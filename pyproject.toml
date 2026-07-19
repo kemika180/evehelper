@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evetrader"
+version = "0.1.0"
+description = "A TUI money-making advisor for EVE Online (ESI market data + character state)."
+requires-python = ">=3.12"
+dependencies = [
+    "polars>=1.42",
+    "pydantic>=2.11",
+    "httpx>=0.28",
+    "textual>=8.0",
+]
+
+[project.scripts]
+evetrader = "evetrader.tui.app:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15",
+    "pytest>=8.3",
+    "ruff>=0.15",
+    "import-linter>=2.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["python/evetrader"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+
+# The non-negotiable pure-core boundary, enforced mechanically: the analysis
+# core (market/, advisor/) is deterministic and must never reach the I/O shell
+# (esi/, data/) or the network. See ARCHITECTURE.md § Internal boundary contract.
+[tool.importlinter]
+root_package = "evetrader"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Pure analysis core never imports the I/O shell or network libraries"
+type = "forbidden"
+source_modules = ["evetrader.market", "evetrader.advisor"]
+forbidden_modules = ["evetrader.esi", "evetrader.data", "httpx"]
