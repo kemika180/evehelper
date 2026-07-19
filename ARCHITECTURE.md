@@ -58,6 +58,7 @@ eve_trading/
 │       │   ├── market.py      # market orders + history -> polars
 │       │   └── universe.py    # type/region/station/system reference data
 │       ├── market/            # PURE analysis core (no I/O)
+│       │   ├── snapshot.py    # MarketSnapshot: polars frames + region + capture time
 │       │   ├── fees.py        # broker fee + sales tax from skills/standings
 │       │   ├── station_trading.py  # margins, competition/undercut, ISK/hr scoring
 │       │   └── hauling.py     # (milestone 6) cross-region arbitrage
@@ -126,9 +127,6 @@ v1 focuses on **station trading**; **hauling** is a later milestone on the same 
    persist past suggestions and realized P&L to tune scoring.
 
 ## Open decisions
-- **Universe reference source**: the static SDE (large static export, fast local
-  lookups, periodically stale) vs live ESI `/universe/*` endpoints (always current,
-  slower, more calls). Likely SDE for names/volumes, ESI for prices.
 - **Advisor state persistence**: sqlite vs polars/parquet for suggestion history
   and realized P&L.
 - **Multi-character / multi-account** handling in `Config` and the TUI (defer past
@@ -143,4 +141,16 @@ v1 focuses on **station trading**; **hauling** is a later milestone on the same 
   a local loopback server catches the redirect. Scopes requested up front:
   `esi-wallet.read_character_wallet.v1`, `esi-assets.read_assets.v1`,
   `esi-markets.read_character_orders.v1`, `esi-location.read_location.v1`,
-  `esi-skills.read_skills.v1` (skills included now so milestone 3 needs no re-auth).
+  `esi-skills.read_skills.v1`, `esi-characters.read_standings.v1` (skills and
+  standings included now so fee/tax computation needs no re-auth).
+- **Universe reference source** (milestone 3): live ESI `POST /universe/names/`
+  (bulk id→name, up to 1000/call) plus a persistent local name cache in `data/`,
+  since names are immutable and the client's Expires-cache does not cover POST. The
+  static SDE is deferred to hauling (milestone 6), where item volumes are needed —
+  `/universe/names/` returns names only. ESI has no per-day request quota; the only
+  budget is the error-limit (errors, not successes), so volume is not a constraint.
+- **Fee/tax constants** (milestone 3): `market/fees.py` stays pure and takes skill
+  levels + standings + a `FeeRates` config block (base rates and per-level/standing
+  reductions) as inputs. No CCP rate constants are baked into code; `FeeRates`
+  defaults are user-owned and documented as needing confirmation against the live
+  game after balance patches.

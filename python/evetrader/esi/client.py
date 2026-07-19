@@ -103,6 +103,22 @@ class EsiClient:
             bodies.append(body)
         return bodies
 
+    async def post_json(self, path: str, *, body: object, token: str | None = None) -> bytes:
+        """POST a JSON body (e.g. an id list) and return the response body.
+
+        Not cached — POST responses aren't Expires-cacheable — but still subject to
+        the error-limit budget and the descriptive User-Agent.
+        """
+        headers = {"User-Agent": self._user_agent, "Accept": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        await self._respect_error_limit()
+        response = await self._http.post(_BASE_URL + path, json=body, headers=headers)
+        self._observe_error_limit(response)
+        if response.status_code != httpx.codes.OK:
+            raise EsiError(response.status_code, path)
+        return response.content
+
     async def _request(
         self, path: str, *, params: Params | None, token: str | None
     ) -> tuple[bytes, int]:

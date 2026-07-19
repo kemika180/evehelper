@@ -13,9 +13,13 @@ from evetrader.esi.client import EsiClient
 from evetrader.esi.endpoints import (
     fetch_assets,
     fetch_location,
+    fetch_market_history,
     fetch_market_orders,
     fetch_open_orders,
+    fetch_skills,
+    fetch_standings,
     fetch_wallet_balance,
+    resolve_names,
 )
 
 _FUTURE = format_datetime(datetime(2099, 1, 1, tzinfo=UTC), usegmt=True)
@@ -135,5 +139,87 @@ def test_fetch_market_orders_is_public_and_paged() -> None:
     async def body(client: EsiClient, _: dict[str, str | None]) -> None:
         orders = await fetch_market_orders(client, 10000002)
         assert [o.order_id for o in orders] == [1, 2]
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_fetch_market_history_passes_type_id_and_parses() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("type_id") == "34"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "date": "2020-01-01",
+                    "average": 5.1,
+                    "highest": 5.5,
+                    "lowest": 4.9,
+                    "order_count": 120,
+                    "volume": 1_000_000,
+                }
+            ],
+            headers={"Expires": _FUTURE},
+        )
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        history = await fetch_market_history(client, 10000002, 34)
+        assert history[0].volume == 1_000_000
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_fetch_skills_authenticates_and_parses() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("Authorization") == "Bearer tok"
+        return httpx.Response(
+            200,
+            json={
+                "skills": [
+                    {"skill_id": 16622, "active_skill_level": 5, "trained_skill_level": 5}
+                ],
+                "total_sp": 5_000_000,
+            },
+            headers={"Expires": _FUTURE},
+        )
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        skills = await fetch_skills(client, 42, token="tok")
+        assert skills.skills[0].skill_id == 16622
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_fetch_standings_parses() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[{"from_id": 1000035, "from_type": "npc_corp", "standing": 3.5}],
+            headers={"Expires": _FUTURE},
+        )
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        standings = await fetch_standings(client, 42, token="tok")
+        assert standings[0].standing == 3.5
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_resolve_names_posts_id_list() -> None:
+    import json
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert json.loads(request.content) == [34, 10000002]
+        return httpx.Response(
+            200,
+            json=[
+                {"id": 34, "name": "Tritanium", "category": "inventory_type"},
+                {"id": 10000002, "name": "The Forge", "category": "region"},
+            ],
+        )
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        names = await resolve_names(client, [34, 10000002])
+        assert {n.id: n.name for n in names} == {34: "Tritanium", 10000002: "The Forge"}
 
     _run(body, httpx.MockTransport(handler))
