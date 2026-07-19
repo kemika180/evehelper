@@ -1,0 +1,182 @@
+"""SSO auth: PKCE derivation, authorize URL, JWT character id, token exchange,
+and Authenticator auto-refresh with refresh-token rotation."""
+
+import asyncio
+import base64
+import hashlib
+import json
+import urllib.parse
+from collections.abc import Awaitable, Callable
+
+import httpx
+import pytest
+
+from evetrader.config import Config, RiskPreferences
+from evetrader.esi.auth import (
+    AuthError,
+    Authenticator,
+    build_authorize_url,
+    character_id_from_access_token,
+    exchange_code,
+    generate_pkce,
+)
+
+
+def _config() -> Config:
+    return Config(
+        esi_client_id="cid",
+        contact="contact@example.com",
+        home_region_id=10000002,
+        home_station_id=60003760,
+        total_capital_isk=1.0,
+        risk=RiskPreferences(
+            min_margin=0.05, min_daily_isk_volume=0.0, max_capital_per_order_isk=1.0
+        ),
+    )
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _make_jwt(sub: str) -> str:
+    header = _b64url(json.dumps({"alg": "RS256"}).encode())
+    payload = _b64url(json.dumps({"sub": sub}).encode())
+    return f"{header}.{payload}.signature"
+
+
+class _FakeStore:
+    def __init__(self) -> None:
+        self.tokens: dict[int, str] = {}
+
+    def load(self, character_id: int) -> str | None:
+        return self.tokens.get(character_id)
+
+    def save(self, character_id: int, refresh_token: str) -> None:
+        self.tokens[character_id] = refresh_token
+
+    def delete(self, character_id: int) -> None:
+        self.tokens.pop(character_id, None)
+
+
+def _run(coro: Callable[[], Awaitable[None]]) -> None:
+    asyncio.run(coro())
+
+
+def test_generate_pkce_uses_s256() -> None:
+    pair = generate_pkce(b"\x00" * 32)
+    expected = _b64url(hashlib.sha256(pair.verifier.encode("ascii")).digest())
+    assert pair.challenge == expected
+
+
+def test_build_authorize_url_encodes_scopes_and_method() -> None:
+    url = build_authorize_url(
+        client_id="cid",
+        redirect_uri="http://localhost:8765/callback",
+        scopes=["esi-wallet.read_character_wallet.v1", "esi-assets.read_assets.v1"],
+        challenge="chal",
+        state="xyz",
+    )
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["scope"] == ["esi-wallet.read_character_wallet.v1 esi-assets.read_assets.v1"]
+    assert query["redirect_uri"] == ["http://localhost:8765/callback"]
+
+
+def test_character_id_extracted_from_jwt_sub() -> None:
+    token = _make_jwt("CHARACTER:EVE:2112625428")
+    assert character_id_from_access_token(token) == 2112625428
+
+
+def test_non_jwt_access_token_raises() -> None:
+    with pytest.raises(AuthError):
+        character_id_from_access_token("not-a-jwt")
+
+
+def test_exchange_code_posts_pkce_verifier() -> None:
+    seen: dict[str, list[str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(urllib.parse.parse_qs(request.content.decode()))
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "a1",
+                "token_type": "Bearer",
+                "expires_in": 1199,
+                "refresh_token": "r1",
+            },
+        )
+
+    async def body() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http:
+            token = await exchange_code(
+                http, client_id="cid", contact="c@e.com", code="thecode", verifier="theverifier"
+            )
+            assert token.refresh_token == "r1"
+
+    _run(body)
+    assert seen["grant_type"] == ["authorization_code"]
+    assert seen["code_verifier"] == ["theverifier"]
+    assert seen["code"] == ["thecode"]
+
+
+def test_authenticator_refreshes_rotates_and_caches() -> None:
+    calls = 0
+    sent_refresh: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        form = urllib.parse.parse_qs(request.content.decode())
+        sent_refresh.append(form["refresh_token"][0])
+        return httpx.Response(
+            200,
+            json={
+                "access_token": f"a{calls}",
+                "token_type": "Bearer",
+                "expires_in": 1200,
+                "refresh_token": f"r{calls}",
+            },
+        )
+
+    store = _FakeStore()
+    store.save(42, "r0")
+    now = [1000.0]
+    from datetime import UTC, datetime, timedelta
+
+    def clock() -> datetime:
+        return datetime(2020, 1, 1, tzinfo=UTC) + timedelta(seconds=now[0])
+
+    async def body() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http:
+            auth = Authenticator(_config(), http, store, now=clock)
+
+            first = await auth.access_token(42)
+            assert first == "a1"
+            assert store.tokens[42] == "r1"  # rotated
+
+            second = await auth.access_token(42)
+            assert second == "a1"  # cached, no refresh
+
+            now[0] += 1200  # past expiry (minus skew)
+            third = await auth.access_token(42)
+            assert third == "a2"
+            assert store.tokens[42] == "r2"
+
+    _run(body)
+    assert calls == 2
+    assert sent_refresh == ["r0", "r1"]  # each refresh uses the latest rotated token
+
+
+def test_authenticator_without_stored_token_raises() -> None:
+    async def body() -> None:
+        transport = httpx.MockTransport(lambda _: httpx.Response(200, json={}))
+        async with httpx.AsyncClient(transport=transport) as http:
+            auth = Authenticator(_config(), http, _FakeStore())
+            with pytest.raises(AuthError):
+                await auth.access_token(999)
+
+    _run(body)
