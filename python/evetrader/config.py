@@ -29,6 +29,8 @@ class Config(BaseModel):
     esi_client_id: str = Field(min_length=1)
     # Contact (email or URL) sent in the ESI User-Agent, as ESI's rules require.
     contact: str = Field(min_length=1)
+    # Loopback port for the PKCE SSO callback; must match the registered redirect.
+    callback_port: int = Field(default=8765, gt=0, lt=65536)
     # Region the advisor analyses for station trading.
     home_region_id: int = Field(gt=0)
     # Station the advisor trades from.

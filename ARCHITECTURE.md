@@ -52,6 +52,7 @@ eve_trading/
 │       ├── esi/               # ALL network I/O lives here
 │       │   ├── auth.py        # OAuth2 SSO (PKCE, native-app flow); token store + refresh
 │       │   ├── client.py      # async HTTP; ETag/Expires cache; error-limit backoff; paging
+│       │   ├── endpoints.py   # typed per-endpoint fetches (bytes in -> pydantic out)
 │       │   └── models.py      # pydantic models for ESI payloads (the I/O boundary)
 │       ├── data/              # ingestion: ESI/SDE -> normalized polars frames
 │       │   ├── market.py      # market orders + history -> polars
@@ -124,15 +125,22 @@ v1 focuses on **station trading**; **hauling** is a later milestone on the same 
    copied inventory/market exports for instant state, bypassing asset cache lag);
    persist past suggestions and realized P&L to tune scoring.
 
-## Open decisions to resolve in Claude Code
+## Open decisions
 - **Universe reference source**: the static SDE (large static export, fast local
   lookups, periodically stale) vs live ESI `/universe/*` endpoints (always current,
   slower, more calls). Likely SDE for names/volumes, ESI for prices.
-- **Token storage**: OS keyring vs an encrypted local file. Whichever, it is
-  gitignored and never logged.
 - **Advisor state persistence**: sqlite vs polars/parquet for suggestion history
   and realized P&L.
 - **Multi-character / multi-account** handling in `Config` and the TUI (defer past
   v1 unless trivial).
-- **ESI app registration**: scopes to request, callback URL for the native SSO
-  flow. Minimize requested scopes to what each milestone needs.
+
+## Resolved decisions
+- **Token storage** (milestone 2): OS keyring via the `keyring` library — the
+  system secret service holds refresh tokens; no secret material in our files. It
+  is never logged.
+- **ESI app registration** (milestone 2): native application, PKCE, no client
+  secret. Callback `http://localhost:8765/callback` (port configurable in `Config`);
+  a local loopback server catches the redirect. Scopes requested up front:
+  `esi-wallet.read_character_wallet.v1`, `esi-assets.read_assets.v1`,
+  `esi-markets.read_character_orders.v1`, `esi-location.read_location.v1`,
+  `esi-skills.read_skills.v1` (skills included now so milestone 3 needs no re-auth).
