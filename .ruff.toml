@@ -1,0 +1,6 @@
+line-length = 100
+target-version = "py312"
+
+[lint]
+# ANN reinforces strict typing at lint speed; ANN401 bans `Any` in annotations.
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ANN"]
