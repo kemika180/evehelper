@@ -4,7 +4,7 @@ Inbound external data: extras are ignored (ESI may add fields) but every field w
 consume is strictly typed. These never cross into the analysis core as raw dicts.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict
 
@@ -76,3 +76,45 @@ class MarketOrder(_EsiModel):
     range: str
     duration: int
     issued: datetime
+
+
+class MarketHistoryDay(_EsiModel):
+    """One row of GET /markets/{region_id}/history/ (daily aggregates per type)."""
+
+    date: date
+    average: float
+    highest: float
+    lowest: float
+    order_count: int
+    volume: int
+
+
+class EsiName(_EsiModel):
+    """One row of POST /universe/names/ — an id resolved to a name and category."""
+
+    id: int
+    name: str
+    category: str
+
+
+class Skill(_EsiModel):
+    """One trained skill from GET /characters/{id}/skills/."""
+
+    skill_id: int
+    active_skill_level: int
+    trained_skill_level: int
+
+
+class CharacterSkills(_EsiModel):
+    """GET /characters/{id}/skills/ — the character's trained skills."""
+
+    skills: list[Skill]
+    total_sp: int
+
+
+class Standing(_EsiModel):
+    """One row of GET /characters/{id}/standings/ (toward faction/corp/agent)."""
+
+    from_id: int
+    from_type: str
+    standing: float

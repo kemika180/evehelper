@@ -8,15 +8,29 @@ market endpoint does not.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from pydantic import TypeAdapter
 
 from evetrader.esi.client import EsiClient
-from evetrader.esi.models import Asset, CharacterOrder, Location, MarketOrder
+from evetrader.esi.models import (
+    Asset,
+    CharacterOrder,
+    CharacterSkills,
+    EsiName,
+    Location,
+    MarketHistoryDay,
+    MarketOrder,
+    Standing,
+)
 
 _WALLET = TypeAdapter(float)
 _ASSETS = TypeAdapter(list[Asset])
 _CHARACTER_ORDERS = TypeAdapter(list[CharacterOrder])
 _MARKET_ORDERS = TypeAdapter(list[MarketOrder])
+_MARKET_HISTORY = TypeAdapter(list[MarketHistoryDay])
+_NAMES = TypeAdapter(list[EsiName])
+_STANDINGS = TypeAdapter(list[Standing])
 
 
 async def fetch_wallet_balance(client: EsiClient, character_id: int, token: str) -> float:
@@ -44,3 +58,26 @@ async def fetch_location(client: EsiClient, character_id: int, token: str) -> Lo
 async def fetch_market_orders(client: EsiClient, region_id: int) -> list[MarketOrder]:
     pages = await client.get_all_pages(f"/markets/{region_id}/orders/")
     return [order for page in pages for order in _MARKET_ORDERS.validate_json(page)]
+
+
+async def fetch_market_history(
+    client: EsiClient, region_id: int, type_id: int
+) -> list[MarketHistoryDay]:
+    body = await client.get(f"/markets/{region_id}/history/", params={"type_id": type_id})
+    return _MARKET_HISTORY.validate_json(body)
+
+
+async def fetch_skills(client: EsiClient, character_id: int, token: str) -> CharacterSkills:
+    body = await client.get(f"/characters/{character_id}/skills/", token=token)
+    return CharacterSkills.model_validate_json(body)
+
+
+async def fetch_standings(client: EsiClient, character_id: int, token: str) -> list[Standing]:
+    body = await client.get(f"/characters/{character_id}/standings/", token=token)
+    return _STANDINGS.validate_json(body)
+
+
+async def resolve_names(client: EsiClient, ids: Sequence[int]) -> list[EsiName]:
+    """Resolve up to 1000 ids to names via POST /universe/names/ (single call)."""
+    body = await client.post_json("/universe/names/", body=list(ids))
+    return _NAMES.validate_json(body)

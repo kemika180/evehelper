@@ -7,6 +7,29 @@ analysis core may import it freely. Loading config from disk lives elsewhere.
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class FeeRates(BaseModel):
+    """CCP fee/tax constants for the (parameterized) fee formula.
+
+    These are user-owned inputs, not code constants: CCP changes them with balance
+    patches. The seed defaults reflect commonly-cited mechanics and should be
+    CONFIRMED against the live game — a wrong rate silently skews every profit
+    estimate. The reduction formula shape is standard (linear, floored).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Base rates before skills/standings.
+    base_sales_tax: float = Field(default=0.08, ge=0.0, le=1.0)
+    base_broker_fee: float = Field(default=0.03, ge=0.0, le=1.0)
+    min_broker_fee: float = Field(default=0.01, ge=0.0, le=1.0)
+    # Per-level skill reductions (fraction of the base removed per skill level).
+    accounting_reduction_per_level: float = Field(default=0.11, ge=0.0, le=1.0)
+    broker_relations_reduction_per_level: float = Field(default=0.003, ge=0.0, le=1.0)
+    # Per-standing-point broker-fee reductions (applied to raw standing value).
+    faction_standing_reduction: float = Field(default=0.0003, ge=0.0, le=1.0)
+    corp_standing_reduction: float = Field(default=0.0002, ge=0.0, le=1.0)
+
+
 class RiskPreferences(BaseModel):
     """Thresholds the advisor uses to filter and rank opportunities."""
 
@@ -38,3 +61,4 @@ class Config(BaseModel):
     # Total ISK available to allocate across all suggested orders.
     total_capital_isk: float = Field(gt=0.0)
     risk: RiskPreferences
+    fees: FeeRates = Field(default_factory=FeeRates)
