@@ -12,17 +12,73 @@ is testable without ESI.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import ClassVar
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import BindingType
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, OptionList, Static
+from textual.widgets import DataTable, Footer, Header, OptionList, Static, TabbedContent, TabPane
 from textual.widgets.option_list import Option
 
 from evetrader.esi.auth import CharacterIdentity
+from evetrader.esi.models import SkillQueueEntry
 from evetrader.pipeline import AdvisorReport
 from evetrader.session import CharacterRecord, CharacterStore
+from evetrader.tui.themes import KEMIKA_PURPLE
+
+
+def _finish(entry: SkillQueueEntry) -> str:
+    # ESI gives UTC; astimezone() (no arg) converts to the machine's local zone.
+    if entry.finish_date is None:
+        return "unknown"
+    return entry.finish_date.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _current_training(
+    skill_queue: list[SkillQueueEntry], reference: datetime
+) -> SkillQueueEntry | None:
+    """The skill actually training at `reference`, or None (empty/paused/finished).
+
+    ESI can return a completed skill at the top of the queue, or a paused queue with
+    no dates, so the front entry is not reliably "the one training" — check the
+    window instead.
+    """
+    for entry in sorted(skill_queue, key=lambda e: e.queue_position):
+        if (
+            entry.start_date is not None
+            and entry.finish_date is not None
+            and entry.start_date <= reference < entry.finish_date
+        ):
+            return entry
+    return None
+
+
+def _is_completed(entry: SkillQueueEntry, reference: datetime) -> bool:
+    return entry.finish_date is not None and entry.finish_date <= reference
+
+
+def _completion(entry: SkillQueueEntry, reference: datetime) -> str:
+    # A skill that already finished doesn't need a completion time shown.
+    return "—" if _is_completed(entry, reference) else _finish(entry)
+
+
+def _time_left(entry: SkillQueueEntry, reference: datetime) -> str:
+    """Human time from `reference` (the report's capture time) to completion."""
+    if entry.finish_date is None:
+        return "unknown"
+    total = int((entry.finish_date - reference).total_seconds())
+    if total <= 0:
+        return "done"
+    days, remainder = divmod(total, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes = remainder // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 RefreshFn = Callable[[], Awaitable[AdvisorReport]]
 MakeRefreshFn = Callable[[int], RefreshFn]
@@ -43,14 +99,20 @@ class TradingScreen(Screen[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Fetching market data…", id="status")
-        yield Static("", id="character")
-        yield DataTable(id="opportunities")
-        yield Static("", id="skillqueue")
+        with TabbedContent():
+            with TabPane("Advisor", id="advisor"):
+                yield Static("", id="character")
+                yield Static("", id="training")
+                yield DataTable(id="opportunities", zebra_stripes=True)
+            with TabPane("Skill Queue", id="queue"):
+                yield DataTable(id="skillqueue", zebra_stripes=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#opportunities", DataTable)
-        table.add_columns("Type", "Buy", "Sell", "Qty", "Capital", "ISK/hr", "Notes")
+        opportunities = self.query_one("#opportunities", DataTable)
+        opportunities.add_columns("Type", "Buy", "Sell", "Qty", "Capital", "ISK/hr", "Notes")
+        queue = self.query_one("#skillqueue", DataTable)
+        queue.add_columns("Skill", "Time left", "Completion")
         self.run_worker(self._refresh(), exclusive=True)
         self.set_interval(self._interval, self._refresh)
 
@@ -64,6 +126,7 @@ class TradingScreen(Screen[None]):
             return
         self._render_character(report)
         self._render_opportunities(report)
+        self._render_training(report)
         self._render_skill_queue(report)
         count = len(report.opportunities)
         status.update(f"{count} opportunit{'y' if count == 1 else 'ies'} — updated")
@@ -92,16 +155,43 @@ class TradingScreen(Screen[None]):
                 opportunity.reasoning,
             )
 
-    def _render_skill_queue(self, report: AdvisorReport) -> None:
-        if not report.skill_queue:
-            self.query_one("#skillqueue", Static).update("Skill queue: empty")
+    def _render_training(self, report: AdvisorReport) -> None:
+        """The skill actually training now, on the main tab."""
+        current = _current_training(report.skill_queue, report.captured_at)
+        target = self.query_one("#training", Static)
+        if current is None:
+            target.update(
+                "Training: nothing (queue empty)"
+                if not report.skill_queue
+                else "Training: paused (no skill actively training)"
+            )
             return
-        lines = ["Skill queue:"]
-        for entry in report.skill_queue:
+        name = report.names.get(current.skill_id, str(current.skill_id))
+        target.update(
+            f"Training: {name} → L{current.finished_level}  ·  "
+            f"{_time_left(current, report.captured_at)} left  ·  completes {_finish(current)}"
+        )
+
+    def _render_skill_queue(self, report: AdvisorReport) -> None:
+        """The full queue as Skill / Time left / Completion; current row highlighted,
+        already-completed entries marked done."""
+        table = self.query_one("#skillqueue", DataTable)
+        table.clear()
+        current = _current_training(report.skill_queue, report.captured_at)
+        reference = report.captured_at
+        for entry in sorted(report.skill_queue, key=lambda e: e.queue_position):
             name = report.names.get(entry.skill_id, str(entry.skill_id))
-            finish = entry.finish_date.strftime("%Y-%m-%d %H:%M") if entry.finish_date else "?"
-            lines.append(f"  {entry.queue_position + 1}. {name} L{entry.finished_level} → {finish}")
-        self.query_one("#skillqueue", Static).update("\n".join(lines))
+            if current is not None and entry.queue_position == current.queue_position:
+                marker, style = "▶ ", "bold magenta"
+            elif _is_completed(entry, reference):
+                marker, style = "✓ ", "dim strike"
+            else:
+                marker, style = "  ", "cyan"
+            table.add_row(
+                Text(f"{marker}{name} → L{entry.finished_level}", style=style),
+                Text(_time_left(entry, reference), style="yellow"),
+                Text(_completion(entry, reference), style="dim"),
+            )
 
 
 class CharacterPickerScreen(Screen[None]):
@@ -192,6 +282,7 @@ class EveTraderApp(App[None]):
         login_fn: LoginFn,
         remove_token_fn: RemoveTokenFn,
         interval_seconds: int,
+        theme: str = "kemika-purple",
     ) -> None:
         super().__init__()
         self._store = store
@@ -199,6 +290,14 @@ class EveTraderApp(App[None]):
         self._login_fn = login_fn
         self._remove_token_fn = remove_token_fn
         self._interval = interval_seconds
+        self._theme_name = theme
+
+    def on_mount(self) -> None:
+        # Register the custom theme, then apply the configured one if it's known.
+        # Users can also switch at runtime via the command palette (ctrl+p).
+        self.register_theme(KEMIKA_PURPLE)
+        if self._theme_name in self.available_themes:
+            self.theme = self._theme_name
 
     def get_default_screen(self) -> Screen[None]:
         return CharacterPickerScreen(

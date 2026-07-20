@@ -64,5 +64,7 @@ class Config(BaseModel):
     watchlist_type_ids: tuple[int, ...] = ()
     # How often the TUI re-runs the pipeline; the client cache gates real fetches.
     refresh_interval_seconds: int = Field(default=30, gt=0)
+    # TUI colour theme: "kemika-purple" (default) or any built-in Textual theme.
+    theme: str = "kemika-purple"
     risk: RiskPreferences
     fees: FeeRates = Field(default_factory=FeeRates)

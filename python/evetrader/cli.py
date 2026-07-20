@@ -97,7 +97,12 @@ def _run_tui(config: Config) -> None:
             KeyringTokenStore().delete(character_id)
 
     EveTraderApp(
-        store, make_refresh_fn, login_fn, remove_token_fn, config.refresh_interval_seconds
+        store,
+        make_refresh_fn,
+        login_fn,
+        remove_token_fn,
+        config.refresh_interval_seconds,
+        theme=config.theme,
     ).run()
 
 
