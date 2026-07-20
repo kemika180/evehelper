@@ -27,6 +27,7 @@ class Opportunity(BaseModel):
     station_id: int
     buy_price: float
     sell_price: float
+    margin: float
     quantity: int
     capital_required: float
     profit_per_unit: float
@@ -73,6 +74,7 @@ class StationTradingSource:
             station_id=station_id,
             buy_price=trade.buy_price,
             sell_price=trade.sell_price,
+            margin=trade.margin,
             quantity=trade.recommended_units,
             capital_required=trade.capital_required,
             profit_per_unit=trade.profit_per_unit,
