@@ -120,7 +120,7 @@ class TradingScreen(Screen[None]):
 
     DEFAULT_CSS = """
     TradingScreen #status { padding: 0 2; color: $text-muted; }
-    TradingScreen #stats { height: 4; padding: 1 1 0 1; }
+    TradingScreen #stats { height: 6; padding: 1 1 0 1; }
     TradingScreen .stat {
         width: 1fr;
         height: 100%;
@@ -174,13 +174,13 @@ class TradingScreen(Screen[None]):
         except Exception as error:  # surface it instead of a blank screen
             status.update(f"[Character load failed] {type(error).__name__}: {error}")
             return
+        self.app.sub_title = character_report.station_name
         self._render_stats(character_report)
         self._render_training(character_report)
         self._render_skill_queue(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
-        station = character_report.character.station_id
-        status.update(f"Scanning market at station {station} for opportunities…")
+        status.update(f"Scanning {character_report.station_name} for opportunities…")
         try:
             opportunity_report = await self._feed.opportunities(character_report.character)
         except Exception as error:
@@ -189,7 +189,7 @@ class TradingScreen(Screen[None]):
         self._render_opportunities(opportunity_report)
         count = len(opportunity_report.opportunities)
         noun = "opportunity" if count == 1 else "opportunities"
-        status.update(f"{count} {noun} at station {station} — updated")
+        status.update(f"{count} {noun} — {character_report.station_name} — updated")
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
         content = Text()

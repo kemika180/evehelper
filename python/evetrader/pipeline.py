@@ -35,6 +35,7 @@ class CharacterReport:
     character: CharacterState
     skill_queue: list[SkillQueueEntry]
     names: dict[int, str]
+    station_name: str
 
 
 @dataclass(frozen=True)
@@ -62,8 +63,11 @@ async def fetch_character(
     token = await authenticator.access_token(character_id)
     character = await build_character_state(client, config, character_id, token)
     skill_queue = await fetch_skillqueue(client, character_id, token)
-    names = await name_cache.resolve([entry.skill_id for entry in skill_queue])
-    return CharacterReport(now(), character, skill_queue, names)
+    name_ids = [entry.skill_id for entry in skill_queue]
+    name_ids.append(config.home_station_id)  # resolve the station's name too
+    names = await name_cache.resolve(name_ids)
+    station_name = names.get(config.home_station_id, str(config.home_station_id))
+    return CharacterReport(now(), character, skill_queue, names, station_name)
 
 
 async def _orders_and_types(
