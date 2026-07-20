@@ -167,5 +167,7 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             assert [s.type_id for s in report.buys] == [_UNDERVALUED]
             assert [(s.type_id, s.quantity) for s in report.sells] == [(_HELD_DEAR, 10)]
             assert report.names[_UNDERVALUED] == "Tritanium"
+            # History for signalled items is retained for plotting.
+            assert _UNDERVALUED in report.history and len(report.history[_UNDERVALUED]) == 4
 
     asyncio.run(go())

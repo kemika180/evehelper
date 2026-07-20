@@ -19,13 +19,15 @@ from typing import ClassVar
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import BindingType
-from textual.containers import Horizontal
-from textual.screen import Screen
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, OptionList, Static, TabbedContent, TabPane
 from textual.widgets.option_list import Option
+from textual_plotext import PlotextPlot
 
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import SkillQueueEntry
+from evetrader.esi.models import MarketHistoryDay, SkillQueueEntry
+from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
@@ -112,6 +114,53 @@ class RefreshFeed:
 MakeFeed = Callable[[int], RefreshFeed]
 
 
+class PriceHistoryScreen(ModalScreen[None]):
+    """A modal price-history chart for one item (its N-day average/high/low, the
+    moving average, and today's price), plotted in the terminal."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        ("q", "dismiss", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    PriceHistoryScreen { align: center middle; }
+    PriceHistoryScreen #plotbox {
+        width: 88%;
+        height: 82%;
+        border: round $primary;
+        background: $surface;
+    }
+    PriceHistoryScreen #plothint { padding: 0 1; color: $text-muted; }
+    """
+
+    def __init__(self, title: str, days: list[MarketHistoryDay], signal: InvestmentSignal) -> None:
+        super().__init__()
+        self._title = title
+        self._days = sorted(days, key=lambda day: day.date)
+        self._signal = signal
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="plotbox"):
+            yield PlotextPlot()
+            yield Static("esc / enter to close", id="plothint")
+
+    def on_mount(self) -> None:
+        plt = self.query_one(PlotextPlot).plt
+        x = list(range(len(self._days)))
+        plt.plot(x, [day.average for day in self._days], color="yellow", label="avg")
+        plt.plot(x, [day.highest for day in self._days], color="green", label="high")
+        plt.plot(x, [day.lowest for day in self._days], color="red", label="low")
+        plt.hline(self._signal.fair_value, color="magenta")  # moving average
+        plt.hline(self._signal.current_price, color="cyan")  # today's price
+        plt.title(
+            f"{self._title}  —  now {self._signal.current_price:,.0f}  "
+            f"fair {self._signal.fair_value:,.0f}"
+        )
+        plt.xlabel(f"days ({len(self._days)})")
+
+
 class TradingScreen(Screen[None]):
     """Per-character advisor view: opportunities plus character and skill-queue."""
 
@@ -144,11 +193,12 @@ class TradingScreen(Screen[None]):
         super().__init__()
         self._feed = feed
         self._interval = interval_seconds
+        self._report: OpportunityReport | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="location")
-        yield Static("Fetching market data…", id="status")
+        yield Static("Fetching market data… (select a row for its price chart)", id="status")
         with TabbedContent():
             with TabPane("Advisor", id="advisor"):
                 with Horizontal(id="stats"):
@@ -158,12 +208,24 @@ class TradingScreen(Screen[None]):
                     yield Static(id="stat-broker", classes="stat")
                 yield Static("", id="training")
                 yield Static("BUY — trading below normal", classes="section")
-                yield DataTable(id="buys", zebra_stripes=True)
+                yield DataTable(id="buys", zebra_stripes=True, cursor_type="row")
                 yield Static("SELL — your holdings above normal", classes="section")
-                yield DataTable(id="sells", zebra_stripes=True)
+                yield DataTable(id="sells", zebra_stripes=True, cursor_type="row")
             with TabPane("Skill Queue", id="queue"):
                 yield DataTable(id="skillqueue", zebra_stripes=True)
         yield Footer()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if self._report is None or event.row_key.value is None:
+            return
+        type_id = int(event.row_key.value)
+        days = self._report.history.get(type_id)
+        signal = next(
+            (s for s in (*self._report.buys, *self._report.sells) if s.type_id == type_id), None
+        )
+        if days and signal is not None:
+            name = self._report.names.get(type_id, str(type_id))
+            self.app.push_screen(PriceHistoryScreen(name, days, signal))
 
     def on_mount(self) -> None:
         self.query_one("#buys", DataTable).add_columns(
@@ -197,6 +259,7 @@ class TradingScreen(Screen[None]):
         except Exception as error:
             status.update(f"[Market scan failed] {type(error).__name__}: {error}")
             return
+        self._report = report
         self._render_buys(report)
         self._render_sells(report)
         status.update(f"{len(report.buys)} to buy · {len(report.sells)} to sell — updated")
@@ -231,6 +294,7 @@ class TradingScreen(Screen[None]):
                 Text(f"{signal.quantity:,}", justify="right"),
                 Text(_isk(signal.expected_profit), justify="right", style="bold green"),
                 Text(signal.reasoning, style="dim"),
+                key=str(signal.type_id),
             )
 
     def _render_sells(self, report: OpportunityReport) -> None:
@@ -246,6 +310,7 @@ class TradingScreen(Screen[None]):
                 Text(f"{signal.channel_position:.0%}", justify="right", style="yellow"),
                 Text(_isk(signal.expected_profit), justify="right", style="bold yellow"),
                 Text(signal.reasoning, style="dim"),
+                key=str(signal.type_id),
             )
 
     def _render_training(self, report: CharacterReport) -> None:
