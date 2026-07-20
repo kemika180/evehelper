@@ -94,16 +94,25 @@ def build_authorize_url(
     return f"{_AUTHORIZE_URL}?{query}"
 
 
+@dataclass(frozen=True)
+class CharacterIdentity:
+    """A logged-in character: id and display name, from the SSO token."""
+
+    character_id: int
+    name: str
+
+
 class _JwtPayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     sub: str
+    name: str | None = None
 
 
-def character_id_from_access_token(access_token: str) -> int:
-    """Read the character id from the SSO JWT's ``sub`` (``CHARACTER:EVE:<id>``).
+def _decode_payload(access_token: str) -> _JwtPayload:
+    """Decode the SSO JWT payload.
 
-    The token comes straight from the SSO endpoint over TLS, so we read the claim
+    The token comes straight from the SSO endpoint over TLS, so we read its claims
     without verifying the signature. Signature verification against ESI's JWKS is a
     possible hardening follow-up.
     """
@@ -111,8 +120,20 @@ def character_id_from_access_token(access_token: str) -> int:
     if len(parts) != 3:
         raise AuthError("access token is not a JWT")
     padded = parts[1] + "=" * (-len(parts[1]) % 4)
-    payload = _JwtPayload.model_validate_json(base64.urlsafe_b64decode(padded))
-    return int(payload.sub.rsplit(":", 1)[-1])
+    return _JwtPayload.model_validate_json(base64.urlsafe_b64decode(padded))
+
+
+def character_id_from_access_token(access_token: str) -> int:
+    """Read the character id from the SSO JWT's ``sub`` (``CHARACTER:EVE:<id>``)."""
+    return int(_decode_payload(access_token).sub.rsplit(":", 1)[-1])
+
+
+def character_identity(access_token: str) -> CharacterIdentity:
+    """Read the character id and name from the SSO JWT."""
+    payload = _decode_payload(access_token)
+    character_id = int(payload.sub.rsplit(":", 1)[-1])
+    name = payload.name if payload.name is not None else f"Character {character_id}"
+    return CharacterIdentity(character_id=character_id, name=name)
 
 
 class RefreshTokenStore(Protocol):
@@ -258,8 +279,8 @@ async def login(
     *,
     open_browser: Callable[[str], bool] = webbrowser.open,
     entropy: bytes | None = None,
-) -> int:
-    """Run the interactive PKCE login; persist the refresh token; return character id."""
+) -> CharacterIdentity:
+    """Run the interactive PKCE login; persist the refresh token; return the identity."""
     pkce = generate_pkce(entropy)
     state = _b64url(secrets.token_bytes(16))
     redirect_uri = f"http://localhost:{config.callback_port}/callback"
@@ -280,6 +301,6 @@ async def login(
         code=code,
         verifier=pkce.verifier,
     )
-    character_id = character_id_from_access_token(token.access_token)
-    store.save(character_id, token.refresh_token)
-    return character_id
+    identity = character_identity(token.access_token)
+    store.save(identity.character_id, token.refresh_token)
+    return identity
