@@ -10,7 +10,7 @@ from evetrader.data.market import build_market_snapshot
 from evetrader.esi.models import MarketHistoryDay, MarketOrder
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.snapshot import MarketSnapshot
-from evetrader.market.station_trading import rank_station_trades
+from evetrader.market.station_trading import candidate_types, rank_station_trades
 
 _STATION = 60003760
 _FEES = EffectiveFees(sales_tax=0.05, broker_fee=0.02)
@@ -175,6 +175,29 @@ def test_capital_limit_skips_unaffordable_and_takes_next() -> None:
     )
 
     assert [t.type_id for t in trades] == [34]
+
+
+def test_candidate_types_ranks_by_margin_and_drops_losers() -> None:
+    snapshot = _snapshot(
+        [
+            # type 34: 1-cent spread -> negative after fees, excluded
+            _order(1, 34, is_buy=True, price=100.0),
+            _order(2, 34, is_buy=False, price=101.0),
+            # type 40: wide spread -> best margin
+            _order(3, 40, is_buy=True, price=100.0),
+            _order(4, 40, is_buy=False, price=150.0),
+            # type 50: medium spread
+            _order(5, 50, is_buy=True, price=100.0),
+            _order(6, 50, is_buy=False, price=120.0),
+        ],
+        {},  # candidate selection needs no history
+    )
+
+    result = candidate_types(
+        snapshot.orders, station_id=_STATION, fees=_FEES, min_margin=0.05, limit=10
+    )
+
+    assert result == [40, 50]  # widest spread first; the negative-margin 34 dropped
 
 
 def test_other_stations_are_ignored() -> None:
