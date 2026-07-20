@@ -4,7 +4,12 @@ from datetime import UTC, datetime
 
 import polars as pl
 
-from evetrader.data.market import build_market_snapshot, history_to_frame, orders_to_frame
+from evetrader.data.market import (
+    build_market_snapshot,
+    history_to_frame,
+    orders_frame_from_pages,
+    orders_to_frame,
+)
 from evetrader.esi.models import MarketHistoryDay, MarketOrder
 
 
@@ -72,12 +77,45 @@ def test_history_to_frame_parses_dates() -> None:
     assert frame["volume"].to_list() == [1_000_000]
 
 
+def test_orders_frame_from_pages_parses_raw_json() -> None:
+    import json
+
+    page = json.dumps(
+        [
+            {
+                "order_id": 1,
+                "type_id": 34,
+                "location_id": 60003760,
+                "system_id": 30000142,
+                "is_buy_order": True,
+                "price": 5.5,
+                "volume_remain": 10,
+                "volume_total": 20,
+                "min_volume": 1,
+                "range": "region",
+                "duration": 90,
+                "issued": "2020-01-01T00:00:00Z",
+            }
+        ]
+    ).encode()
+    frame = orders_frame_from_pages([page, b"[]", b""])  # empty pages ignored
+    assert frame.height == 1
+    assert frame["price"].to_list() == [5.5]
+    assert frame.schema["is_buy_order"] == pl.Boolean
+
+
+def test_orders_frame_from_pages_empty_is_typed() -> None:
+    frame = orders_frame_from_pages([])
+    assert frame.height == 0
+    assert frame.schema["order_id"] == pl.Int64
+
+
 def test_build_market_snapshot_carries_region_and_time() -> None:
     captured = datetime(2020, 1, 1, 12, 0, tzinfo=UTC)
     snapshot = build_market_snapshot(
         region_id=10000002,
         captured_at=captured,
-        orders=[_order(1, is_buy=True, price=5.0)],
+        orders=orders_to_frame([_order(1, is_buy=True, price=5.0)]),
         history_by_type={},
     )
     assert snapshot.region_id == 10000002

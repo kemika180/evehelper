@@ -2,6 +2,7 @@
 error-limit backoff, descriptive User-Agent, and bearer auth."""
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -115,10 +116,11 @@ def test_get_all_pages_follows_x_pages() -> None:
 
     async def body(client: EsiClient) -> None:
         bodies = await client.get_all_pages("/markets/10000002/orders/")
-        assert len(bodies) == 3
+        # Pages are fetched concurrently but returned in page order.
+        assert [json.loads(body) for body in bodies] == [["1"], ["2"], ["3"]]
 
     _run(handler, body)
-    assert pages_seen == ["1", "2", "3"]
+    assert sorted(filter(None, pages_seen)) == ["1", "2", "3"]
 
 
 def test_backs_off_when_error_budget_is_low() -> None:

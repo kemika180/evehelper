@@ -12,6 +12,7 @@ is testable without ESI.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import ClassVar
 
@@ -23,9 +24,10 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, OptionList, Static, TabbedContent, TabPane
 from textual.widgets.option_list import Option
 
+from evetrader.advisor.state import CharacterState
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import SkillQueueEntry
-from evetrader.pipeline import AdvisorReport
+from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
 
@@ -93,10 +95,22 @@ def _time_left(entry: SkillQueueEntry, reference: datetime) -> str:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
 
-RefreshFn = Callable[[], Awaitable[AdvisorReport]]
-MakeRefreshFn = Callable[[int], RefreshFn]
+FetchCharacter = Callable[[], Awaitable[CharacterReport]]
+FetchOpportunities = Callable[[CharacterState], Awaitable[OpportunityReport]]
 LoginFn = Callable[[], Awaitable[CharacterIdentity]]
 RemoveTokenFn = Callable[[int], None]
+
+
+@dataclass
+class RefreshFeed:
+    """The two-phase data source for one character: quick character info, then the
+    slower market scan."""
+
+    character: FetchCharacter
+    opportunities: FetchOpportunities
+
+
+MakeFeed = Callable[[int], RefreshFeed]
 
 
 class TradingScreen(Screen[None]):
@@ -122,9 +136,9 @@ class TradingScreen(Screen[None]):
     TradingScreen #opportunities, TradingScreen #skillqueue { margin: 1 1; height: 1fr; }
     """
 
-    def __init__(self, refresh_fn: RefreshFn, interval_seconds: int) -> None:
+    def __init__(self, feed: RefreshFeed, interval_seconds: int) -> None:
         super().__init__()
-        self._refresh_fn = refresh_fn
+        self._feed = feed
         self._interval = interval_seconds
 
     def compose(self) -> ComposeResult:
@@ -153,19 +167,29 @@ class TradingScreen(Screen[None]):
 
     async def _refresh(self) -> None:
         status = self.query_one("#status", Static)
-        status.update("Fetching market data…")
+        # Phase 1: character + skill queue render immediately.
+        status.update("Loading character…")
         try:
-            report = await self._refresh_fn()
+            character_report = await self._feed.character()
         except Exception as error:  # surface it instead of a blank screen
-            status.update(f"[Refresh failed] {type(error).__name__}: {error}")
+            status.update(f"[Character load failed] {type(error).__name__}: {error}")
             return
-        self._render_stats(report)
-        self._render_training(report)
-        self._render_opportunities(report)
-        self._render_skill_queue(report)
-        count = len(report.opportunities)
+        self._render_stats(character_report)
+        self._render_training(character_report)
+        self._render_skill_queue(character_report)
+
+        # Phase 2: the market scan is slower; character info is already on screen.
+        station = character_report.character.station_id
+        status.update(f"Scanning market at station {station} for opportunities…")
+        try:
+            opportunity_report = await self._feed.opportunities(character_report.character)
+        except Exception as error:
+            status.update(f"[Market scan failed] {type(error).__name__}: {error}")
+            return
+        self._render_opportunities(opportunity_report)
+        count = len(opportunity_report.opportunities)
         noun = "opportunity" if count == 1 else "opportunities"
-        status.update(f"{count} {noun} at station {report.character.station_id} — updated")
+        status.update(f"{count} {noun} at station {station} — updated")
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
         content = Text()
@@ -173,7 +197,7 @@ class TradingScreen(Screen[None]):
         content.append(value, style=value_style)
         self.query_one(selector, Static).update(content)
 
-    def _render_stats(self, report: AdvisorReport) -> None:
+    def _render_stats(self, report: CharacterReport) -> None:
         fees = report.character.fees
         self._set_tile(
             "#stat-wallet", "WALLET", f"{_isk(report.character.wallet_balance)} ISK", "bold green"
@@ -184,7 +208,7 @@ class TradingScreen(Screen[None]):
         self._set_tile("#stat-tax", "SALES TAX", f"{fees.sales_tax:.2%}", "bold yellow")
         self._set_tile("#stat-broker", "BROKER FEE", f"{fees.broker_fee:.2%}", "bold yellow")
 
-    def _render_opportunities(self, report: AdvisorReport) -> None:
+    def _render_opportunities(self, report: OpportunityReport) -> None:
         table = self.query_one("#opportunities", DataTable)
         table.clear()
         for index, opportunity in enumerate(report.opportunities):
@@ -199,7 +223,7 @@ class TradingScreen(Screen[None]):
                 Text(_isk(opportunity.expected_isk_per_hour), justify="right", style="bold green"),
             )
 
-    def _render_training(self, report: AdvisorReport) -> None:
+    def _render_training(self, report: CharacterReport) -> None:
         """The skill actually training now, on the main tab."""
         current = _current_training(report.skill_queue, report.captured_at)
         target = self.query_one("#training", Static)
@@ -215,7 +239,7 @@ class TradingScreen(Screen[None]):
         bar.append(f"· completes {_finish(current)}", style="dim")
         target.update(bar)
 
-    def _render_skill_queue(self, report: AdvisorReport) -> None:
+    def _render_skill_queue(self, report: CharacterReport) -> None:
         """The full queue as Skill / Time left / Completion; current row highlighted,
         already-completed entries marked done."""
         table = self.query_one("#skillqueue", DataTable)
@@ -248,14 +272,14 @@ class CharacterPickerScreen(Screen[None]):
     def __init__(
         self,
         store: CharacterStore,
-        make_refresh_fn: MakeRefreshFn,
+        make_feed: MakeFeed,
         login_fn: LoginFn,
         remove_token_fn: RemoveTokenFn,
         interval_seconds: int,
     ) -> None:
         super().__init__()
         self._store = store
-        self._make_refresh_fn = make_refresh_fn
+        self._make_feed = make_feed
         self._login_fn = login_fn
         self._remove_token_fn = remove_token_fn
         self._interval = interval_seconds
@@ -281,7 +305,7 @@ class CharacterPickerScreen(Screen[None]):
             self.select_character(int(event.option.id))
 
     def select_character(self, character_id: int) -> None:
-        self.app.push_screen(TradingScreen(self._make_refresh_fn(character_id), self._interval))
+        self.app.push_screen(TradingScreen(self._make_feed(character_id), self._interval))
 
     def action_add(self) -> None:
         self.run_worker(self._add(), exclusive=True)
@@ -321,7 +345,7 @@ class EveTraderApp(App[None]):
     def __init__(
         self,
         store: CharacterStore,
-        make_refresh_fn: MakeRefreshFn,
+        make_feed: MakeFeed,
         login_fn: LoginFn,
         remove_token_fn: RemoveTokenFn,
         interval_seconds: int,
@@ -329,7 +353,7 @@ class EveTraderApp(App[None]):
     ) -> None:
         super().__init__()
         self._store = store
-        self._make_refresh_fn = make_refresh_fn
+        self._make_feed = make_feed
         self._login_fn = login_fn
         self._remove_token_fn = remove_token_fn
         self._interval = interval_seconds
@@ -345,7 +369,7 @@ class EveTraderApp(App[None]):
     def get_default_screen(self) -> Screen[None]:
         return CharacterPickerScreen(
             self._store,
-            self._make_refresh_fn,
+            self._make_feed,
             self._login_fn,
             self._remove_token_fn,
             self._interval,

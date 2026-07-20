@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from evetrader.config import RiskPreferences
-from evetrader.data.market import build_market_snapshot
+from evetrader.data.market import build_market_snapshot, orders_to_frame
 from evetrader.esi.models import MarketHistoryDay, MarketOrder
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.snapshot import MarketSnapshot
@@ -24,7 +24,9 @@ def _risk(*, min_margin: float = 0.05, min_daily_isk_volume: float = 1000.0) -> 
     )
 
 
-def _order(order_id: int, type_id: int, *, is_buy: bool, price: float) -> MarketOrder:
+def _order(
+    order_id: int, type_id: int, *, is_buy: bool, price: float, volume: int = 100
+) -> MarketOrder:
     return MarketOrder.model_validate(
         {
             "order_id": order_id,
@@ -33,8 +35,8 @@ def _order(order_id: int, type_id: int, *, is_buy: bool, price: float) -> Market
             "system_id": 30000142,
             "is_buy_order": is_buy,
             "price": price,
-            "volume_remain": 100,
-            "volume_total": 100,
+            "volume_remain": volume,
+            "volume_total": volume,
             "min_volume": 1,
             "range": "station",
             "duration": 90,
@@ -62,7 +64,7 @@ def _snapshot(
     return build_market_snapshot(
         region_id=10000002,
         captured_at=datetime(2020, 1, 1, tzinfo=UTC),
-        orders=orders,
+        orders=orders_to_frame(orders),
         history_by_type=history,
     )
 
@@ -198,6 +200,45 @@ def test_candidate_types_ranks_by_margin_and_drops_losers() -> None:
     )
 
     assert result == [40, 50]  # widest spread first; the negative-margin 34 dropped
+
+
+def test_candidate_types_weights_by_order_book_depth() -> None:
+    # Type 40 has a fat margin but a shallow book; type 50 has a thinner margin but a
+    # deep book. margin * depth should rank the liquid one first.
+    snapshot = _snapshot(
+        [
+            _order(1, 40, is_buy=True, price=100.0, volume=1),
+            _order(2, 40, is_buy=False, price=150.0, volume=1),  # margin ~37%, depth 1
+            _order(3, 50, is_buy=True, price=100.0, volume=10_000),
+            _order(4, 50, is_buy=False, price=120.0, volume=10_000),  # margin ~9%, depth 10k
+        ],
+        {},
+    )
+
+    result = candidate_types(
+        snapshot.orders, station_id=_STATION, fees=_FEES, min_margin=0.05, limit=10
+    )
+
+    assert result == [50, 40]  # deep+profitable beats shallow+high-margin
+
+
+def test_candidate_types_rejects_placeholder_buy_order_junk() -> None:
+    # A lone 0.01-ISK buy order gives a fake ~1,000,000% margin; it must not win.
+    snapshot = _snapshot(
+        [
+            _order(1, 99, is_buy=True, price=0.01, volume=1),
+            _order(2, 99, is_buy=False, price=10_000.0, volume=1),  # absurd fake margin
+            _order(3, 40, is_buy=True, price=100.0, volume=1000),
+            _order(4, 40, is_buy=False, price=150.0, volume=1000),  # a real 37% margin
+        ],
+        {},
+    )
+
+    result = candidate_types(
+        snapshot.orders, station_id=_STATION, fees=_FEES, min_margin=0.05, limit=10
+    )
+
+    assert result == [40]  # the junk item is excluded entirely
 
 
 def test_other_stations_are_ignored() -> None:

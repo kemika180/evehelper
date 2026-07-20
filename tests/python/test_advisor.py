@@ -6,7 +6,7 @@ from evetrader.advisor.engine import rank
 from evetrader.advisor.source import Opportunity, OpportunitySource, StationTradingSource
 from evetrader.advisor.state import CharacterState, TradeSkills, total_order_slots
 from evetrader.config import Config, RiskPreferences
-from evetrader.data.market import build_market_snapshot
+from evetrader.data.market import build_market_snapshot, orders_to_frame
 from evetrader.esi.models import MarketHistoryDay, MarketOrder
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.snapshot import MarketSnapshot
@@ -74,7 +74,7 @@ def _snapshot() -> MarketSnapshot:
     return build_market_snapshot(
         region_id=10000002,
         captured_at=datetime(2020, 1, 1, tzinfo=UTC),
-        orders=orders,
+        orders=orders_to_frame(orders),
         history_by_type={34: history},
     )
 
