@@ -17,6 +17,7 @@ from evetrader.esi.auth import (
     Authenticator,
     build_authorize_url,
     character_id_from_access_token,
+    character_identity,
     exchange_code,
     generate_pkce,
 )
@@ -39,9 +40,12 @@ def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def _make_jwt(sub: str) -> str:
+def _make_jwt(sub: str, name: str | None = None) -> str:
     header = _b64url(json.dumps({"alg": "RS256"}).encode())
-    payload = _b64url(json.dumps({"sub": sub}).encode())
+    claims: dict[str, str] = {"sub": sub}
+    if name is not None:
+        claims["name"] = name
+    payload = _b64url(json.dumps(claims).encode())
     return f"{header}.{payload}.signature"
 
 
@@ -91,6 +95,17 @@ def test_character_id_extracted_from_jwt_sub() -> None:
 def test_non_jwt_access_token_raises() -> None:
     with pytest.raises(AuthError):
         character_id_from_access_token("not-a-jwt")
+
+
+def test_character_identity_reads_id_and_name() -> None:
+    identity = character_identity(_make_jwt("CHARACTER:EVE:2112625428", name="Jane Doe"))
+    assert identity.character_id == 2112625428
+    assert identity.name == "Jane Doe"
+
+
+def test_character_identity_falls_back_when_name_absent() -> None:
+    identity = character_identity(_make_jwt("CHARACTER:EVE:42"))
+    assert identity.name == "Character 42"
 
 
 def test_exchange_code_posts_pkce_verifier() -> None:

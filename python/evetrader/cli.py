@@ -1,14 +1,15 @@
 """The `evetrader` entry point: `evetrader login` then `evetrader`. Composition root.
 
-Builds the real I/O resources (kept alive across refreshes so the client cache
-works) and wires the pipeline into the TUI. Not unit-tested — it is the live-only
-glue; the pipeline, app rendering, and auth pieces it composes are tested.
+Builds the I/O resources (shared across characters so the client cache is reused)
+and wires the pipeline, login, and character store into the TUI. Not unit-tested —
+it is the live-only glue; the pieces it composes are tested.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,10 +18,17 @@ import httpx
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
 from evetrader.data.universe import NameCache
-from evetrader.esi.auth import Authenticator, KeyringTokenStore, login
+from evetrader.esi.auth import (
+    Authenticator,
+    CharacterIdentity,
+    KeyringTokenStore,
+    character_identity,
+    login,
+)
 from evetrader.esi.client import EsiClient
 from evetrader.pipeline import AdvisorReport, refresh
-from evetrader.tui.app import EveTraderApp
+from evetrader.session import CharacterRecord, CharacterStore
+from evetrader.tui.app import EveTraderApp, RefreshFn
 
 
 @dataclass
@@ -42,34 +50,55 @@ def _build_resources(config: Config) -> _Resources:
     )
 
 
-def _character_id_path() -> Path:
-    return default_data_dir() / "character_id"
+def _characters_path() -> Path:
+    return default_data_dir() / "characters.json"
 
 
-def _save_character_id(character_id: int) -> None:
-    path = _character_id_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(character_id), encoding="utf-8")
-
-
-def _load_character_id() -> int:
-    return int(_character_id_path().read_text(encoding="utf-8"))
-
-
-async def _run_login(config: Config) -> int:
+async def _run_login(config: Config) -> CharacterIdentity:
     async with httpx.AsyncClient() as http:
         return await login(config, http, KeyringTokenStore())
 
 
-def _run_tui(config: Config, character_id: int) -> None:
+async def _migrate_legacy_character(config: Config, store: CharacterStore) -> None:
+    """Import a pre-multi-character `character_id` file into the store, resolving the
+    name from the stored token (no re-login needed)."""
+    legacy = default_data_dir() / "character_id"
+    if store.records() or not legacy.exists():
+        return
+    character_id = int(legacy.read_text(encoding="utf-8"))
+    async with httpx.AsyncClient() as http:
+        authenticator = Authenticator(config, http, KeyringTokenStore())
+        token = await authenticator.access_token(character_id)
+    store.add(CharacterRecord(character_id, character_identity(token).name))
+
+
+def _run_tui(config: Config) -> None:
+    store = CharacterStore(_characters_path())
+    asyncio.run(_migrate_legacy_character(config, store))
     resources = _build_resources(config)
 
-    async def refresh_fn() -> AdvisorReport:
-        return await refresh(
-            resources.client, resources.authenticator, config, character_id, resources.name_cache
-        )
+    def make_refresh_fn(character_id: int) -> RefreshFn:
+        async def refresh_fn() -> AdvisorReport:
+            return await refresh(
+                resources.client,
+                resources.authenticator,
+                config,
+                character_id,
+                resources.name_cache,
+            )
 
-    EveTraderApp(refresh_fn, config.refresh_interval_seconds).run()
+        return refresh_fn
+
+    async def login_fn() -> CharacterIdentity:
+        return await login(config, resources.http, KeyringTokenStore())
+
+    def remove_token_fn(character_id: int) -> None:
+        with contextlib.suppress(Exception):
+            KeyringTokenStore().delete(character_id)
+
+    EveTraderApp(
+        store, make_refresh_fn, login_fn, remove_token_fn, config.refresh_interval_seconds
+    ).run()
 
 
 def main() -> None:
@@ -81,8 +110,10 @@ def main() -> None:
     config = load_config(args.config or default_config_path())
 
     if args.command == "login":
-        character_id = asyncio.run(_run_login(config))
-        _save_character_id(character_id)
-        print(f"Logged in as character {character_id}; refresh token stored in the keyring.")
+        identity = asyncio.run(_run_login(config))
+        CharacterStore(_characters_path()).add(
+            CharacterRecord(identity.character_id, identity.name)
+        )
+        print(f"Logged in as {identity.name} ({identity.character_id}).")
     else:
-        _run_tui(config, _load_character_id())
+        _run_tui(config)

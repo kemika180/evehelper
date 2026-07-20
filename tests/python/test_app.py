@@ -1,16 +1,20 @@
-"""The TUI mounts, renders a report into the table and panels, and quits."""
+"""The TUI: the picker lists set-up characters, and the trading screen renders a
+report into the table and panels."""
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, OptionList, Static
 
 from evetrader.advisor.source import Opportunity
 from evetrader.advisor.state import CharacterState, TradeSkills
+from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import SkillQueueEntry
 from evetrader.market.fees import EffectiveFees
 from evetrader.pipeline import AdvisorReport
-from evetrader.tui.app import EveTraderApp
+from evetrader.session import CharacterRecord, CharacterStore
+from evetrader.tui.app import CharacterPickerScreen, EveTraderApp, RefreshFn
 
 
 def _report() -> AdvisorReport:
@@ -35,29 +39,69 @@ def _report() -> AdvisorReport:
         expected_isk_per_hour=156.0,
         reasoning="Buy 100 @ 100.01, sell @ 149.99; margin 37.5%",
     )
-    queue = [SkillQueueEntry(skill_id=16622, finished_level=5, queue_position=0)]
     return AdvisorReport(
         captured_at=datetime(2020, 1, 1, tzinfo=UTC),
         character=character,
         opportunities=[opportunity],
-        skill_queue=queue,
+        skill_queue=[SkillQueueEntry(skill_id=16622, finished_level=5, queue_position=0)],
         names={34: "Tritanium", 16622: "Accounting"},
     )
 
 
-def test_app_renders_report() -> None:
+async def _report_fn() -> AdvisorReport:
+    return _report()
+
+
+def _build_app(store: CharacterStore) -> EveTraderApp:
+    def make_refresh_fn(character_id: int) -> RefreshFn:
+        return _report_fn
+
+    async def login_fn() -> CharacterIdentity:
+        return CharacterIdentity(999, "New Char")
+
+    def remove_token_fn(character_id: int) -> None:
+        pass
+
+    return EveTraderApp(store, make_refresh_fn, login_fn, remove_token_fn, interval_seconds=30)
+
+
+def test_picker_lists_set_up_characters(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+    store.add(CharacterRecord(2, "Bob"))
+
     async def _drive() -> None:
-        app = EveTraderApp(refresh_fn=_report_fn, interval_seconds=30)
+        app = _build_app(store)
         async with app.run_test() as pilot:
-            table = app.query_one("#opportunities", DataTable)
-            assert table.row_count == 1
-            character_text = str(app.query_one("#character", Static).render())
-            assert "Wallet" in character_text and "5,000,000" in character_text
-            skillqueue_text = str(app.query_one("#skillqueue", Static).render())
-            assert "Accounting" in skillqueue_text
+            await pilot.pause()
+            option_list = app.query_one("#characters", OptionList)
+            assert option_list.option_count == 2
             await pilot.press("q")
 
-    async def _report_fn() -> AdvisorReport:
-        return _report()
+    asyncio.run(_drive())
+
+
+def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)  # the same path OptionSelected takes
+            await pilot.pause()
+            await pilot.pause()
+
+            trading = app.screen  # top of the stack
+            table = trading.query_one("#opportunities", DataTable)
+            assert table.row_count == 1
+            character_text = str(trading.query_one("#character", Static).render())
+            assert "5,000,000" in character_text
+            skillqueue_text = str(trading.query_one("#skillqueue", Static).render())
+            assert "Accounting" in skillqueue_text
+            await pilot.press("q")
 
     asyncio.run(_drive())

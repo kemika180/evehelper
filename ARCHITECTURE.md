@@ -51,6 +51,7 @@ eve_trading/
 │       │                      #   fee rates, watchlist (pure data — no I/O)
 │       ├── configload.py      # load Config from TOML (impure; kept out of the core)
 │       ├── cli.py             # `evetrader` entry point: `login` + run the TUI
+│       ├── session.py         # persistent set of logged-in characters (id + name)
 │       ├── pipeline.py        # composition root: fetch -> build inputs -> run advisor
 │       ├── esi/               # ALL network I/O lives here
 │       │   ├── auth.py        # OAuth2 SSO (PKCE, native-app flow); token store + refresh
@@ -71,7 +72,7 @@ eve_trading/
 │       │   ├── source.py      # OpportunitySource Protocol + Opportunity + station source
 │       │   └── engine.py      # gather from sources, rank under capital/slot/risk limits
 │       └── tui/
-│           └── app.py         # Textual app; interval refresh, opportunity + character panels
+│           └── app.py         # Textual app: character picker -> per-character trading screen
 ├── tests/
 │   └── python/
 └── data/                      # local cache: SDE, token store (gitignored)
@@ -133,10 +134,12 @@ v1 focuses on **station trading**; **hauling** is a later milestone on the same 
 ## Open decisions
 - **Advisor state persistence**: sqlite vs polars/parquet for suggestion history
   and realized P&L.
-- **Multi-character / multi-account** handling in `Config` and the TUI (defer past
-  v1 unless trivial).
 
 ## Resolved decisions
+- **Multi-character**: implemented — the keyring stores a refresh token per
+  character id, `session.py` persists the set of logged-in characters (id + name),
+  and the TUI opens on a picker (add via SSO login / remove) before the per-
+  character trading screen. Per-character view, not aggregated.
 - **Token storage** (milestone 2): OS keyring via the `keyring` library — the
   system secret service holds refresh tokens; no secret material in our files. It
   is never logged.
