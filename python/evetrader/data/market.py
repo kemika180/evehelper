@@ -30,6 +30,9 @@ _ORDER_SCHEMA: dict[str, pl.DataType] = {
 }
 
 _HISTORY_SCHEMA: dict[str, pl.DataType] = {
+    # ESI history is fetched per type and omits the type id; we attach it here so
+    # one frame can hold history for many types.
+    "type_id": pl.Int64(),
     "date": pl.Date(),
     "average": pl.Float64(),
     "highest": pl.Float64(),
@@ -44,8 +47,12 @@ def orders_to_frame(orders: list[MarketOrder]) -> pl.DataFrame:
     return pl.DataFrame(rows, schema=_ORDER_SCHEMA, orient="row")
 
 
-def history_to_frame(history: list[MarketHistoryDay]) -> pl.DataFrame:
-    rows = [day.model_dump() for day in history]
+def history_to_frame(history_by_type: dict[int, list[MarketHistoryDay]]) -> pl.DataFrame:
+    rows = [
+        {"type_id": type_id, **day.model_dump()}
+        for type_id, days in history_by_type.items()
+        for day in days
+    ]
     return pl.DataFrame(rows, schema=_HISTORY_SCHEMA, orient="row")
 
 
@@ -54,12 +61,12 @@ def build_market_snapshot(
     region_id: int,
     captured_at: datetime,
     orders: list[MarketOrder],
-    history: list[MarketHistoryDay],
+    history_by_type: dict[int, list[MarketHistoryDay]],
 ) -> MarketSnapshot:
-    """Assemble a MarketSnapshot from fetched orders and history."""
+    """Assemble a MarketSnapshot from fetched orders and per-type history."""
     return MarketSnapshot(
         region_id=region_id,
         captured_at=captured_at,
         orders=orders_to_frame(orders),
-        history=history_to_frame(history),
+        history=history_to_frame(history_by_type),
     )
