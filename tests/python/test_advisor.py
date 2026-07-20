@@ -121,6 +121,7 @@ def _opp(type_id: int, isk_per_hour: float) -> Opportunity:
         station_id=_STATION,
         buy_price=1.0,
         sell_price=2.0,
+        margin=0.5,
         quantity=1,
         capital_required=1.0,
         profit_per_unit=1.0,

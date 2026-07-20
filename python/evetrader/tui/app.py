@@ -18,6 +18,7 @@ from typing import ClassVar
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import BindingType
+from textual.containers import Horizontal
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, OptionList, Static, TabbedContent, TabPane
 from textual.widgets.option_list import Option
@@ -34,6 +35,18 @@ def _finish(entry: SkillQueueEntry) -> str:
     if entry.finish_date is None:
         return "unknown"
     return entry.finish_date.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _isk(value: float) -> str:
+    """Compact ISK: 648,161,887 -> 648.16m."""
+    magnitude = abs(value)
+    if magnitude >= 1e9:
+        return f"{value / 1e9:.2f}b"
+    if magnitude >= 1e6:
+        return f"{value / 1e6:.2f}m"
+    if magnitude >= 1e3:
+        return f"{value / 1e3:.1f}k"
+    return f"{value:.0f}"
 
 
 def _current_training(
@@ -91,6 +104,24 @@ class TradingScreen(Screen[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [("escape", "app.pop_screen", "Switch character")]
 
+    DEFAULT_CSS = """
+    TradingScreen #status { padding: 0 2; color: $text-muted; }
+    TradingScreen #stats { height: 4; padding: 1 1 0 1; }
+    TradingScreen .stat {
+        width: 1fr;
+        height: 100%;
+        border: round $primary;
+        padding: 0 1;
+        margin: 0 1 0 0;
+    }
+    TradingScreen #training {
+        margin: 1 2 0 2;
+        padding: 0 1;
+        background: $boost;
+    }
+    TradingScreen #opportunities, TradingScreen #skillqueue { margin: 1 1; height: 1fr; }
+    """
+
     def __init__(self, refresh_fn: RefreshFn, interval_seconds: int) -> None:
         super().__init__()
         self._refresh_fn = refresh_fn
@@ -101,7 +132,11 @@ class TradingScreen(Screen[None]):
         yield Static("Fetching market data…", id="status")
         with TabbedContent():
             with TabPane("Advisor", id="advisor"):
-                yield Static("", id="character")
+                with Horizontal(id="stats"):
+                    yield Static(id="stat-wallet", classes="stat")
+                    yield Static(id="stat-slots", classes="stat")
+                    yield Static(id="stat-tax", classes="stat")
+                    yield Static(id="stat-broker", classes="stat")
                 yield Static("", id="training")
                 yield DataTable(id="opportunities", zebra_stripes=True)
             with TabPane("Skill Queue", id="queue"):
@@ -110,7 +145,7 @@ class TradingScreen(Screen[None]):
 
     def on_mount(self) -> None:
         opportunities = self.query_one("#opportunities", DataTable)
-        opportunities.add_columns("Type", "Buy", "Sell", "Qty", "Capital", "ISK/hr", "Notes")
+        opportunities.add_columns("Item", "Buy", "Sell", "Margin", "Units", "Capital", "ISK/hr")
         queue = self.query_one("#skillqueue", DataTable)
         queue.add_columns("Skill", "Time left", "Completion")
         self.run_worker(self._refresh(), exclusive=True)
@@ -124,35 +159,44 @@ class TradingScreen(Screen[None]):
         except Exception as error:  # surface it instead of a blank screen
             status.update(f"[Refresh failed] {type(error).__name__}: {error}")
             return
-        self._render_character(report)
-        self._render_opportunities(report)
+        self._render_stats(report)
         self._render_training(report)
+        self._render_opportunities(report)
         self._render_skill_queue(report)
         count = len(report.opportunities)
-        status.update(f"{count} opportunit{'y' if count == 1 else 'ies'} — updated")
+        noun = "opportunity" if count == 1 else "opportunities"
+        status.update(f"{count} {noun} at station {report.character.station_id} — updated")
 
-    def _render_character(self, report: AdvisorReport) -> None:
-        character = report.character
-        self.query_one("#character", Static).update(
-            f"Station {character.station_id}  |  "
-            f"Wallet {character.wallet_balance:,.0f} ISK  |  "
-            f"Free order slots {character.free_order_slots}  |  "
-            f"Sales tax {character.fees.sales_tax:.2%}  Broker {character.fees.broker_fee:.2%}"
+    def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
+        content = Text()
+        content.append(f"{label}\n", style="dim")
+        content.append(value, style=value_style)
+        self.query_one(selector, Static).update(content)
+
+    def _render_stats(self, report: AdvisorReport) -> None:
+        fees = report.character.fees
+        self._set_tile(
+            "#stat-wallet", "WALLET", f"{_isk(report.character.wallet_balance)} ISK", "bold green"
         )
+        self._set_tile(
+            "#stat-slots", "FREE ORDER SLOTS", str(report.character.free_order_slots), "bold cyan"
+        )
+        self._set_tile("#stat-tax", "SALES TAX", f"{fees.sales_tax:.2%}", "bold yellow")
+        self._set_tile("#stat-broker", "BROKER FEE", f"{fees.broker_fee:.2%}", "bold yellow")
 
     def _render_opportunities(self, report: AdvisorReport) -> None:
         table = self.query_one("#opportunities", DataTable)
         table.clear()
-        for opportunity in report.opportunities:
+        for index, opportunity in enumerate(report.opportunities):
             name = report.names.get(opportunity.type_id, str(opportunity.type_id))
             table.add_row(
-                name,
-                f"{opportunity.buy_price:,.2f}",
-                f"{opportunity.sell_price:,.2f}",
-                str(opportunity.quantity),
-                f"{opportunity.capital_required:,.0f}",
-                f"{opportunity.expected_isk_per_hour:,.0f}",
-                opportunity.reasoning,
+                Text(name, style="bold" if index == 0 else ""),
+                Text(f"{opportunity.buy_price:,.2f}", justify="right"),
+                Text(f"{opportunity.sell_price:,.2f}", justify="right"),
+                Text(f"{opportunity.margin:.1%}", justify="right", style="green"),
+                Text(f"{opportunity.quantity:,}", justify="right"),
+                Text(_isk(opportunity.capital_required), justify="right", style="cyan"),
+                Text(_isk(opportunity.expected_isk_per_hour), justify="right", style="bold green"),
             )
 
     def _render_training(self, report: AdvisorReport) -> None:
@@ -160,17 +204,16 @@ class TradingScreen(Screen[None]):
         current = _current_training(report.skill_queue, report.captured_at)
         target = self.query_one("#training", Static)
         if current is None:
-            target.update(
-                "Training: nothing (queue empty)"
-                if not report.skill_queue
-                else "Training: paused (no skill actively training)"
-            )
+            idle = "⏸  Skill queue empty" if not report.skill_queue else "⏸  Training paused"
+            target.update(Text(idle, style="bold"))
             return
         name = report.names.get(current.skill_id, str(current.skill_id))
-        target.update(
-            f"Training: {name} → L{current.finished_level}  ·  "
-            f"{_time_left(current, report.captured_at)} left  ·  completes {_finish(current)}"
-        )
+        bar = Text()
+        bar.append("▶ TRAINING  ", style="bold magenta")
+        bar.append(f"{name} → L{current.finished_level}", style="bold")
+        bar.append(f"   {_time_left(current, report.captured_at)} left   ")
+        bar.append(f"· completes {_finish(current)}", style="dim")
+        target.update(bar)
 
     def _render_skill_queue(self, report: AdvisorReport) -> None:
         """The full queue as Skill / Time left / Completion; current row highlighted,

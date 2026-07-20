@@ -81,6 +81,7 @@ def _report() -> AdvisorReport:
         station_id=60003760,
         buy_price=100.01,
         sell_price=149.99,
+        margin=0.375,
         quantity=100,
         capital_required=10001.0,
         profit_per_unit=37.48,
@@ -155,8 +156,8 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
             trading = app.screen  # top of the stack
             table = trading.query_one("#opportunities", DataTable)
             assert table.row_count == 1
-            character_text = str(trading.query_one("#character", Static).render())
-            assert "5,000,000" in character_text
+            wallet_text = str(trading.query_one("#stat-wallet", Static).render())
+            assert "WALLET" in wallet_text and "5.00m" in wallet_text
             # Completion is shown in local time (same conversion, TZ-independent here).
             expected_local = (
                 datetime(2026, 8, 1, 12, 0, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M %Z")
