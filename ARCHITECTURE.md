@@ -99,7 +99,11 @@ esi/ + data/   -->   MarketSnapshot + CharacterState   -->   advisor/engine.rank
   engine consumes any list of sources.
 
 ## Money-making verticals
-v1 focuses on **station trading**; **hauling** is a later milestone on the same core.
+> Note (2026-07-20): the active strategy is **value investing** (see § Resolved
+> decisions and § Roadmap). Station trading below was the original v1 vertical and
+> is retired from the pipeline; the description is kept as design history.
+
+Original plan — v1 focuses on **station trading**; **hauling** is a later milestone.
 - **Station trading**: place buy orders below market, sell orders above, profit on
   the spread at one station. Needs: best-buy/best-sell per type, fee/tax-adjusted
   margin, competition & 0.01-ISK undercut pressure, daily volume (velocity) from
@@ -108,7 +112,11 @@ v1 focuses on **station trading**; **hauling** is a later milestone on the same 
   sells for in region B; suggest buy/haul/sell accounting for cargo volume, route
   jumps, and price impact.
 
-## Milestones
+## Milestones (original plan — shipped, then the strategy pivoted)
+Milestones 1–5 landed as written; milestone 4's station-trading engine was then
+**retired in favour of value investing** (see § Resolved decisions and § Roadmap).
+Kept here as the build history.
+
 1. Scaffold: `pyproject.toml`, package skeleton, `Config` pydantic model, an
    `evetrader` entry point that launches an empty Textual app. `pytest` +
    `mypy --strict` + `ruff` all green.
@@ -131,9 +139,48 @@ v1 focuses on **station trading**; **hauling** is a later milestone on the same 
    copied inventory/market exports for instant state, bypassing asset cache lag);
    persist past suggestions and realized P&L to tune scoring.
 
+## Roadmap (planned)
+The tool is a set of location-aware money-making **modules**; each character uses
+whichever fit their situation (a Forge trader vs a null resident get different
+advice). Value investing (`market/investment.py`) is the first module. Planned, in
+rough order:
+
+**Near-term (small, high value)**
+- **Active-listings overlay** — show the character's own open market orders inside
+  the buy/sell lists, coloured green if still best price, red if undercut (sell) /
+  overcut (buy).
+- **Skill-info popup** — select a skill in the queue (later the full skill list) to
+  see its details.
+- **Downtrend guard** — distinguish a real dip from a structural decline (compare a
+  short vs long average) so buys don't chase items that won't revert.
+
+**Modules — crafting/PI before hauling**
+- **Crafting / industry** tracking & assistance, and **PI (planetary interaction)**
+  tracking & assistance. Self-contained (blueprints, jobs, PI setups) and don't
+  depend on volatile live conditions — so they come first.
+- **Hauling / regional arbitrage** (Jita ↔ your hub) — **after** crafting/PI, because
+  it depends heavily on in-game context: routes, gate/route safety, cargo volume,
+  what the alliance is actually bidding for. Must be route- and security-aware so it
+  never suggests a dangerous trip. Needs the SDE (cargo volumes) + ESI route data.
+- **Asset browser + containers** — browse assets and look inside containers/ships
+  (rebuild the asset tree from ESI's flat list).
+
+**Persistence / data (enables several of the above)**
+- **Advisor state persistence** (sqlite vs polars/parquet) — remember past
+  suggestions and realized P&L to tune scoring.
+- **Self-recorded structure history** — for *private* structures with no public
+  history, record observed prices over time to build a channel. (Not needed for a
+  public hub like the 4-HWWF Keepstar, which has region history.)
+
+**Deferred / optional**
+- "Follow current location" toggle (analyze wherever docked) — decided against for
+  hub trading, but available if wanted.
+- `esi-markets.structure_markets.v1` scope — only for *private* structures; public
+  hubs work through the region endpoints.
+
 ## Open decisions
 - **Advisor state persistence**: sqlite vs polars/parquet for suggestion history
-  and realized P&L.
+  and realized P&L (see Roadmap § Persistence).
 
 ## Resolved decisions
 - **Strategy: value investing, not station trading** (2026-07-20). The active
