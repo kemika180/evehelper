@@ -119,6 +119,7 @@ class TradingScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [("escape", "app.pop_screen", "Switch character")]
 
     DEFAULT_CSS = """
+    TradingScreen #location { padding: 0 2; text-style: bold; color: $accent; }
     TradingScreen #status { padding: 0 2; color: $text-muted; }
     TradingScreen #stats { height: 6; padding: 1 1 0 1; }
     TradingScreen .stat {
@@ -143,6 +144,7 @@ class TradingScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static("", id="location")
         yield Static("Fetching market data…", id="status")
         with TabbedContent():
             with TabPane("Advisor", id="advisor"):
@@ -174,13 +176,13 @@ class TradingScreen(Screen[None]):
         except Exception as error:  # surface it instead of a blank screen
             status.update(f"[Character load failed] {type(error).__name__}: {error}")
             return
-        self.app.sub_title = character_report.station_name
+        self.query_one("#location", Static).update(f"📍 {character_report.station_name}")
         self._render_stats(character_report)
         self._render_training(character_report)
         self._render_skill_queue(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
-        status.update(f"Scanning {character_report.station_name} for opportunities…")
+        status.update("Scanning for opportunities…")
         try:
             opportunity_report = await self._feed.opportunities(character_report.character)
         except Exception as error:
@@ -189,7 +191,7 @@ class TradingScreen(Screen[None]):
         self._render_opportunities(opportunity_report)
         count = len(opportunity_report.opportunities)
         noun = "opportunity" if count == 1 else "opportunities"
-        status.update(f"{count} {noun} — {character_report.station_name} — updated")
+        status.update(f"{count} {noun} — updated")
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
         content = Text()

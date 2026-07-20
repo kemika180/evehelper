@@ -171,8 +171,9 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
             assert table.row_count == 1
             wallet_text = str(trading.query_one("#stat-wallet", Static).render())
             assert "WALLET" in wallet_text and "5.00m" in wallet_text
-            # The station shows its resolved name, not the numeric id.
-            assert app.sub_title == "Jita IV - Moon 4 - Caldari Navy Assembly Plant"
+            # The station shows its resolved name in the location row, not the id.
+            location_text = str(trading.query_one("#location", Static).render())
+            assert "Jita IV - Moon 4 - Caldari Navy Assembly Plant" in location_text
             # Completion is shown in local time (same conversion, TZ-independent here).
             expected_local = (
                 datetime(2026, 8, 1, 12, 0, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M %Z")
