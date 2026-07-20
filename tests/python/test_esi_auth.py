@@ -186,6 +186,40 @@ def test_authenticator_refreshes_rotates_and_caches() -> None:
     assert sent_refresh == ["r0", "r1"]  # each refresh uses the latest rotated token
 
 
+def test_authenticator_keeps_tokens_separate_per_character() -> None:
+    # Each character's refresh must use ITS OWN stored token and cache its own
+    # access token — not leak one character's token to another.
+    def handler(request: httpx.Request) -> httpx.Response:
+        form = urllib.parse.parse_qs(request.content.decode())
+        incoming = form["refresh_token"][0]
+        # Echo which character's token was presented so we can assert isolation.
+        return httpx.Response(
+            200,
+            json={
+                "access_token": f"access-for-{incoming}",
+                "token_type": "Bearer",
+                "expires_in": 1200,
+                "refresh_token": incoming,
+            },
+        )
+
+    store = _FakeStore()
+    store.save(1, "refresh-1")
+    store.save(2, "refresh-2")
+
+    async def body() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http:
+            auth = Authenticator(_config(), http, store)
+            assert await auth.access_token(1) == "access-for-refresh-1"
+            # With the bug, this returned character 1's cached token.
+            assert await auth.access_token(2) == "access-for-refresh-2"
+            # Selecting 1 again must still return 1's token, from its own cache.
+            assert await auth.access_token(1) == "access-for-refresh-1"
+
+    _run(body)
+
+
 def test_authenticator_without_stored_token_raises() -> None:
     async def body() -> None:
         transport = httpx.MockTransport(lambda _: httpx.Response(200, json={}))
