@@ -59,7 +59,7 @@ def _find(orders: list[MarketOrder], history: dict[int, list[MarketHistoryDay]],
         window=10,
         buy_position=0.2,
         sell_position=0.8,
-        min_daily_volume=0.0,
+        min_daily_isk_volume=0.0,
         max_capital_per_item=1_000_000.0,
     )
 

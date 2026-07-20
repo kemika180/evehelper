@@ -36,6 +36,19 @@ class InvestmentSignal:
     reasoning: str
 
 
+def liquid_types(orders: pl.DataFrame, station_id: int, limit: int) -> list[int]:
+    """The type ids with the most sell-side ISK in the book — the most liquid items,
+    worth pulling history for as buy candidates."""
+    sells = orders.filter((pl.col("location_id") == station_id) & (~pl.col("is_buy_order")))
+    ranked = (
+        sells.group_by("type_id")
+        .agg((pl.col("price") * pl.col("volume_remain")).sum().alias("isk"))
+        .sort("isk", descending=True)
+        .head(limit)
+    )
+    return [int(type_id) for type_id in ranked["type_id"].to_list()]
+
+
 def _channels(history: pl.DataFrame, window: int) -> pl.DataFrame:
     recent = (
         history.sort("date", descending=True).group_by("type_id", maintain_order=True).head(window)
@@ -74,7 +87,7 @@ def find_opportunities(
     window: int,
     buy_position: float,
     sell_position: float,
-    min_daily_volume: float,
+    min_daily_isk_volume: float,
     max_capital_per_item: float,
 ) -> list[InvestmentSignal]:
     """Buy signals (cheap) and sell signals (held and dear), best expected profit first."""
@@ -91,7 +104,7 @@ def find_opportunities(
         avg_volume = float(row["avg_volume"]) if row["avg_volume"] is not None else 0.0
         if fair <= 0.0 or high <= low or int(row["days"]) < window // 2:
             continue
-        if avg_volume < min_daily_volume:
+        if avg_volume * fair < min_daily_isk_volume:  # daily ISK traded, a liquidity floor
             continue
         width = high - low
 

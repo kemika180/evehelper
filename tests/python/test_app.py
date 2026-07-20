@@ -7,11 +7,11 @@ from pathlib import Path
 
 from textual.widgets import DataTable, OptionList, Static
 
-from evetrader.advisor.source import Opportunity
 from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import SkillQueueEntry
 from evetrader.market.fees import EffectiveFees
+from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
@@ -90,29 +90,32 @@ def _character_report() -> CharacterReport:
                 finish_date=datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
             )
         ],
+        holdings={34: 500},
         names={16622: "Accounting"},
         station_name="Jita IV - Moon 4 - Caldari Navy Assembly Plant",
     )
 
 
+def _signal(type_id: int, action: str, current: float, fair: float, position: float) -> InvestmentSignal:
+    return InvestmentSignal(
+        type_id=type_id,
+        action=action,
+        current_price=current,
+        fair_value=fair,
+        low_band=fair * 0.8,
+        high_band=fair * 1.2,
+        channel_position=position,
+        quantity=100,
+        expected_profit=1_000_000.0,
+        reasoning="test",
+    )
+
+
 def _opportunity_report() -> OpportunityReport:
     return OpportunityReport(
-        opportunities=[
-            Opportunity(
-                kind="station_trade",
-                type_id=34,
-                station_id=60003760,
-                buy_price=100.01,
-                sell_price=149.99,
-                margin=0.375,
-                quantity=100,
-                capital_required=10001.0,
-                profit_per_unit=37.48,
-                expected_isk_per_hour=156.0,
-                reasoning="Buy 100 @ 100.01, sell @ 149.99; margin 37.5%",
-            )
-        ],
-        names={34: "Tritanium"},
+        buys=[_signal(34, "BUY", current=700.0, fair=1000.0, position=0.05)],
+        sells=[_signal(35, "SELL", current=1300.0, fair=1000.0, position=0.95)],
+        names={34: "Tritanium", 35: "Pyerite"},
     )
 
 
@@ -167,8 +170,8 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
                 await pilot.pause()
 
             trading = app.screen  # top of the stack
-            table = trading.query_one("#opportunities", DataTable)
-            assert table.row_count == 1
+            assert trading.query_one("#buys", DataTable).row_count == 1
+            assert trading.query_one("#sells", DataTable).row_count == 1
             wallet_text = str(trading.query_one("#stat-wallet", Static).render())
             assert "WALLET" in wallet_text and "5.00m" in wallet_text
             # The station shows its resolved name in the location row, not the id.
