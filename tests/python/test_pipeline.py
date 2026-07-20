@@ -141,7 +141,7 @@ def _handler(request: httpx.Request) -> httpx.Response:
         import json
 
         ids = json.loads(request.content)
-        catalogue = {34: "Tritanium", 16622: "Accounting"}
+        catalogue = {34: "Tritanium", 16622: "Accounting", _STATION: "Jita IV-4 CNAP"}
         return httpx.Response(200, json=[{"id": i, "name": catalogue[i], "category": "x"} for i in ids])
     raise AssertionError(f"unexpected {path}")
 
@@ -161,6 +161,7 @@ def test_pipeline_two_phases_produce_reports(tmp_path: Path) -> None:
             )
             assert character.skill_queue[0].skill_id == 16622
             assert character.names[16622] == "Accounting"
+            assert character.station_name == "Jita IV-4 CNAP"
             assert character.character.free_order_slots == 25  # Trade 5 -> 25, no open orders
             assert character.character.fees.sales_tax > 0.0
 
