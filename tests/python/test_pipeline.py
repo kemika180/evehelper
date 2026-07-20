@@ -11,7 +11,7 @@ from evetrader.config import Config, RiskPreferences
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient
-from evetrader.pipeline import refresh
+from evetrader.pipeline import fetch_character, fetch_opportunities
 
 _STATION = 60003760
 _REGION = 10000002
@@ -146,29 +146,30 @@ def _handler(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"unexpected {path}")
 
 
-def test_refresh_produces_full_report(tmp_path: Path) -> None:
+def test_pipeline_two_phases_produce_reports(tmp_path: Path) -> None:
     async def go() -> None:
         transport = httpx.MockTransport(_handler)
         async with httpx.AsyncClient(transport=transport) as http:
             client = EsiClient(_config(), http)
             authenticator = Authenticator(_config(), http, _FakeStore())
             name_cache = NameCache(tmp_path / "names.json", client)
+            now = lambda: datetime(2020, 1, 1, tzinfo=UTC)  # noqa: E731
 
-            report = await refresh(
-                client,
-                authenticator,
-                _config(),
-                character_id=42,
-                name_cache=name_cache,
-                now=lambda: datetime(2020, 1, 1, tzinfo=UTC),
+            # Phase 1: character + skill queue.
+            character = await fetch_character(
+                client, authenticator, _config(), 42, name_cache, now=now
             )
+            assert character.skill_queue[0].skill_id == 16622
+            assert character.names[16622] == "Accounting"
+            assert character.character.free_order_slots == 25  # Trade 5 -> 25, no open orders
+            assert character.character.fees.sales_tax > 0.0
 
-            assert len(report.opportunities) == 1
-            assert report.opportunities[0].type_id == 34
-            assert report.names[34] == "Tritanium"
-            assert report.names[16622] == "Accounting"
-            assert report.skill_queue[0].skill_id == 16622
-            assert report.character.free_order_slots == 25  # Trade 5 -> 25, no open orders
-            assert report.character.fees.sales_tax > 0.0
+            # Phase 2: the market scan (discovery mode via scan_candidates default).
+            opportunities = await fetch_opportunities(
+                client, _config(), character.character, name_cache, now=now
+            )
+            assert len(opportunities.opportunities) == 1
+            assert opportunities.opportunities[0].type_id == 34
+            assert opportunities.names[34] == "Tritanium"
 
     asyncio.run(go())

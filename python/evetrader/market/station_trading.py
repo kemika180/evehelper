@@ -26,6 +26,10 @@ from evetrader.market.snapshot import MarketSnapshot
 
 _ISK_TICK = 0.01
 _HOURS_PER_DAY = 24
+# A fee-adjusted margin above this is a data artefact, not a trade — e.g. a lone
+# 0.01-ISK placeholder buy order makes profit/buy_price explode to millions of %.
+# Real station-trade spreads never approach 100%.
+_MAX_MARGIN = 1.0
 
 
 @dataclass(frozen=True)
@@ -56,12 +60,20 @@ def _order_book(orders: pl.DataFrame, station_id: int) -> pl.DataFrame:
     buys = (
         at_station.filter(pl.col("is_buy_order"))
         .group_by("type_id")
-        .agg(pl.col("price").max().alias("best_buy"), pl.len().alias("competing_buy_orders"))
+        .agg(
+            pl.col("price").max().alias("best_buy"),
+            pl.len().alias("competing_buy_orders"),
+            pl.col("volume_remain").sum().alias("buy_volume"),
+        )
     )
     sells = (
         at_station.filter(~pl.col("is_buy_order"))
         .group_by("type_id")
-        .agg(pl.col("price").min().alias("best_sell"), pl.len().alias("competing_sell_orders"))
+        .agg(
+            pl.col("price").min().alias("best_sell"),
+            pl.len().alias("competing_sell_orders"),
+            pl.col("volume_remain").sum().alias("sell_volume"),
+        )
     )
     return buys.join(sells, on="type_id", how="inner")
 
@@ -79,6 +91,11 @@ def candidate_types(
 
     Discovery step: pick which items are worth pulling history for, from the full
     station order book, without a fixed watchlist. Pure.
+
+    Ranked by margin * order-book depth (the smaller of the two sides' resting
+    volume) — a liquidity proxy standing in for the daily volume we don't have yet.
+    Ranking by margin alone surfaces expensive illiquid items that then fail the
+    volume filter; weighting by depth surfaces items that are profitable AND liquid.
     """
     book = _order_book(orders, station_id)
     scored: list[tuple[float, int]] = []
@@ -89,10 +106,12 @@ def candidate_types(
             continue
         profit = _profit_per_unit(buy_price, sell_price, fees)
         margin = profit / buy_price
-        if profit > 0.0 and margin >= min_margin:
-            scored.append((margin, int(row["type_id"])))
+        if profit <= 0.0 or not (min_margin <= margin <= _MAX_MARGIN):
+            continue
+        depth = min(int(row["buy_volume"]), int(row["sell_volume"]))
+        scored.append((margin * depth, int(row["type_id"])))
     scored.sort(reverse=True)
-    return [type_id for _margin, type_id in scored[:limit]]
+    return [type_id for _score, type_id in scored[:limit]]
 
 
 def _daily_volumes(history: pl.DataFrame) -> pl.DataFrame:
@@ -128,7 +147,7 @@ def rank_station_trades(
 
         profit = _profit_per_unit(buy_price, sell_price, fees)
         margin = profit / buy_price
-        if profit <= 0.0 or margin < risk.min_margin:
+        if profit <= 0.0 or not (risk.min_margin <= margin <= _MAX_MARGIN):
             continue
 
         raw_volume = row["daily_volume"]

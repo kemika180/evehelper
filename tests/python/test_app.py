@@ -12,12 +12,12 @@ from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import SkillQueueEntry
 from evetrader.market.fees import EffectiveFees
-from evetrader.pipeline import AdvisorReport
+from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
     CharacterPickerScreen,
     EveTraderApp,
-    RefreshFn,
+    RefreshFeed,
     _completion,
     _current_training,
 )
@@ -65,8 +65,8 @@ def test_completion_hidden_for_completed_skills() -> None:
     assert _completion(future, reference) != "—"  # still shown for not-yet-complete
 
 
-def _report() -> AdvisorReport:
-    character = CharacterState(
+def _character_state() -> CharacterState:
+    return CharacterState(
         station_id=60003760,
         wallet_balance=5_000_000.0,
         fees=EffectiveFees(sales_tax=0.036, broker_fee=0.0146),
@@ -75,23 +75,12 @@ def _report() -> AdvisorReport:
         ),
         free_order_slots=23,
     )
-    opportunity = Opportunity(
-        kind="station_trade",
-        type_id=34,
-        station_id=60003760,
-        buy_price=100.01,
-        sell_price=149.99,
-        margin=0.375,
-        quantity=100,
-        capital_required=10001.0,
-        profit_per_unit=37.48,
-        expected_isk_per_hour=156.0,
-        reasoning="Buy 100 @ 100.01, sell @ 149.99; margin 37.5%",
-    )
-    return AdvisorReport(
+
+
+def _character_report() -> CharacterReport:
+    return CharacterReport(
         captured_at=datetime(2020, 1, 1, tzinfo=UTC),
-        character=character,
-        opportunities=[opportunity],
+        character=_character_state(),
         skill_queue=[
             SkillQueueEntry(
                 skill_id=16622,
@@ -101,17 +90,40 @@ def _report() -> AdvisorReport:
                 finish_date=datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
             )
         ],
-        names={34: "Tritanium", 16622: "Accounting"},
+        names={16622: "Accounting"},
     )
 
 
-async def _report_fn() -> AdvisorReport:
-    return _report()
+def _opportunity_report() -> OpportunityReport:
+    return OpportunityReport(
+        opportunities=[
+            Opportunity(
+                kind="station_trade",
+                type_id=34,
+                station_id=60003760,
+                buy_price=100.01,
+                sell_price=149.99,
+                margin=0.375,
+                quantity=100,
+                capital_required=10001.0,
+                profit_per_unit=37.48,
+                expected_isk_per_hour=156.0,
+                reasoning="Buy 100 @ 100.01, sell @ 149.99; margin 37.5%",
+            )
+        ],
+        names={34: "Tritanium"},
+    )
 
 
 def _build_app(store: CharacterStore) -> EveTraderApp:
-    def make_refresh_fn(character_id: int) -> RefreshFn:
-        return _report_fn
+    def make_feed(character_id: int) -> RefreshFeed:
+        async def character() -> CharacterReport:
+            return _character_report()
+
+        async def opportunities(state: CharacterState) -> OpportunityReport:
+            return _opportunity_report()
+
+        return RefreshFeed(character=character, opportunities=opportunities)
 
     async def login_fn() -> CharacterIdentity:
         return CharacterIdentity(999, "New Char")
@@ -119,7 +131,7 @@ def _build_app(store: CharacterStore) -> EveTraderApp:
     def remove_token_fn(character_id: int) -> None:
         pass
 
-    return EveTraderApp(store, make_refresh_fn, login_fn, remove_token_fn, interval_seconds=30)
+    return EveTraderApp(store, make_feed, login_fn, remove_token_fn, interval_seconds=30)
 
 
 def test_picker_lists_set_up_characters(tmp_path: Path) -> None:
@@ -150,8 +162,8 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
             picker = app.screen
             assert isinstance(picker, CharacterPickerScreen)
             picker.select_character(1)  # the same path OptionSelected takes
-            await pilot.pause()
-            await pilot.pause()
+            for _ in range(4):  # let both refresh phases run
+                await pilot.pause()
 
             trading = app.screen  # top of the stack
             table = trading.query_one("#opportunities", DataTable)

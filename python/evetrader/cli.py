@@ -15,6 +15,7 @@ from pathlib import Path
 
 import httpx
 
+from evetrader.advisor.state import CharacterState
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
 from evetrader.data.universe import NameCache
@@ -26,9 +27,14 @@ from evetrader.esi.auth import (
     login,
 )
 from evetrader.esi.client import EsiClient
-from evetrader.pipeline import AdvisorReport, refresh
+from evetrader.pipeline import (
+    CharacterReport,
+    OpportunityReport,
+    fetch_character,
+    fetch_opportunities,
+)
 from evetrader.session import CharacterRecord, CharacterStore
-from evetrader.tui.app import EveTraderApp, RefreshFn
+from evetrader.tui.app import EveTraderApp, RefreshFeed
 
 
 @dataclass
@@ -77,9 +83,9 @@ def _run_tui(config: Config) -> None:
     asyncio.run(_migrate_legacy_character(config, store))
     resources = _build_resources(config)
 
-    def make_refresh_fn(character_id: int) -> RefreshFn:
-        async def refresh_fn() -> AdvisorReport:
-            return await refresh(
+    def make_feed(character_id: int) -> RefreshFeed:
+        async def character() -> CharacterReport:
+            return await fetch_character(
                 resources.client,
                 resources.authenticator,
                 config,
@@ -87,7 +93,10 @@ def _run_tui(config: Config) -> None:
                 resources.name_cache,
             )
 
-        return refresh_fn
+        async def opportunities(state: CharacterState) -> OpportunityReport:
+            return await fetch_opportunities(resources.client, config, state, resources.name_cache)
+
+        return RefreshFeed(character=character, opportunities=opportunities)
 
     async def login_fn() -> CharacterIdentity:
         return await login(config, resources.http, KeyringTokenStore())
@@ -98,7 +107,7 @@ def _run_tui(config: Config) -> None:
 
     EveTraderApp(
         store,
-        make_refresh_fn,
+        make_feed,
         login_fn,
         remove_token_fn,
         config.refresh_interval_seconds,

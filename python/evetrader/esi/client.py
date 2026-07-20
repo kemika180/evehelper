@@ -25,6 +25,9 @@ from evetrader.config import Config
 _BASE_URL = "https://esi.evetech.net/latest"
 # Back off once the remaining error budget for the window drops to this.
 _ERROR_LIMIT_FLOOR = 5
+# Bounded concurrency for paged fetches — fast without hammering ESI. Successful
+# requests don't count against the error-limit budget; the cap keeps bursts modest.
+_MAX_CONCURRENT_PAGES = 8
 
 Params = Mapping[str, str | int]
 
@@ -94,14 +97,25 @@ class EsiClient:
     async def get_all_pages(
         self, path: str, *, params: Params | None = None, token: str | None = None
     ) -> list[bytes]:
-        """Fetch every page of a paged resource, following the ``X-Pages`` header."""
+        """Fetch every page of a paged resource, following the ``X-Pages`` header.
+
+        Page 1 is fetched first to learn the page count; the rest are fetched with
+        bounded concurrency and returned in page order.
+        """
         base = dict(params or {})
         first, pages = await self._request(path, params={**base, "page": 1}, token=token)
-        bodies = [first]
-        for page in range(2, pages + 1):
-            body, _ = await self._request(path, params={**base, "page": page}, token=token)
-            bodies.append(body)
-        return bodies
+        if pages <= 1:
+            return [first]
+
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PAGES)
+
+        async def fetch(page: int) -> bytes:
+            async with semaphore:
+                body, _ = await self._request(path, params={**base, "page": page}, token=token)
+                return body
+
+        rest = await asyncio.gather(*(fetch(page) for page in range(2, pages + 1)))
+        return [first, *rest]
 
     async def post_json(self, path: str, *, body: object, token: str | None = None) -> bytes:
         """POST a JSON body (e.g. an id list) and return the response body.
