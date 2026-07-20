@@ -219,10 +219,12 @@ class Authenticator:
         self._http = http
         self._store = store
         self._now = now
-        self._active: _ActiveToken | None = None
+        # Cached access token PER character — sharing one slot hands the wrong
+        # character's token out when multiple characters are set up.
+        self._active: dict[int, _ActiveToken] = {}
 
     async def access_token(self, character_id: int) -> str:
-        active = self._active
+        active = self._active.get(character_id)
         if active is not None and self._now() < active.expires_at:
             return active.value
 
@@ -238,7 +240,7 @@ class Authenticator:
         )
         self._store.save(character_id, token.refresh_token)  # ESI rotates refresh tokens
         expires_at = self._now() + timedelta(seconds=token.expires_in) - _EXPIRY_SKEW
-        self._active = _ActiveToken(token.access_token, expires_at)
+        self._active[character_id] = _ActiveToken(token.access_token, expires_at)
         return token.access_token
 
 
