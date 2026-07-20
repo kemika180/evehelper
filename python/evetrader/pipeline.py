@@ -137,5 +137,10 @@ async def fetch_opportunities(
     sells = [signal for signal in signals if signal.action == "SELL"]
     names = await name_cache.resolve([signal.type_id for signal in signals])
     signalled = {signal.type_id for signal in signals}
-    retained = {type_id: history[type_id] for type_id in signalled if type_id in history}
+    window = config.investment.window_days
+    retained = {
+        type_id: sorted(history[type_id], key=lambda day: day.date)[-window:]
+        for type_id in signalled
+        if type_id in history
+    }
     return OpportunityReport(buys=buys, sells=sells, names=names, history=retained)

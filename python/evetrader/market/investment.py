@@ -19,6 +19,11 @@ import polars as pl
 
 from evetrader.market.fees import EffectiveFees
 
+# Robustness to one-off spikes: trim the extreme tails of the price range, and read
+# the current price at a small slice of book depth rather than the single best quote.
+_BAND_QUANTILE = 0.05
+_DEPTH_FRACTION = 0.02
+
 
 @dataclass(frozen=True)
 class InvestmentSignal:
@@ -54,25 +59,36 @@ def _channels(history: pl.DataFrame, window: int) -> pl.DataFrame:
         history.sort("date", descending=True).group_by("type_id", maintain_order=True).head(window)
     )
     return recent.group_by("type_id").agg(
-        pl.col("average").mean().alias("fair_value"),
-        pl.col("lowest").min().alias("low_band"),
-        pl.col("highest").max().alias("high_band"),
+        # Median + trimmed bands are robust to one-off price spikes; a raw mean and
+        # absolute min/max would swing on a single outlier day.
+        pl.col("average").median().alias("fair_value"),
+        pl.col("lowest").quantile(_BAND_QUANTILE).alias("low_band"),
+        pl.col("highest").quantile(1.0 - _BAND_QUANTILE).alias("high_band"),
         pl.col("volume").mean().alias("avg_volume"),
         pl.len().alias("days"),
     )
 
 
+def _depth_price(side: pl.DataFrame, *, best_first_descending: bool, alias: str) -> pl.DataFrame:
+    """The price to trade a small slice (`_DEPTH_FRACTION`) of the resting volume,
+    ignoring tiny lone lowball/highball orders at the very top of the book."""
+    ordered = side.sort(["type_id", "price"], descending=[False, best_first_descending])
+    cumulative = ordered.with_columns(
+        pl.col("volume_remain").cum_sum().over("type_id").alias("_cum"),
+        pl.col("volume_remain").sum().over("type_id").alias("_total"),
+    )
+    reached = cumulative.filter(pl.col("_cum") >= _DEPTH_FRACTION * pl.col("_total"))
+    price = pl.col("price").max() if best_first_descending else pl.col("price").min()
+    return reached.group_by("type_id").agg(price.alias(alias))
+
+
 def _current_prices(orders: pl.DataFrame, station_id: int) -> pl.DataFrame:
     at_station = orders.filter(pl.col("location_id") == station_id)
-    asks = (
-        at_station.filter(~pl.col("is_buy_order"))
-        .group_by("type_id")
-        .agg(pl.col("price").min().alias("ask"))
+    asks = _depth_price(
+        at_station.filter(~pl.col("is_buy_order")), best_first_descending=False, alias="ask"
     )
-    bids = (
-        at_station.filter(pl.col("is_buy_order"))
-        .group_by("type_id")
-        .agg(pl.col("price").max().alias("bid"))
+    bids = _depth_price(
+        at_station.filter(pl.col("is_buy_order")), best_first_descending=True, alias="bid"
     )
     return asks.join(bids, on="type_id", how="full", coalesce=True)
 

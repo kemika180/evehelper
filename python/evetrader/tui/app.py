@@ -11,6 +11,7 @@ is testable without ESI.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,25 @@ def _finish(entry: SkillQueueEntry) -> str:
     if entry.finish_date is None:
         return "unknown"
     return entry.finish_date.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _nice_ticks(low: float, high: float, count: int) -> list[float]:
+    """Round tick values spanning [low, high] at 1/2/2.5/5 x10^k intervals."""
+    if high <= low or count < 2:
+        return [low]
+    raw_step = (high - low) / (count - 1)
+    magnitude = 10.0 ** math.floor(math.log10(raw_step))
+    step = next(
+        (m * magnitude for m in (1.0, 2.0, 2.5, 5.0, 10.0) if m * magnitude >= raw_step),
+        10.0 * magnitude,
+    )
+    ticks: list[float] = []
+    value = math.floor(low / step) * step
+    while value <= high + step * 0.5:
+        if value >= low - step * 0.5:
+            ticks.append(value)
+        value += step
+    return ticks
 
 
 def _isk(value: float) -> str:
@@ -144,21 +164,43 @@ class PriceHistoryScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="plotbox"):
             yield PlotextPlot()
-            yield Static("esc / enter to close", id="plothint")
+            yield Static(
+                "cyan = daily avg · magenta = fair value · yellow = now   ·   esc to close",
+                id="plothint",
+            )
 
     def on_mount(self) -> None:
         plt = self.query_one(PlotextPlot).plt
-        x = list(range(len(self._days)))
-        plt.plot(x, [day.average for day in self._days], color="yellow", label="avg")
-        plt.plot(x, [day.highest for day in self._days], color="green", label="high")
-        plt.plot(x, [day.lowest for day in self._days], color="red", label="low")
-        plt.hline(self._signal.fair_value, color="magenta")  # moving average
-        plt.hline(self._signal.current_price, color="cyan")  # today's price
-        plt.title(
-            f"{self._title}  —  now {self._signal.current_price:,.0f}  "
-            f"fair {self._signal.fair_value:,.0f}"
+        days = self._days
+        count = len(days)
+        if count == 0:
+            plt.title(f"{self._title} — no history")
+            return
+        averages = [day.average for day in days]
+        plt.plot(list(range(count)), averages, color="cyan")
+        plt.hline(self._signal.fair_value, color="magenta")
+        plt.hline(self._signal.current_price, color="yellow")
+
+        # X axis: real dates at ~6 evenly spaced positions instead of 0..N indices.
+        ticks = min(6, count)
+        if count > 1:
+            positions = [round(i * (count - 1) / (ticks - 1)) for i in range(ticks)]
+        else:
+            positions = [0]
+        plt.xticks(
+            [float(p) for p in positions], [days[p].date.strftime("%b %d") for p in positions]
         )
-        plt.xlabel(f"days ({len(self._days)})")
+
+        # Y axis: round, human-readable ISK values.
+        low = min(*averages, self._signal.current_price, self._signal.fair_value)
+        high = max(*averages, self._signal.current_price, self._signal.fair_value)
+        y_ticks = _nice_ticks(low, high, 5)
+        plt.yticks(y_ticks, [_isk(value) for value in y_ticks])
+
+        plt.title(
+            f"{self._title}   ·   now {_isk(self._signal.current_price)}   ·   "
+            f"fair {_isk(self._signal.fair_value)}   ·   last {count} days"
+        )
 
 
 class TradingScreen(Screen[None]):
