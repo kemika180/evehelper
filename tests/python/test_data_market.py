@@ -66,8 +66,9 @@ def test_history_to_frame_parses_dates() -> None:
             "volume": 1_000_000,
         }
     )
-    frame = history_to_frame([day])
+    frame = history_to_frame({34: [day]})
     assert frame.schema["date"] == pl.Date
+    assert frame["type_id"].to_list() == [34]
     assert frame["volume"].to_list() == [1_000_000]
 
 
@@ -77,7 +78,7 @@ def test_build_market_snapshot_carries_region_and_time() -> None:
         region_id=10000002,
         captured_at=captured,
         orders=[_order(1, is_buy=True, price=5.0)],
-        history=[],
+        history_by_type={},
     )
     assert snapshot.region_id == 10000002
     assert snapshot.captured_at == captured
