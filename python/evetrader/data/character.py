@@ -32,6 +32,10 @@ _RETAIL = 3444
 _WHOLESALE = 16596
 _TYCOON = 18580
 
+# NPC station id range; structures (Keepstars etc.) fall outside it and have no NPC
+# owner to hold standings against.
+_NPC_STATION_RANGE = range(60_000_000, 64_000_000)
+
 
 def _trade_skills(skills: CharacterSkills) -> TradeSkills:
     levels = {skill.skill_id: skill.active_skill_level for skill in skills.skills}
@@ -65,15 +69,19 @@ async def _resolve_broker_standings(
 
 
 async def build_character_state(
-    client: EsiClient, config: Config, character_id: int, token: str
+    client: EsiClient, config: Config, character_id: int, token: str, station_id: int
 ) -> CharacterState:
     """Fetch character data and build the pure CharacterState for the advisor."""
     wallet = await fetch_wallet_balance(client, character_id, token)
     skills = await fetch_skills(client, character_id, token)
     open_orders = await fetch_open_orders(client, character_id, token)
-    faction_standing, corp_standing = await _resolve_broker_standings(
-        client, character_id, token, config.home_station_id
-    )
+
+    if station_id in _NPC_STATION_RANGE:
+        faction_standing, corp_standing = await _resolve_broker_standings(
+            client, character_id, token, station_id
+        )
+    else:
+        faction_standing, corp_standing = 0.0, 0.0  # structures: no NPC owner standings
 
     trade_skills = _trade_skills(skills)
     fees = compute_fees(
@@ -85,7 +93,7 @@ async def build_character_state(
     )
     free_order_slots = max(0, total_order_slots(trade_skills) - len(open_orders))
     return CharacterState(
-        station_id=config.home_station_id,
+        station_id=station_id,
         wallet_balance=wallet,
         fees=fees,
         trade_skills=trade_skills,

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 import polars as pl
 
 from evetrader.advisor.state import CharacterState
-from evetrader.config import Config
+from evetrader.config import Config, HomeMarket
 from evetrader.data.character import build_character_state
 from evetrader.data.market import history_to_frame, orders_frame_from_pages
 from evetrader.data.universe import NameCache
@@ -61,23 +61,30 @@ async def fetch_character(
     authenticator: Authenticator,
     config: Config,
     character_id: int,
+    home: HomeMarket,
     name_cache: NameCache,
     *,
     now: Callable[[], datetime] = _utc_now,
 ) -> CharacterReport:
     """Wallet, skills, standings, fees, skill queue, and inventory — the quick fetches."""
     token = await authenticator.access_token(character_id)
-    character = await build_character_state(client, config, character_id, token)
+    character = await build_character_state(client, config, character_id, token, home.station_id)
     skill_queue = await fetch_skillqueue(client, character_id, token)
+
+    # Only holdings AT the home market are sellable there — don't suggest selling
+    # something sitting 20 jumps away.
     assets = await fetch_assets(client, character_id, token)
     holdings: dict[int, int] = {}
     for asset in assets:
-        holdings[asset.type_id] = holdings.get(asset.type_id, 0) + asset.quantity
+        if asset.location_id == home.station_id:
+            holdings[asset.type_id] = holdings.get(asset.type_id, 0) + asset.quantity
 
+    # Structures don't resolve via /universe/names — a config label names them.
     name_ids = [entry.skill_id for entry in skill_queue]
-    name_ids.append(config.home_station_id)
+    if home.label is None:
+        name_ids.append(home.station_id)
     names = await name_cache.resolve(name_ids)
-    station_name = names.get(config.home_station_id, str(config.home_station_id))
+    station_name = home.label or names.get(home.station_id, str(home.station_id))
     return CharacterReport(now(), character, skill_queue, holdings, names, station_name)
 
 
@@ -102,29 +109,26 @@ async def fetch_opportunities(
     client: EsiClient,
     config: Config,
     character: CharacterReport,
+    home: HomeMarket,
     name_cache: NameCache,
 ) -> OpportunityReport:
-    """Scan the station book, then find undervalued buys and overvalued holdings."""
+    """Scan the home market, then find undervalued buys and overvalued holdings."""
     pages = await client.get_all_pages(
-        f"/markets/{config.home_region_id}/orders/", params={"order_type": "all"}
+        f"/markets/{home.region_id}/orders/", params={"order_type": "all"}
     )
-    orders = orders_frame_from_pages(pages).filter(
-        pl.col("location_id") == config.home_station_id
-    )
+    orders = orders_frame_from_pages(pages).filter(pl.col("location_id") == home.station_id)
 
     # Only pull history for liquid candidates and holdings that actually trade here —
     # fetching non-market types would 400 and burn the error-limit budget.
     traded = set(orders["type_id"].to_list())
-    candidates = liquid_types(orders, config.home_station_id, config.scan_candidates)
+    candidates = liquid_types(orders, home.station_id, config.scan_candidates)
     sellable = [type_id for type_id in character.holdings if type_id in traded]
-    history = await _histories(
-        client, config.home_region_id, list({*candidates, *sellable})
-    )
+    history = await _histories(client, home.region_id, list({*candidates, *sellable}))
 
     signals = find_opportunities(
         orders=orders,
         history=history_to_frame(history),
-        station_id=config.home_station_id,
+        station_id=home.station_id,
         holdings=character.holdings,
         fees=character.character.fees,
         window=config.investment.window_days,

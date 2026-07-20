@@ -3,15 +3,14 @@
 import pytest
 from pydantic import ValidationError
 
-from evetrader.config import Config, RiskPreferences
+from evetrader.config import Config, HomeMarket, RiskPreferences
 
 
 def _valid_config() -> Config:
     return Config(
         esi_client_id="abc123",
         contact="jane@example.com",
-        home_region_id=10000002,  # The Forge
-        home_station_id=60003760,  # Jita IV - Moon 4 - Caldari Navy Assembly Plant
+        default_home=HomeMarket(region_id=10000002, station_id=60003760),  # The Forge / Jita 4-4
         total_capital_isk=1_000_000_000.0,
         risk=RiskPreferences(
             min_margin=0.05,
@@ -23,7 +22,7 @@ def _valid_config() -> Config:
 
 def test_valid_config_constructs() -> None:
     config = _valid_config()
-    assert config.home_region_id == 10000002
+    assert config.default_home.region_id == 10000002
     assert config.risk.min_margin == 0.05
 
 
@@ -42,8 +41,7 @@ def test_capital_must_be_positive() -> None:
         Config(
             esi_client_id="abc123",
             contact="jane@example.com",
-            home_region_id=1,
-            home_station_id=1,
+            default_home=HomeMarket(region_id=1, station_id=1),
             total_capital_isk=0.0,
             risk=RiskPreferences(
                 min_margin=0.05,

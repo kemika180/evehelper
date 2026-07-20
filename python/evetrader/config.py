@@ -30,6 +30,21 @@ class FeeRates(BaseModel):
     corp_standing_reduction: float = Field(default=0.0002, ge=0.0, le=1.0)
 
 
+class HomeMarket(BaseModel):
+    """The region and market location a character trades at.
+
+    `station_id` is an NPC station id OR a public structure id (e.g. an alliance
+    Keepstar) — both appear in region orders and share the region's price history.
+    `label` is a display name for structures, which don't resolve via /universe/names.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    region_id: int = Field(gt=0)
+    station_id: int = Field(gt=0)
+    label: str | None = None
+
+
 class InvestmentParams(BaseModel):
     """Mean-reversion tuning: the history window and how extreme a price must be."""
 
@@ -67,10 +82,10 @@ class Config(BaseModel):
     contact: str = Field(min_length=1)
     # Loopback port for the PKCE SSO callback; must match the registered redirect.
     callback_port: int = Field(default=8765, gt=0, lt=65536)
-    # Region the advisor analyses for station trading.
-    home_region_id: int = Field(gt=0)
-    # Station the advisor trades from.
-    home_station_id: int = Field(gt=0)
+    # Home market for characters without a specific entry below.
+    default_home: HomeMarket
+    # Per-character home markets, keyed by character name.
+    homes: dict[str, HomeMarket] = Field(default_factory=dict)
     # Total ISK available to allocate across all suggested orders.
     total_capital_isk: float = Field(gt=0.0)
     # Type ids to always analyse for station trading (in addition to discovery).
@@ -86,3 +101,6 @@ class Config(BaseModel):
     risk: RiskPreferences
     fees: FeeRates = Field(default_factory=FeeRates)
     investment: InvestmentParams = Field(default_factory=InvestmentParams)
+
+    def home_for(self, character_name: str) -> HomeMarket:
+        return self.homes.get(character_name, self.default_home)

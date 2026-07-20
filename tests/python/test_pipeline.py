@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 
-from evetrader.config import Config, InvestmentParams, RiskPreferences
+from evetrader.config import Config, HomeMarket, InvestmentParams, RiskPreferences
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient
@@ -26,8 +26,7 @@ def _config() -> Config:
     return Config(
         esi_client_id="cid",
         contact="c@e.com",
-        home_region_id=_REGION,
-        home_station_id=_STATION,
+        default_home=HomeMarket(region_id=_REGION, station_id=_STATION),
         total_capital_isk=1_000_000_000.0,
         scan_candidates=50,
         risk=RiskPreferences(
@@ -113,7 +112,16 @@ def _handler(request: httpx.Request) -> httpx.Response:
                     "location_flag": "Hangar",
                     "location_type": "station",
                     "is_singleton": False,
-                }
+                },
+                {
+                    "item_id": 2,
+                    "type_id": _HELD_DEAR,
+                    "quantity": 999,  # 20 jumps away -> must NOT count as sellable here
+                    "location_id": 60000001,
+                    "location_flag": "Hangar",
+                    "location_type": "station",
+                    "is_singleton": False,
+                },
             ],
             headers=exp,
         )
@@ -159,11 +167,14 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             name_cache = NameCache(tmp_path / "names.json", client)
             now = lambda: datetime(2020, 1, 1, tzinfo=UTC)  # noqa: E731
 
-            character = await fetch_character(client, authenticator, _config(), 42, name_cache, now=now)
+            home = _config().default_home
+            character = await fetch_character(
+                client, authenticator, _config(), 42, home, name_cache, now=now
+            )
             assert character.holdings == {_HELD_DEAR: 10}
             assert character.station_name == "Jita IV-4"
 
-            report = await fetch_opportunities(client, _config(), character, name_cache)
+            report = await fetch_opportunities(client, _config(), character, home, name_cache)
             assert [s.type_id for s in report.buys] == [_UNDERVALUED]
             assert [(s.type_id, s.quantity) for s in report.sells] == [(_HELD_DEAR, 10)]
             assert report.names[_UNDERVALUED] == "Tritanium"
