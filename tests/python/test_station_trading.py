@@ -130,6 +130,30 @@ def test_filters_negative_margin_and_missing_history() -> None:
     assert trades == []
 
 
+def test_lowball_buy_with_average_above_ask_is_rejected() -> None:
+    # Wide book spread (buy 100 / sell 200) but the item actually trades at ~250,
+    # above the ask — so the 100 buy orders are lowballs that never fill. Fake spread.
+    snapshot = _snapshot(
+        [
+            _order(1, 34, is_buy=True, price=100.0),
+            _order(2, 34, is_buy=False, price=200.0),
+        ],
+        {34: [_hist(10_000, 250.0)]},  # average traded price sits above the best sell
+    )
+
+    trades = rank_station_trades(
+        snapshot,
+        station_id=_STATION,
+        fees=_FEES,
+        risk=_risk(),
+        total_capital_isk=1_000_000.0,
+        max_capital_per_order_isk=1_000_000.0,
+        max_orders=5,
+    )
+
+    assert trades == []
+
+
 def test_ranks_by_isk_per_hour_and_respects_slot_limit() -> None:
     snapshot = _snapshot(
         [
