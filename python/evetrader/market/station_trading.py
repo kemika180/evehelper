@@ -66,6 +66,35 @@ def _order_book(orders: pl.DataFrame, station_id: int) -> pl.DataFrame:
     return buys.join(sells, on="type_id", how="inner")
 
 
+def candidate_types(
+    orders: pl.DataFrame,
+    *,
+    station_id: int,
+    fees: EffectiveFees,
+    min_margin: float,
+    limit: int,
+    tick: float = _ISK_TICK,
+) -> list[int]:
+    """Type ids at the station with the best fee-adjusted spread, best first.
+
+    Discovery step: pick which items are worth pulling history for, from the full
+    station order book, without a fixed watchlist. Pure.
+    """
+    book = _order_book(orders, station_id)
+    scored: list[tuple[float, int]] = []
+    for row in book.iter_rows(named=True):
+        buy_price = float(row["best_buy"]) + tick
+        sell_price = float(row["best_sell"]) - tick
+        if buy_price <= 0.0 or sell_price <= 0.0:
+            continue
+        profit = _profit_per_unit(buy_price, sell_price, fees)
+        margin = profit / buy_price
+        if profit > 0.0 and margin >= min_margin:
+            scored.append((margin, int(row["type_id"])))
+    scored.sort(reverse=True)
+    return [type_id for _margin, type_id in scored[:limit]]
+
+
 def _daily_volumes(history: pl.DataFrame) -> pl.DataFrame:
     return history.group_by("type_id").agg(
         pl.col("volume").mean().alias("daily_volume"),

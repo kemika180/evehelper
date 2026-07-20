@@ -16,7 +16,7 @@ from evetrader.advisor.source import Opportunity, StationTradingSource
 from evetrader.advisor.state import CharacterState
 from evetrader.config import Config
 from evetrader.data.character import build_character_state
-from evetrader.data.market import build_market_snapshot
+from evetrader.data.market import build_market_snapshot, orders_to_frame
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient
@@ -26,6 +26,8 @@ from evetrader.esi.endpoints import (
     fetch_skillqueue,
 )
 from evetrader.esi.models import MarketHistoryDay, MarketOrder, SkillQueueEntry
+from evetrader.market.fees import EffectiveFees
+from evetrader.market.station_trading import candidate_types
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,34 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+async def _orders_and_candidates(
+    client: EsiClient, config: Config, fees: EffectiveFees
+) -> tuple[list[MarketOrder], list[int]]:
+    """The station order book plus the type ids to analyse.
+
+    Discovery mode pulls the whole region book (slow first run, then cached) and
+    picks the best-spread items; watchlist mode fetches only the configured types.
+    """
+    if config.scan_candidates > 0:
+        region_orders = await fetch_market_orders(client, config.home_region_id)
+        station_orders = [
+            order for order in region_orders if order.location_id == config.home_station_id
+        ]
+        candidates = candidate_types(
+            orders_to_frame(station_orders),
+            station_id=config.home_station_id,
+            fees=fees,
+            min_margin=config.risk.min_margin,
+            limit=config.scan_candidates,
+        )
+        return station_orders, list(dict.fromkeys([*candidates, *config.watchlist_type_ids]))
+
+    orders: list[MarketOrder] = []
+    for type_id in config.watchlist_type_ids:
+        orders.extend(await fetch_market_orders(client, config.home_region_id, type_id))
+    return orders, list(config.watchlist_type_ids)
+
+
 async def refresh(
     client: EsiClient,
     authenticator: Authenticator,
@@ -54,14 +84,15 @@ async def refresh(
 ) -> AdvisorReport:
     """Fetch live state, run the advisor, and resolve display names."""
     token = await authenticator.access_token(character_id)
+    character = await build_character_state(client, config, character_id, token)
 
-    # Fetch orders and history per watchlist type — a whole-region order fetch is
-    # hundreds of pages and would stall startup.
-    orders: list[MarketOrder] = []
-    history: dict[int, list[MarketHistoryDay]] = {}
-    for type_id in config.watchlist_type_ids:
-        orders.extend(await fetch_market_orders(client, config.home_region_id, type_id))
-        history[type_id] = await fetch_market_history(client, config.home_region_id, type_id)
+    orders, type_ids = await _orders_and_candidates(client, config, character.fees)
+
+    # History (for ISK/hr and liquidity) only for the candidate + watchlist types.
+    history: dict[int, list[MarketHistoryDay]] = {
+        type_id: await fetch_market_history(client, config.home_region_id, type_id)
+        for type_id in type_ids
+    }
     snapshot = build_market_snapshot(
         region_id=config.home_region_id,
         captured_at=now(),
@@ -69,7 +100,6 @@ async def refresh(
         history_by_type=history,
     )
 
-    character = await build_character_state(client, config, character_id, token)
     skill_queue = await fetch_skillqueue(client, character_id, token)
 
     opportunities = rank([StationTradingSource()], snapshot, character, config)

@@ -60,8 +60,12 @@ class Config(BaseModel):
     home_station_id: int = Field(gt=0)
     # Total ISK available to allocate across all suggested orders.
     total_capital_isk: float = Field(gt=0.0)
-    # Type ids to analyse for station trading (bounds per-type history fetches).
+    # Type ids to always analyse for station trading (in addition to discovery).
     watchlist_type_ids: tuple[int, ...] = ()
+    # Discovery: scan the whole station order book and analyse the this-many
+    # best-spread items (0 = watchlist only). The full region fetch is slow the
+    # first time, then cached.
+    scan_candidates: int = Field(default=50, ge=0)
     # How often the TUI re-runs the pipeline; the client cache gates real fetches.
     refresh_interval_seconds: int = Field(default=30, gt=0)
     # TUI colour theme: "kemika-purple" (default) or any built-in Textual theme.
