@@ -136,6 +136,14 @@ v1 focuses on **station trading**; **hauling** is a later milestone on the same 
   and realized P&L.
 
 ## Resolved decisions
+- **Strategy: value investing, not station trading** (2026-07-20). The active
+  analysis is mean-reversion (`market/investment.py`): buy items trading below their
+  moving average / near the bottom of their Donchian channel, and flag held items
+  trading above it. Uses ESI market history (daily average/high/low/volume). Long
+  horizon — no instant turnaround. `market/station_trading.py` is retired from the
+  pipeline but kept for a future station-to-station transfer / hauling source; the
+  old `advisor/source.py`+`engine.py` (OpportunitySource Protocol / station-trade
+  Opportunity) were removed and will be reintroduced when a second source exists.
 - **Multi-character**: implemented — the keyring stores a refresh token per
   character id, `session.py` persists the set of logged-in characters (id + name),
   and the TUI opens on a picker (add via SSO login / remove) before the per-
