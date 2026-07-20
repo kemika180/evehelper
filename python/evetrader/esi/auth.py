@@ -43,6 +43,7 @@ SCOPES: tuple[str, ...] = (
     "esi-markets.read_character_orders.v1",
     "esi-location.read_location.v1",
     "esi-skills.read_skills.v1",
+    "esi-skills.read_skillqueue.v1",
     "esi-characters.read_standings.v1",
 )
 

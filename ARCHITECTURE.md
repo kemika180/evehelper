@@ -47,27 +47,31 @@ eve_trading/
 ├── python/
 │   └── evetrader/
 │       ├── __init__.py
-│       ├── config.py          # pydantic settings: character(s), home region/station,
-│       │                      #   trade skills, capital limits, risk prefs
+│       ├── config.py          # pydantic models: home region/station, capital, risk,
+│       │                      #   fee rates, watchlist (pure data — no I/O)
+│       ├── configload.py      # load Config from TOML (impure; kept out of the core)
+│       ├── cli.py             # `evetrader` entry point: `login` + run the TUI
+│       ├── pipeline.py        # composition root: fetch -> build inputs -> run advisor
 │       ├── esi/               # ALL network I/O lives here
 │       │   ├── auth.py        # OAuth2 SSO (PKCE, native-app flow); token store + refresh
 │       │   ├── client.py      # async HTTP; ETag/Expires cache; error-limit backoff; paging
 │       │   ├── endpoints.py   # typed per-endpoint fetches (bytes in -> pydantic out)
 │       │   └── models.py      # pydantic models for ESI payloads (the I/O boundary)
-│       ├── data/              # ingestion: ESI/SDE -> normalized polars frames
-│       │   ├── market.py      # market orders + history -> polars
-│       │   └── universe.py    # type/region/station/system reference data
+│       ├── data/              # ingestion: ESI/SDE -> normalized plain data
+│       │   ├── market.py      # market orders + history -> polars MarketSnapshot
+│       │   ├── character.py   # wallet/skills/standings/orders -> CharacterState
+│       │   └── universe.py    # type/region/station names (cached POST /universe/names/)
 │       ├── market/            # PURE analysis core (no I/O)
 │       │   ├── snapshot.py    # MarketSnapshot: polars frames + region + capture time
 │       │   ├── fees.py        # broker fee + sales tax from skills/standings
 │       │   ├── station_trading.py  # margins, competition/undercut, ISK/hr scoring
 │       │   └── hauling.py     # (milestone 6) cross-region arbitrage
 │       ├── advisor/           # PURE: rank opportunities against character state
-│       │   ├── source.py      # OpportunitySource Protocol + Opportunity model
+│       │   ├── state.py       # CharacterState (pure hand-off type) + order-slot calc
+│       │   ├── source.py      # OpportunitySource Protocol + Opportunity + station source
 │       │   └── engine.py      # gather from sources, rank under capital/slot/risk limits
 │       └── tui/
-│           ├── app.py         # Textual app; refresh loop driven by cache expiry
-│           └── widgets.py
+│           └── app.py         # Textual app; interval refresh, opportunity + character panels
 ├── tests/
 │   └── python/
 └── data/                      # local cache: SDE, token store (gitignored)

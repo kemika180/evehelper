@@ -1,0 +1,93 @@
+"""Assemble CharacterState from live ESI data. Impure.
+
+Fetches wallet/skills/standings/open-orders, resolves the home station's owning
+corp and faction to look up broker-fee standings, computes effective fees, and
+derives free order slots. Bridges live ESI into the pure core's CharacterState.
+
+Simplifications (documented, not silent): standings are used raw — the
+Connections/Diplomacy skill adjustments to effective standing are not applied yet.
+"""
+
+from __future__ import annotations
+
+from evetrader.advisor.state import CharacterState, TradeSkills, total_order_slots
+from evetrader.config import Config
+from evetrader.esi.client import EsiClient
+from evetrader.esi.endpoints import (
+    fetch_corporation,
+    fetch_open_orders,
+    fetch_skills,
+    fetch_standings,
+    fetch_station,
+    fetch_wallet_balance,
+)
+from evetrader.esi.models import CharacterSkills
+from evetrader.market.fees import compute_fees
+
+# EVE skill type ids (stable game constants; sanity-check against live data).
+_ACCOUNTING = 16622
+_BROKER_RELATIONS = 3446
+_TRADE = 3443
+_RETAIL = 3444
+_WHOLESALE = 16596
+_TYCOON = 18580
+
+
+def _trade_skills(skills: CharacterSkills) -> TradeSkills:
+    levels = {skill.skill_id: skill.active_skill_level for skill in skills.skills}
+    return TradeSkills(
+        accounting=levels.get(_ACCOUNTING, 0),
+        broker_relations=levels.get(_BROKER_RELATIONS, 0),
+        trade=levels.get(_TRADE, 0),
+        retail=levels.get(_RETAIL, 0),
+        wholesale=levels.get(_WHOLESALE, 0),
+        tycoon=levels.get(_TYCOON, 0),
+    )
+
+
+async def _resolve_broker_standings(
+    client: EsiClient, character_id: int, token: str, station_id: int
+) -> tuple[float, float]:
+    """Return (faction_standing, corp_standing) toward the station's owner."""
+    station = await fetch_station(client, station_id)
+    if station.owner is None:
+        return 0.0, 0.0
+
+    standings = await fetch_standings(client, character_id, token)
+    by_key = {(standing.from_type, standing.from_id): standing.standing for standing in standings}
+    corp_standing = by_key.get(("npc_corp", station.owner), 0.0)
+
+    corp = await fetch_corporation(client, station.owner)
+    faction_standing = 0.0
+    if corp.faction_id is not None:
+        faction_standing = by_key.get(("faction", corp.faction_id), 0.0)
+    return faction_standing, corp_standing
+
+
+async def build_character_state(
+    client: EsiClient, config: Config, character_id: int, token: str
+) -> CharacterState:
+    """Fetch character data and build the pure CharacterState for the advisor."""
+    wallet = await fetch_wallet_balance(client, character_id, token)
+    skills = await fetch_skills(client, character_id, token)
+    open_orders = await fetch_open_orders(client, character_id, token)
+    faction_standing, corp_standing = await _resolve_broker_standings(
+        client, character_id, token, config.home_station_id
+    )
+
+    trade_skills = _trade_skills(skills)
+    fees = compute_fees(
+        accounting_level=trade_skills.accounting,
+        broker_relations_level=trade_skills.broker_relations,
+        faction_standing=faction_standing,
+        corp_standing=corp_standing,
+        rates=config.fees,
+    )
+    free_order_slots = max(0, total_order_slots(trade_skills) - len(open_orders))
+    return CharacterState(
+        station_id=config.home_station_id,
+        wallet_balance=wallet,
+        fees=fees,
+        trade_skills=trade_skills,
+        free_order_slots=free_order_slots,
+    )

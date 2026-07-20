@@ -118,3 +118,32 @@ class Standing(_EsiModel):
     from_id: int
     from_type: str
     standing: float
+
+
+class SkillQueueEntry(_EsiModel):
+    """One row of GET /characters/{id}/skillqueue/ (a queued skill level)."""
+
+    skill_id: int
+    finished_level: int
+    queue_position: int
+    start_date: datetime | None = None
+    finish_date: datetime | None = None
+
+
+class Station(_EsiModel):
+    """GET /universe/stations/{station_id}/ — an NPC station's public data."""
+
+    station_id: int
+    name: str
+    system_id: int
+    type_id: int
+    # Owning corporation id (present for NPC stations); needed for broker standings.
+    owner: int | None = None
+
+
+class Corporation(_EsiModel):
+    """GET /corporations/{corporation_id}/ — only the fields we need."""
+
+    name: str
+    # Present for NPC corporations; the faction whose standing affects broker fees.
+    faction_id: int | None = None
