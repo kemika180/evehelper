@@ -156,6 +156,11 @@ def rank_station_trades(
         avg_price = float(raw_price) if raw_price is not None else 0.0
         if daily_volume * avg_price < risk.min_daily_isk_volume:
             continue
+        # The average traded price must be capturable between our orders. If it
+        # sits at/above the ask, trades happen only on the sell side and the "best
+        # buy" is a lowball nobody fills — the spread is fake (see ARCHITECTURE).
+        if not (buy_price <= avg_price <= sell_price):
+            continue
 
         affordable = int(max_capital_per_order_isk // buy_price)
         fillable = int(daily_volume * volume_capture)
