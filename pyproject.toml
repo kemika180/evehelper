@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.11",
     "httpx>=0.28",
     "textual>=8.0",
+    "textual-plotext>=1.0",
     "keyring>=25.0",
 ]
 

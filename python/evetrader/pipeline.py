@@ -47,6 +47,9 @@ class OpportunityReport:
     buys: list[InvestmentSignal]
     sells: list[InvestmentSignal]
     names: dict[int, str]
+    # Daily history for the signalled types, retained so a selected row can be
+    # plotted without a fresh (keystroke-triggered) ESI call.
+    history: dict[int, list[MarketHistoryDay]]
 
 
 def _utc_now() -> datetime:
@@ -133,4 +136,6 @@ async def fetch_opportunities(
     buys = [signal for signal in signals if signal.action == "BUY"]
     sells = [signal for signal in signals if signal.action == "SELL"]
     names = await name_cache.resolve([signal.type_id for signal in signals])
-    return OpportunityReport(buys=buys, sells=sells, names=names)
+    signalled = {signal.type_id for signal in signals}
+    retained = {type_id: history[type_id] for type_id in signalled if type_id in history}
+    return OpportunityReport(buys=buys, sells=sells, names=names, history=retained)

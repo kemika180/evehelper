@@ -9,7 +9,7 @@ from textual.widgets import DataTable, OptionList, Static
 
 from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import SkillQueueEntry
+from evetrader.esi.models import MarketHistoryDay, SkillQueueEntry
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
@@ -17,6 +17,7 @@ from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
     CharacterPickerScreen,
     EveTraderApp,
+    PriceHistoryScreen,
     RefreshFeed,
     _completion,
     _current_training,
@@ -111,11 +112,28 @@ def _signal(type_id: int, action: str, current: float, fair: float, position: fl
     )
 
 
+def _history_days() -> list[MarketHistoryDay]:
+    return [
+        MarketHistoryDay.model_validate(
+            {
+                "date": f"2020-01-0{day}",
+                "average": 1000.0,
+                "highest": 1100.0,
+                "lowest": 900.0,
+                "order_count": 10,
+                "volume": 1000,
+            }
+        )
+        for day in range(1, 5)
+    ]
+
+
 def _opportunity_report() -> OpportunityReport:
     return OpportunityReport(
         buys=[_signal(34, "BUY", current=700.0, fair=1000.0, position=0.05)],
         sells=[_signal(35, "SELL", current=1300.0, fair=1000.0, position=0.95)],
         names={34: "Tritanium", 35: "Pyerite"},
+        history={34: _history_days(), 35: _history_days()},
     )
 
 
@@ -190,5 +208,32 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
             row_text = " ".join(str(cell) for cell in queue.get_row_at(0))
             assert "Accounting" in row_text and expected_local in row_text
             await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_selecting_a_buy_row_opens_the_price_chart(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            buys = trading.query_one("#buys", DataTable)
+            buys.focus()
+            await pilot.pause()
+            await pilot.press("enter")  # select the highlighted row
+            await pilot.pause()
+
+            assert isinstance(app.screen, PriceHistoryScreen)
+            await pilot.press("escape")
 
     asyncio.run(_drive())
