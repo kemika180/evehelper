@@ -5,7 +5,7 @@ import asyncio
 import httpx
 import pytest
 
-from evetrader.config import Config, RiskPreferences
+from evetrader.config import Config, HomeMarket, RiskPreferences
 from evetrader.data.character import build_character_state
 from evetrader.esi.client import EsiClient
 
@@ -18,8 +18,7 @@ def _config() -> Config:
     return Config(
         esi_client_id="cid",
         contact="c@e.com",
-        home_region_id=10000002,
-        home_station_id=_STATION,
+        default_home=HomeMarket(region_id=10000002, station_id=_STATION),
         total_capital_isk=1_000_000.0,
         risk=RiskPreferences(
             min_margin=0.05, min_daily_isk_volume=1000.0, max_capital_per_order_isk=1_000_000.0
@@ -89,7 +88,9 @@ def test_build_character_state_computes_fees_and_free_slots() -> None:
         transport = httpx.MockTransport(_handler)
         async with httpx.AsyncClient(transport=transport) as http:
             client = EsiClient(_config(), http)
-            state = await build_character_state(client, _config(), character_id=42, token="tok")
+            state = await build_character_state(
+                client, _config(), character_id=42, token="tok", station_id=_STATION
+            )
 
             assert state.wallet_balance == 5_000_000.0
             assert state.station_id == _STATION

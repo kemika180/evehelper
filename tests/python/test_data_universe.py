@@ -5,7 +5,7 @@ from pathlib import Path
 
 import httpx
 
-from evetrader.config import Config, RiskPreferences
+from evetrader.config import Config, HomeMarket, RiskPreferences
 from evetrader.data.universe import NameCache
 from evetrader.esi.client import EsiClient
 
@@ -14,8 +14,7 @@ def _config() -> Config:
     return Config(
         esi_client_id="cid",
         contact="contact@example.com",
-        home_region_id=10000002,
-        home_station_id=60003760,
+        default_home=HomeMarket(region_id=10000002, station_id=60003760),
         total_capital_isk=1.0,
         risk=RiskPreferences(
             min_margin=0.05, min_daily_isk_volume=0.0, max_capital_per_order_isk=1.0

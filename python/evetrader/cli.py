@@ -83,17 +83,23 @@ def _run_tui(config: Config) -> None:
     resources = _build_resources(config)
 
     def make_feed(character_id: int) -> RefreshFeed:
+        record = next((r for r in store.records() if r.character_id == character_id), None)
+        home = config.home_for(record.name if record is not None else str(character_id))
+
         async def character() -> CharacterReport:
             return await fetch_character(
                 resources.client,
                 resources.authenticator,
                 config,
                 character_id,
+                home,
                 resources.name_cache,
             )
 
         async def opportunities(report: CharacterReport) -> OpportunityReport:
-            return await fetch_opportunities(resources.client, config, report, resources.name_cache)
+            return await fetch_opportunities(
+                resources.client, config, report, home, resources.name_cache
+            )
 
         return RefreshFeed(character=character, opportunities=opportunities)
 

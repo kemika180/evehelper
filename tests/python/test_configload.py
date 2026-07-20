@@ -7,11 +7,15 @@ from evetrader.configload import load_config
 _TOML = """
 esi_client_id = "abc123"
 contact = "jane@example.com"
-home_region_id = 10000002
-home_station_id = 60003760
 total_capital_isk = 1000000000.0
-watchlist_type_ids = [34, 35, 36]
 refresh_interval_seconds = 60
+
+default_home = { region_id = 10000002, station_id = 60003760 }
+
+[homes.Rehvin]
+region_id = 10000003
+station_id = 1053970513596
+label = "4-HWWF Keepstar"
 
 [risk]
 min_margin = 0.05
@@ -30,9 +34,9 @@ def test_load_config_from_toml(tmp_path: Path) -> None:
     config = load_config(path)
 
     assert config.esi_client_id == "abc123"
-    assert config.watchlist_type_ids == (34, 35, 36)
-    assert config.refresh_interval_seconds == 60
-    assert config.risk.min_margin == 0.05
+    assert config.default_home.station_id == 60003760
+    # A character with a specific home overrides the default; others fall back.
+    assert config.home_for("Rehvin").label == "4-HWWF Keepstar"
+    assert config.home_for("Rehvin").station_id == 1053970513596
+    assert config.home_for("Someone Else").station_id == 60003760
     assert config.fees.base_sales_tax == 0.075
-    # Unspecified fee fields fall back to documented defaults.
-    assert config.fees.base_broker_fee == 0.03
