@@ -399,6 +399,7 @@ class CharacterPickerScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         ("a", "add", "Add character"),
         ("d", "remove", "Remove character"),
+        ("escape", "resume", "Back"),
     ]
 
     def __init__(
@@ -415,6 +416,7 @@ class CharacterPickerScreen(Screen[None]):
         self._login_fn = login_fn
         self._remove_token_fn = remove_token_fn
         self._interval = interval_seconds
+        self._last_character_id: int | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -437,7 +439,13 @@ class CharacterPickerScreen(Screen[None]):
             self.select_character(int(event.option.id))
 
     def select_character(self, character_id: int) -> None:
+        self._last_character_id = character_id
         self.app.push_screen(TradingScreen(self._make_feed(character_id), self._interval))
+
+    def action_resume(self) -> None:
+        """Esc with a character already open returns to it, rather than sitting here."""
+        if self._last_character_id is not None:
+            self.select_character(self._last_character_id)
 
     def action_add(self) -> None:
         self.run_worker(self._add(), exclusive=True)

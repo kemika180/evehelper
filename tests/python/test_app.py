@@ -19,6 +19,7 @@ from evetrader.tui.app import (
     EveTraderApp,
     PriceHistoryScreen,
     RefreshFeed,
+    TradingScreen,
     _completion,
     _current_training,
 )
@@ -208,6 +209,33 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
             row_text = " ".join(str(cell) for cell in queue.get_row_at(0))
             assert "Accounting" in row_text and expected_local in row_text
             await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_escape_on_picker_resumes_the_last_character(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(3):
+                await pilot.pause()
+            assert isinstance(app.screen, TradingScreen)
+
+            await pilot.press("escape")  # trading -> picker
+            await pilot.pause()
+            assert isinstance(app.screen, CharacterPickerScreen)
+
+            await pilot.press("escape")  # picker -> back to the character
+            for _ in range(3):
+                await pilot.pause()
+            assert isinstance(app.screen, TradingScreen)
 
     asyncio.run(_drive())
 
