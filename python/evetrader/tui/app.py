@@ -24,7 +24,6 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, OptionList, Static, TabbedContent, TabPane
 from textual.widgets.option_list import Option
 
-from evetrader.advisor.state import CharacterState
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import SkillQueueEntry
 from evetrader.pipeline import CharacterReport, OpportunityReport
@@ -96,7 +95,7 @@ def _time_left(entry: SkillQueueEntry, reference: datetime) -> str:
     return f"{minutes}m"
 
 FetchCharacter = Callable[[], Awaitable[CharacterReport]]
-FetchOpportunities = Callable[[CharacterState], Awaitable[OpportunityReport]]
+FetchOpportunities = Callable[[CharacterReport], Awaitable[OpportunityReport]]
 LoginFn = Callable[[], Awaitable[CharacterIdentity]]
 RemoveTokenFn = Callable[[int], None]
 
@@ -134,7 +133,11 @@ class TradingScreen(Screen[None]):
         padding: 0 1;
         background: $boost;
     }
-    TradingScreen #opportunities, TradingScreen #skillqueue { margin: 1 1; height: 1fr; }
+    TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
+    TradingScreen #buys, TradingScreen #sells, TradingScreen #skillqueue {
+        margin: 0 1;
+        height: 1fr;
+    }
     """
 
     def __init__(self, feed: RefreshFeed, interval_seconds: int) -> None:
@@ -154,22 +157,28 @@ class TradingScreen(Screen[None]):
                     yield Static(id="stat-tax", classes="stat")
                     yield Static(id="stat-broker", classes="stat")
                 yield Static("", id="training")
-                yield DataTable(id="opportunities", zebra_stripes=True)
+                yield Static("BUY — trading below normal", classes="section")
+                yield DataTable(id="buys", zebra_stripes=True)
+                yield Static("SELL — your holdings above normal", classes="section")
+                yield DataTable(id="sells", zebra_stripes=True)
             with TabPane("Skill Queue", id="queue"):
                 yield DataTable(id="skillqueue", zebra_stripes=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        opportunities = self.query_one("#opportunities", DataTable)
-        opportunities.add_columns("Item", "Buy", "Sell", "Margin", "Units", "Capital", "ISK/hr")
-        queue = self.query_one("#skillqueue", DataTable)
-        queue.add_columns("Skill", "Time left", "Completion")
+        self.query_one("#buys", DataTable).add_columns(
+            "Item", "Now", "Fair", "Range", "Units", "Est. profit", "Note"
+        )
+        self.query_one("#sells", DataTable).add_columns(
+            "Item", "Held", "Bid", "Fair", "Range", "Est. gain", "Note"
+        )
+        self.query_one("#skillqueue", DataTable).add_columns("Skill", "Time left", "Completion")
         self.run_worker(self._refresh(), exclusive=True)
         self.set_interval(self._interval, self._refresh)
 
     async def _refresh(self) -> None:
         status = self.query_one("#status", Static)
-        # Phase 1: character + skill queue render immediately.
+        # Phase 1: character, holdings and skill queue render immediately.
         status.update("Loading character…")
         try:
             character_report = await self._feed.character()
@@ -182,16 +191,15 @@ class TradingScreen(Screen[None]):
         self._render_skill_queue(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
-        status.update("Scanning for opportunities…")
+        status.update("Scanning for value…")
         try:
-            opportunity_report = await self._feed.opportunities(character_report.character)
+            report = await self._feed.opportunities(character_report)
         except Exception as error:
             status.update(f"[Market scan failed] {type(error).__name__}: {error}")
             return
-        self._render_opportunities(opportunity_report)
-        count = len(opportunity_report.opportunities)
-        noun = "opportunity" if count == 1 else "opportunities"
-        status.update(f"{count} {noun} — updated")
+        self._render_buys(report)
+        self._render_sells(report)
+        status.update(f"{len(report.buys)} to buy · {len(report.sells)} to sell — updated")
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
         content = Text()
@@ -210,19 +218,34 @@ class TradingScreen(Screen[None]):
         self._set_tile("#stat-tax", "SALES TAX", f"{fees.sales_tax:.2%}", "bold yellow")
         self._set_tile("#stat-broker", "BROKER FEE", f"{fees.broker_fee:.2%}", "bold yellow")
 
-    def _render_opportunities(self, report: OpportunityReport) -> None:
-        table = self.query_one("#opportunities", DataTable)
+    def _render_buys(self, report: OpportunityReport) -> None:
+        table = self.query_one("#buys", DataTable)
         table.clear()
-        for index, opportunity in enumerate(report.opportunities):
-            name = report.names.get(opportunity.type_id, str(opportunity.type_id))
+        for index, signal in enumerate(report.buys):
+            name = report.names.get(signal.type_id, str(signal.type_id))
             table.add_row(
                 Text(name, style="bold" if index == 0 else ""),
-                Text(f"{opportunity.buy_price:,.2f}", justify="right"),
-                Text(f"{opportunity.sell_price:,.2f}", justify="right"),
-                Text(f"{opportunity.margin:.1%}", justify="right", style="green"),
-                Text(f"{opportunity.quantity:,}", justify="right"),
-                Text(_isk(opportunity.capital_required), justify="right", style="cyan"),
-                Text(_isk(opportunity.expected_isk_per_hour), justify="right", style="bold green"),
+                Text(_isk(signal.current_price), justify="right"),
+                Text(_isk(signal.fair_value), justify="right", style="dim"),
+                Text(f"{signal.channel_position:.0%}", justify="right", style="green"),
+                Text(f"{signal.quantity:,}", justify="right"),
+                Text(_isk(signal.expected_profit), justify="right", style="bold green"),
+                Text(signal.reasoning, style="dim"),
+            )
+
+    def _render_sells(self, report: OpportunityReport) -> None:
+        table = self.query_one("#sells", DataTable)
+        table.clear()
+        for signal in report.sells:
+            name = report.names.get(signal.type_id, str(signal.type_id))
+            table.add_row(
+                Text(name),
+                Text(f"{signal.quantity:,}", justify="right"),
+                Text(_isk(signal.current_price), justify="right"),
+                Text(_isk(signal.fair_value), justify="right", style="dim"),
+                Text(f"{signal.channel_position:.0%}", justify="right", style="yellow"),
+                Text(_isk(signal.expected_profit), justify="right", style="bold yellow"),
+                Text(signal.reasoning, style="dim"),
             )
 
     def _render_training(self, report: CharacterReport) -> None:

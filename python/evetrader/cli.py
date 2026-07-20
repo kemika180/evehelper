@@ -15,7 +15,6 @@ from pathlib import Path
 
 import httpx
 
-from evetrader.advisor.state import CharacterState
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
 from evetrader.data.universe import NameCache
@@ -93,8 +92,8 @@ def _run_tui(config: Config) -> None:
                 resources.name_cache,
             )
 
-        async def opportunities(state: CharacterState) -> OpportunityReport:
-            return await fetch_opportunities(resources.client, config, state, resources.name_cache)
+        async def opportunities(report: CharacterReport) -> OpportunityReport:
+            return await fetch_opportunities(resources.client, config, report, resources.name_cache)
 
         return RefreshFeed(character=character, opportunities=opportunities)
 

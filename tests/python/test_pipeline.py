@@ -1,13 +1,13 @@
-"""End-to-end pipeline over a fully mocked ESI: refresh yields ranked opportunities,
-character state, skill queue, and resolved names."""
+"""End-to-end pipeline over mocked ESI: character + holdings, then buy/sell signals."""
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
-from evetrader.config import Config, RiskPreferences
+from evetrader.config import Config, InvestmentParams, RiskPreferences
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient
@@ -15,9 +15,11 @@ from evetrader.pipeline import fetch_character, fetch_opportunities
 
 _STATION = 60003760
 _REGION = 10000002
-_OWNER_CORP = 1000035
+_OWNER = 1000035
 _FACTION = 500001
 _FUTURE = "Wed, 21 Oct 2099 07:28:00 GMT"
+_UNDERVALUED = 34  # a cheap buy candidate
+_HELD_DEAR = 35  # held, and currently dear
 
 
 def _config() -> Config:
@@ -26,11 +28,12 @@ def _config() -> Config:
         contact="c@e.com",
         home_region_id=_REGION,
         home_station_id=_STATION,
-        total_capital_isk=1_000_000.0,
-        watchlist_type_ids=(34,),
+        total_capital_isk=1_000_000_000.0,
+        scan_candidates=50,
         risk=RiskPreferences(
-            min_margin=0.05, min_daily_isk_volume=1000.0, max_capital_per_order_isk=1_000_000.0
+            min_margin=0.05, min_daily_isk_volume=0.0, max_capital_per_order_isk=100_000_000.0
         ),
+        investment=InvestmentParams(window_days=4, buy_below_position=0.3, sell_above_position=0.7),
     )
 
 
@@ -48,16 +51,16 @@ class _FakeStore:
         self.tokens.pop(character_id, None)
 
 
-def _market_order(order_id: int, *, is_buy: bool, price: float) -> dict[str, object]:
+def _order(order_id: int, type_id: int, *, is_buy: bool, price: float) -> dict[str, object]:
     return {
         "order_id": order_id,
-        "type_id": 34,
+        "type_id": type_id,
         "location_id": _STATION,
         "system_id": 30000142,
         "is_buy_order": is_buy,
         "price": price,
-        "volume_remain": 100,
-        "volume_total": 100,
+        "volume_remain": 1000,
+        "volume_total": 1000,
         "min_volume": 1,
         "range": "region",
         "duration": 90,
@@ -65,58 +68,64 @@ def _market_order(order_id: int, *, is_buy: bool, price: float) -> dict[str, obj
     }
 
 
+def _channel_history() -> list[dict[str, object]]:
+    # 4 days with a median ~1000 and a 900-1100 low/high channel.
+    return [
+        {
+            "date": f"2020-01-0{day}",
+            "average": average,
+            "highest": 1100.0,
+            "lowest": 900.0,
+            "order_count": 10,
+            "volume": 1000,
+        }
+        for day, average in enumerate([950.0, 1050.0, 950.0, 1050.0], start=1)
+    ]
+
+
 def _handler(request: httpx.Request) -> httpx.Response:
-    host = request.url.host
-    path = request.url.path
+    host, path = request.url.host, request.url.path
     if host == "login.eveonline.com":
         return httpx.Response(
             200,
-            json={
-                "access_token": "atk",
-                "token_type": "Bearer",
-                "expires_in": 1200,
-                "refresh_token": "r1",
-            },
+            json={"access_token": "atk", "token_type": "Bearer", "expires_in": 1200, "refresh_token": "r1"},
         )
     exp = {"Expires": _FUTURE}
     if "/markets/" in path and path.endswith("/history/"):
+        return httpx.Response(200, json=_channel_history(), headers=exp)
+    if "/markets/" in path and path.endswith("/orders/"):
+        orders = [
+            _order(1, _UNDERVALUED, is_buy=False, price=700.0),  # cheap ask
+            _order(2, _UNDERVALUED, is_buy=True, price=600.0),
+            _order(3, _HELD_DEAR, is_buy=True, price=1300.0),  # dear bid
+            _order(4, _HELD_DEAR, is_buy=False, price=1400.0),
+        ]
+        return httpx.Response(200, json=orders, headers={**exp, "X-Pages": "1"})
+    if path.endswith("/assets/"):
         return httpx.Response(
             200,
             json=[
                 {
-                    "date": "2020-01-01",
-                    "average": 120.0,
-                    "highest": 121.0,
-                    "lowest": 119.0,
-                    "order_count": 10,
-                    "volume": 1000,
+                    "item_id": 1,
+                    "type_id": _HELD_DEAR,
+                    "quantity": 10,
+                    "location_id": _STATION,
+                    "location_flag": "Hangar",
+                    "location_type": "station",
+                    "is_singleton": False,
                 }
             ],
             headers=exp,
         )
-    if "/markets/" in path and path.endswith("/orders/"):
-        return httpx.Response(
-            200,
-            json=[_market_order(1, is_buy=True, price=100.0), _market_order(2, is_buy=False, price=150.0)],
-            headers={**exp, "X-Pages": "1"},
-        )
     if path.endswith("/wallet/"):
         return httpx.Response(200, json=5_000_000.0, headers=exp)
     if path.endswith("/skillqueue/"):
-        return httpx.Response(
-            200,
-            json=[{"skill_id": 16622, "finished_level": 5, "queue_position": 0}],
-            headers=exp,
-        )
+        return httpx.Response(200, json=[], headers=exp)
     if path.endswith("/skills/"):
         return httpx.Response(
             200,
             json={
-                "skills": [
-                    {"skill_id": 16622, "active_skill_level": 5, "trained_skill_level": 5},
-                    {"skill_id": 3446, "active_skill_level": 5, "trained_skill_level": 5},
-                    {"skill_id": 3443, "active_skill_level": 5, "trained_skill_level": 5},
-                ],
+                "skills": [{"skill_id": 3443, "active_skill_level": 5, "trained_skill_level": 5}],
                 "total_sp": 10_000_000,
             },
             headers=exp,
@@ -124,29 +133,24 @@ def _handler(request: httpx.Request) -> httpx.Response:
     if "/characters/" in path and path.endswith("/orders/"):
         return httpx.Response(200, json=[], headers=exp)
     if path.endswith("/standings/"):
-        return httpx.Response(
-            200,
-            json=[{"from_id": _FACTION, "from_type": "faction", "standing": 8.0}],
-            headers=exp,
-        )
+        return httpx.Response(200, json=[], headers=exp)
     if "/universe/stations/" in path:
         return httpx.Response(
             200,
-            json={"station_id": _STATION, "name": "Jita", "system_id": 30000142, "type_id": 1529, "owner": _OWNER_CORP},
+            json={"station_id": _STATION, "name": "Jita", "system_id": 30000142, "type_id": 1529, "owner": _OWNER},
             headers=exp,
         )
     if "/corporations/" in path:
         return httpx.Response(200, json={"name": "Caldari Navy", "faction_id": _FACTION}, headers=exp)
     if "/universe/names/" in path:
-        import json
-
-        ids = json.loads(request.content)
-        catalogue = {34: "Tritanium", 16622: "Accounting", _STATION: "Jita IV-4 CNAP"}
-        return httpx.Response(200, json=[{"id": i, "name": catalogue[i], "category": "x"} for i in ids])
+        catalogue = {_UNDERVALUED: "Tritanium", _HELD_DEAR: "Pyerite", _STATION: "Jita IV-4"}
+        return httpx.Response(
+            200, json=[{"id": i, "name": catalogue[i], "category": "x"} for i in json.loads(request.content)]
+        )
     raise AssertionError(f"unexpected {path}")
 
 
-def test_pipeline_two_phases_produce_reports(tmp_path: Path) -> None:
+def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
     async def go() -> None:
         transport = httpx.MockTransport(_handler)
         async with httpx.AsyncClient(transport=transport) as http:
@@ -155,22 +159,13 @@ def test_pipeline_two_phases_produce_reports(tmp_path: Path) -> None:
             name_cache = NameCache(tmp_path / "names.json", client)
             now = lambda: datetime(2020, 1, 1, tzinfo=UTC)  # noqa: E731
 
-            # Phase 1: character + skill queue.
-            character = await fetch_character(
-                client, authenticator, _config(), 42, name_cache, now=now
-            )
-            assert character.skill_queue[0].skill_id == 16622
-            assert character.names[16622] == "Accounting"
-            assert character.station_name == "Jita IV-4 CNAP"
-            assert character.character.free_order_slots == 25  # Trade 5 -> 25, no open orders
-            assert character.character.fees.sales_tax > 0.0
+            character = await fetch_character(client, authenticator, _config(), 42, name_cache, now=now)
+            assert character.holdings == {_HELD_DEAR: 10}
+            assert character.station_name == "Jita IV-4"
 
-            # Phase 2: the market scan (discovery mode via scan_candidates default).
-            opportunities = await fetch_opportunities(
-                client, _config(), character.character, name_cache, now=now
-            )
-            assert len(opportunities.opportunities) == 1
-            assert opportunities.opportunities[0].type_id == 34
-            assert opportunities.names[34] == "Tritanium"
+            report = await fetch_opportunities(client, _config(), character, name_cache)
+            assert [s.type_id for s in report.buys] == [_UNDERVALUED]
+            assert [(s.type_id, s.quantity) for s in report.sells] == [(_HELD_DEAR, 10)]
+            assert report.names[_UNDERVALUED] == "Tritanium"
 
     asyncio.run(go())

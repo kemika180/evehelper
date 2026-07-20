@@ -30,6 +30,19 @@ class FeeRates(BaseModel):
     corp_standing_reduction: float = Field(default=0.0002, ge=0.0, le=1.0)
 
 
+class InvestmentParams(BaseModel):
+    """Mean-reversion tuning: the history window and how extreme a price must be."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Days of market history used for the moving average and Donchian channel.
+    window_days: int = Field(default=30, gt=1)
+    # Buy when the ask sits at/below this fraction of the channel (0 = the low).
+    buy_below_position: float = Field(default=0.15, ge=0.0, le=1.0)
+    # Sell held items when the bid sits at/above this fraction (1 = the high).
+    sell_above_position: float = Field(default=0.85, ge=0.0, le=1.0)
+
+
 class RiskPreferences(BaseModel):
     """Thresholds the advisor uses to filter and rank opportunities."""
 
@@ -72,3 +85,4 @@ class Config(BaseModel):
     theme: str = "kemika-purple"
     risk: RiskPreferences
     fees: FeeRates = Field(default_factory=FeeRates)
+    investment: InvestmentParams = Field(default_factory=InvestmentParams)
