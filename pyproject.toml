@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-evetrader = "evetrader.tui.app:main"
+evetrader = "evetrader.cli:main"
 
 [dependency-groups]
 dev = [

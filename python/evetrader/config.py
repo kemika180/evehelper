@@ -60,5 +60,9 @@ class Config(BaseModel):
     home_station_id: int = Field(gt=0)
     # Total ISK available to allocate across all suggested orders.
     total_capital_isk: float = Field(gt=0.0)
+    # Type ids to analyse for station trading (bounds per-type history fetches).
+    watchlist_type_ids: tuple[int, ...] = ()
+    # How often the TUI re-runs the pipeline; the client cache gates real fetches.
+    refresh_interval_seconds: int = Field(default=30, gt=0)
     risk: RiskPreferences
     fees: FeeRates = Field(default_factory=FeeRates)
