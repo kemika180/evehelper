@@ -5,18 +5,20 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
+from rich.text import Text
 from textual.widgets import DataTable, Input, OptionList, Static, TabbedContent, Tree
 
 from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.data.assets import AssetLocation, AssetNode
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
+from evetrader.esi.models import Blueprint, MarketHistoryDay, Skill, SkillQueueEntry
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
+    BlueprintInfoScreen,
     CharacterPickerScreen,
     EveTraderApp,
     PriceHistoryScreen,
@@ -26,6 +28,7 @@ from evetrader.tui.app import (
     _completion,
     _current_training,
     _skill_progress,
+    _skill_queue_pips,
     _train_time,
 )
 
@@ -178,6 +181,7 @@ def _character_report() -> CharacterReport:
             34: "Tritanium",
             35: "Pyerite",
             17363: "Giant Secure Container",
+            938: "Rifter Blueprint",
         },
         station_name="Jita IV - Moon 4 - Caldari Navy Assembly Plant",
         skill_reference={
@@ -200,6 +204,12 @@ def _character_report() -> CharacterReport:
         },
         assets=_asset_tree(),
         asset_names={11: "Ammo Box"},  # the Giant Secure Container has a player name
+        blueprints={
+            13: Blueprint(
+                item_id=13, type_id=938, location_id=60003760, location_flag="Hangar",
+                quantity=-2, material_efficiency=10, time_efficiency=20, runs=42,
+            )
+        },
     )
 
 
@@ -222,6 +232,10 @@ def _asset_tree() -> list[AssetLocation]:
                             is_singleton=False, children=(),
                         ),
                     ),
+                ),
+                AssetNode(
+                    item_id=13, type_id=938, quantity=1, location_flag="Hangar",
+                    is_singleton=True, children=(),  # a researched blueprint copy
                 ),
             ),
         )
@@ -433,6 +447,91 @@ def test_selecting_a_skill_row_opens_the_skill_info_popup(tmp_path: Path) -> Non
     asyncio.run(_drive())
 
 
+def _pip_styles(pips: Text) -> list[str]:
+    """Per-character style string of a pip Text (each pip is appended individually)."""
+    styles = ["" for _ in pips.plain]
+    for span in pips.spans:
+        for index in range(span.start, span.end):
+            styles[index] = str(span.style)
+    return styles
+
+
+def test_skill_queue_pips_leave_unqueued_skills_plain() -> None:
+    pips = _skill_queue_pips(999, 3, [], datetime(2020, 1, 6, tzinfo=UTC))
+    assert pips.plain == "■■■□□"
+    styles = _pip_styles(pips)
+    assert styles[:3] == ["cyan", "cyan", "cyan"]  # trained
+    assert styles[3:] == ["dim", "dim"]  # untrained, not queued
+
+
+def test_skill_queue_pips_colour_queued_levels() -> None:
+    reference = datetime(2020, 1, 6, tzinfo=UTC)
+    queue = [
+        SkillQueueEntry(  # training into level 4, halfway
+            skill_id=100,
+            finished_level=4,
+            queue_position=0,
+            start_date=datetime(2020, 1, 1, tzinfo=UTC),
+            finish_date=datetime(2020, 1, 11, tzinfo=UTC),
+            training_start_sp=1000,
+            level_start_sp=1000,
+            level_end_sp=2000,
+        ),
+        SkillQueueEntry(skill_id=100, finished_level=5, queue_position=1),  # queued behind it
+    ]
+    pips = _skill_queue_pips(100, 3, queue, reference)
+    assert pips.plain == "■■■◪□"  # 1-3 trained, 4 part-trained (◪), 5 queued
+    styles = _pip_styles(pips)
+    assert styles[:3] == ["cyan", "cyan", "cyan"]  # trained levels keep their colour
+    assert styles[3] == "magenta"  # the part-trained box
+    assert styles[4] == "magenta"  # the queued-but-not-started box
+
+
+def test_skill_queue_pips_count_finished_levels_as_trained() -> None:
+    reference = datetime(2020, 1, 6, tzinfo=UTC)
+    completed = SkillQueueEntry(
+        skill_id=100,
+        finished_level=4,
+        queue_position=0,
+        start_date=datetime(2019, 12, 1, tzinfo=UTC),
+        finish_date=datetime(2019, 12, 20, tzinfo=UTC),  # already finished
+    )
+    # trained_skill_level still lags at 3, but level 4 finished in the queue -> it
+    # shows as a full ■ (trained), not a queued/part-trained box.
+    pips = _skill_queue_pips(100, 3, [completed], reference)
+    assert pips.plain == "■■■■□"
+    assert _pip_styles(pips)[3] == "cyan"
+
+
+def _bpc_node() -> AssetNode:
+    return AssetNode(
+        item_id=13, type_id=938, quantity=1, location_flag="Hangar",
+        is_singleton=True, children=(),
+    )
+
+
+def test_blueprint_info_screen_shows_copy_research() -> None:
+    blueprint = Blueprint(
+        item_id=13, type_id=938, location_id=1, location_flag="Hangar",
+        quantity=-2, material_efficiency=10, time_efficiency=20, runs=42,
+    )
+    body = BlueprintInfoScreen("Rifter Blueprint", _bpc_node(), blueprint)._body().plain
+    assert "Rifter Blueprint" in body
+    assert "Blueprint Copy (BPC)" in body
+    assert "-10% materials" in body and "-20% time" in body
+    assert "42 runs remaining" in body
+
+
+def test_blueprint_info_screen_marks_an_original_unlimited() -> None:
+    blueprint = Blueprint(
+        item_id=13, type_id=938, location_id=1, location_flag="Hangar",
+        quantity=-1, material_efficiency=0, time_efficiency=0, runs=-1,
+    )
+    body = BlueprintInfoScreen("Rifter Blueprint", _bpc_node(), blueprint)._body().plain
+    assert "Blueprint Original (BPO)" in body
+    assert "unlimited runs" in body
+
+
 def test_skills_tab_groups_trained_skills(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
@@ -451,8 +550,8 @@ def test_skills_tab_groups_trained_skills(tmp_path: Path) -> None:
             groups = {str(node.label): node for node in tree.root.children}
             assert "Trade" in groups  # both fixture skills live under Trade
             leaves = [str(leaf.label) for leaf in groups["Trade"].children]
-            assert any("Accounting" in text and "●●●●●" in text for text in leaves)
-            assert any("Trade" in text and "●●●○○" in text for text in leaves)
+            assert any("Accounting" in text and "■■■■■" in text for text in leaves)
+            assert any("Trade" in text and "■■■□□" in text for text in leaves)
             await pilot.press("q")
 
     asyncio.run(_drive())
@@ -578,6 +677,7 @@ def _app_with_assets(store: CharacterStore, locations: list[AssetLocation], name
         base.skill_reference,
         locations,
         {},
+        base.blueprints,
     )
 
     async def character() -> CharacterReport:
@@ -672,6 +772,7 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
         base.skill_reference,
         [AssetLocation(60003760, (container,))],
         {},
+        base.blueprints,
     )
 
     async def _drive() -> None:
@@ -741,6 +842,49 @@ def test_selecting_a_trained_skill_opens_its_detail(tmp_path: Path) -> None:
             body = str(app.screen.query_one("#skillbody", Static).render())
             assert "Trade" in body and "Level 3 trained" in body
             assert "Basic trading." in body  # bundled description
+            await pilot.press("escape")
+
+    asyncio.run(_drive())
+
+
+def test_selecting_a_blueprint_asset_opens_its_detail(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            trading.query_one(TabbedContent).active = "assets"
+            await pilot.pause()
+            tree = trading.query_one("#assettree", Tree)
+            tree.focus()
+            leaves = [lf for place in tree.root.children for lf in place.children]
+            # Only the blueprint (item_id 13) carries data; plain items are inert.
+            blueprint_leaf = next(
+                lf for lf in leaves if isinstance(lf.data, AssetNode) and lf.data.item_id == 13
+            )
+            assert "BPC" in str(blueprint_leaf.label)  # tagged in the tree
+            tritanium_leaf = next(lf for lf in leaves if "Tritanium" in str(lf.label))
+            assert tritanium_leaf.data is None  # a non-blueprint item opens nothing
+
+            tree.move_cursor(blueprint_leaf)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, BlueprintInfoScreen)
+            body = str(app.screen.query_one("#bpbody", Static).render())
+            assert "Rifter Blueprint" in body
+            assert "Blueprint Copy (BPC)" in body
+            assert "42 runs remaining" in body
             await pilot.press("escape")
 
     asyncio.run(_drive())

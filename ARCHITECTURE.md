@@ -159,7 +159,11 @@ rough order:
 - ~~**Full skill view**~~ — DONE. A "Skills" tab with a collapsible tree of all
   trained skills grouped by category (level shown as pips); selecting a skill opens
   the same detail popup — the live training detail if it's in the queue, otherwise
-  its trained level and static facts.
+  its trained level and static facts. Level pips mirror the in-game squares — a cyan ■
+  per trained level, a dim □ per untrained level — and levels queued for training are
+  highlighted magenta (a ◪ for the one part-trained now, a □ for levels queued but not
+  yet started), so a skill not in the queue reads plainly while a queued one lights up
+  exactly the levels it will train.
 - ~~**Downtrend guard**~~ — DONE. `market/investment.py` suppresses a BUY when the
   short-window average (last `trend_days`) sits more than `max_downtrend` below the
   full-window fair value: a sharp dip barely moves the short average, a sustained
@@ -188,7 +192,13 @@ rough order:
   `esi-universe.read_structures.v1` scope + docking access) with a negative cache
   (`data/structures.py`) so an inaccessible one — which 403s, counting against the
   error-limit budget — isn't re-asked each refresh, falling back to its id. Rows are
-  tinted by depth for readability (`DepthTree`).
+  tinted by depth for readability (`DepthTree`). Blueprint leaves are tagged BPO/BPC
+  and open a detail popup (`BlueprintInfoScreen`) — original vs copy, ME/TE savings,
+  and runs remaining — from `GET /characters/{id}/blueprints/`
+  (`esi-characters.read_blueprints.v1`), keyed by asset item_id so two copies of one
+  type read their own research. Only blueprints have a popup: an ordinary item has
+  nothing solid to show without the SDE (volume/group, deferred to hauling) or a
+  per-click ESI fetch (which the cache rules forbid), so those rows are inert.
 
 **Persistence / data (enables several of the above)**
 - **Advisor state persistence** (sqlite vs polars/parquet) — remember past
@@ -230,9 +240,10 @@ rough order:
   `esi-markets.read_character_orders.v1`, `esi-location.read_location.v1`,
   `esi-skills.read_skills.v1`, `esi-skills.read_skillqueue.v1`,
   `esi-characters.read_standings.v1`, and `esi-universe.read_structures.v1` (added
-  2026-07-21 to name player structures in the asset browser). Also **pre-provisioned**
-  (2026-07-21) so upcoming modules need no further re-login, though nothing requests
-  them yet: `esi-industry.read_character_jobs.v1`, `esi-characters.read_blueprints.v1`
+  2026-07-21 to name player structures in the asset browser). `esi-characters.read_blueprints.v1`
+  is now consumed too — the asset browser's item-detail popup reads blueprint ME/TE and
+  runs. Also **pre-provisioned** (2026-07-21) so upcoming modules need no further
+  re-login, though nothing requests them yet: `esi-industry.read_character_jobs.v1`
   (crafting), `esi-planets.manage_planets.v1` (PI), `esi-industry.read_character_mining.v1`,
   `esi-contracts.read_character_contracts.v1` (hauling), `esi-markets.structure_markets.v1`
   (private-structure order books). The registered app must enable every requested
