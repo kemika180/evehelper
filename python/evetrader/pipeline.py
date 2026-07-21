@@ -17,6 +17,7 @@ from evetrader.advisor.state import CharacterState
 from evetrader.config import Config, HomeMarket
 from evetrader.data.character import build_character_state
 from evetrader.data.market import history_to_frame, orders_frame_from_pages
+from evetrader.data.skills import SkillReference, load_skills
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient, EsiError
@@ -38,6 +39,8 @@ class CharacterReport:
     holdings: dict[int, int]
     names: dict[int, str]
     station_name: str
+    # Static skill facts (name/rank/attributes/description) for the skill-info popup.
+    skill_reference: dict[int, SkillReference]
 
 
 @dataclass(frozen=True)
@@ -85,7 +88,9 @@ async def fetch_character(
         name_ids.append(home.station_id)
     names = await name_cache.resolve(name_ids)
     station_name = home.label or names.get(home.station_id, str(home.station_id))
-    return CharacterReport(now(), character, skill_queue, holdings, names, station_name)
+    return CharacterReport(
+        now(), character, skill_queue, holdings, names, station_name, load_skills()
+    )
 
 
 async def _histories(

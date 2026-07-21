@@ -26,6 +26,7 @@ from textual.widgets import DataTable, Footer, Header, OptionList, Static, Tabbe
 from textual.widgets.option_list import Option
 from textual_plotext import PlotextPlot
 
+from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import MarketHistoryDay, SkillQueueEntry
 from evetrader.market.investment import InvestmentSignal
@@ -34,11 +35,15 @@ from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
 
 
-def _finish(entry: SkillQueueEntry) -> str:
+def _local(moment: datetime) -> str:
     # ESI gives UTC; astimezone() (no arg) converts to the machine's local zone.
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _finish(entry: SkillQueueEntry) -> str:
     if entry.finish_date is None:
         return "unknown"
-    return entry.finish_date.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    return _local(entry.finish_date)
 
 
 def _nice_ticks(low: float, high: float, count: int) -> list[float]:
@@ -115,6 +120,68 @@ def _time_left(entry: SkillQueueEntry, reference: datetime) -> str:
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+@dataclass(frozen=True)
+class SkillProgress:
+    """Where a queued skill level stands at a reference time: its SP span and how
+    far into it the character is — SP-based, interpolated by time while training."""
+
+    status: str  # "training" | "queued" | "completed" | "paused"
+    level_sp: int | None  # total SP the level requires
+    trained_sp: int | None  # SP already earned toward it (clamped to the level)
+    fraction: float | None  # trained_sp / level_sp, if computable
+
+
+def _skill_status(entry: SkillQueueEntry, reference: datetime) -> str:
+    if _is_completed(entry, reference):
+        return "completed"
+    if entry.start_date is None or entry.finish_date is None:
+        return "paused"
+    if reference < entry.start_date:
+        return "queued"
+    return "training"
+
+
+def _current_sp(entry: SkillQueueEntry, reference: datetime, status: str) -> int | None:
+    """SP the character holds toward this level at `reference` (None if ESI omits SP).
+
+    A skill trains at a constant rate, so the SP earned while training is a linear
+    interpolation between the queue-entry's starting SP and the level's end SP.
+    """
+    if entry.training_start_sp is None or entry.level_end_sp is None:
+        return None
+    if status == "completed":
+        return entry.level_end_sp
+    if status != "training" or entry.start_date is None or entry.finish_date is None:
+        return entry.training_start_sp  # queued/paused: no training has elapsed
+    span = (entry.finish_date - entry.start_date).total_seconds()
+    if span <= 0:
+        return entry.level_end_sp
+    elapsed = _clamp((reference - entry.start_date).total_seconds() / span, 0.0, 1.0)
+    return round(entry.training_start_sp + elapsed * (entry.level_end_sp - entry.training_start_sp))
+
+
+def _skill_progress(entry: SkillQueueEntry, reference: datetime) -> SkillProgress:
+    status = _skill_status(entry, reference)
+    if entry.level_start_sp is None or entry.level_end_sp is None:
+        return SkillProgress(status, None, None, None)
+    level_sp = entry.level_end_sp - entry.level_start_sp
+    current_sp = _current_sp(entry, reference, status)
+    if current_sp is None or level_sp <= 0:
+        return SkillProgress(status, level_sp if level_sp > 0 else None, None, None)
+    trained_sp = int(_clamp(current_sp - entry.level_start_sp, 0, level_sp))
+    return SkillProgress(status, level_sp, trained_sp, trained_sp / level_sp)
+
+
+def _bar(fraction: float, width: int = 24) -> str:
+    filled = round(_clamp(fraction, 0.0, 1.0) * width)
+    return "█" * filled + "░" * (width - filled)
+
 
 FetchCharacter = Callable[[], Awaitable[CharacterReport]]
 FetchOpportunities = Callable[[CharacterReport], Awaitable[OpportunityReport]]
@@ -203,6 +270,91 @@ class PriceHistoryScreen(ModalScreen[None]):
         )
 
 
+_STATUS_LABEL: dict[str, tuple[str, str]] = {
+    "training": ("▶ Training now", "bold magenta"),
+    "queued": ("• Queued", "cyan"),
+    "completed": ("✓ Completed", "green"),
+    "paused": ("⏸ Paused", "yellow"),
+}
+
+
+class SkillInfoScreen(ModalScreen[None]):
+    """Details for one skill-queue entry: level, SP progress, and timing."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        ("q", "dismiss", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    SkillInfoScreen { align: center middle; }
+    SkillInfoScreen #skillbox {
+        width: 64;
+        height: auto;
+        max-height: 90%;
+        overflow-y: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    SkillInfoScreen #skillhint { padding: 1 0 0 0; color: $text-muted; }
+    """
+
+    def __init__(
+        self,
+        name: str,
+        entry: SkillQueueEntry,
+        reference: datetime,
+        info: SkillReference | None,
+    ) -> None:
+        super().__init__()
+        self._skill_name = name
+        self._entry = entry
+        self._reference = reference
+        self._info = info
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="skillbox"):
+            yield Static(self._body(), id="skillbody")
+            yield Static("esc to close", id="skillhint")
+
+    def _body(self) -> Text:
+        entry = self._entry
+        reference = self._reference
+        info = self._info
+        progress = _skill_progress(entry, reference)
+        label, style = _STATUS_LABEL[progress.status]
+
+        text = Text()
+        text.append(self._skill_name, style="bold")
+        text.append(f"   →   Level {entry.finished_level}\n", style="bold")
+        if info is not None:
+            text.append(
+                f"rank {info.rank}  ·  {info.primary} / {info.secondary}\n", style="dim"
+            )
+        text.append("\n")
+        text.append(f"{label}\n", style=style)
+
+        if progress.fraction is not None and progress.trained_sp is not None:
+            text.append(f"\n{_bar(progress.fraction)}  {progress.fraction:.0%}\n", style="magenta")
+            text.append(
+                f"{progress.trained_sp:,} / {progress.level_sp:,} SP this level\n", style="dim"
+            )
+        elif progress.level_sp is not None:
+            text.append(f"\n{progress.level_sp:,} SP for this level\n", style="dim")
+
+        if progress.status != "completed" and entry.finish_date is not None:
+            text.append(f"\n{_time_left(entry, reference)} left\n", style="yellow")
+        if entry.start_date is not None:
+            text.append(f"starts     {_local(entry.start_date)}\n", style="dim")
+        if entry.finish_date is not None:
+            text.append(f"completes  {_local(entry.finish_date)}\n", style="dim")
+        if info is not None and info.description:
+            text.append(f"\n{info.description}", style="italic dim")
+        return text
+
+
 class TradingScreen(Screen[None]):
     """Per-character advisor view: opportunities plus character and skill-queue."""
 
@@ -236,6 +388,7 @@ class TradingScreen(Screen[None]):
         self._feed = feed
         self._interval = interval_seconds
         self._report: OpportunityReport | None = None
+        self._character: CharacterReport | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -254,10 +407,13 @@ class TradingScreen(Screen[None]):
                 yield Static("SELL — your holdings above normal", classes="section")
                 yield DataTable(id="sells", zebra_stripes=True, cursor_type="row")
             with TabPane("Skill Queue", id="queue"):
-                yield DataTable(id="skillqueue", zebra_stripes=True)
+                yield DataTable(id="skillqueue", zebra_stripes=True, cursor_type="row")
         yield Footer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "skillqueue":
+            self._open_skill_info(event)
+            return
         if self._report is None or event.row_key.value is None:
             return
         type_id = int(event.row_key.value)
@@ -268,6 +424,23 @@ class TradingScreen(Screen[None]):
         if days and signal is not None:
             name = self._report.names.get(type_id, str(type_id))
             self.app.push_screen(PriceHistoryScreen(name, days, signal))
+
+    def _open_skill_info(self, event: DataTable.RowSelected) -> None:
+        if self._character is None or event.row_key.value is None:
+            return
+        position = int(event.row_key.value)
+        entry = next(
+            (e for e in self._character.skill_queue if e.queue_position == position), None
+        )
+        if entry is None:
+            return
+        info = self._character.skill_reference.get(entry.skill_id)
+        name = info.name if info is not None else self._character.names.get(
+            entry.skill_id, str(entry.skill_id)
+        )
+        self.app.push_screen(
+            SkillInfoScreen(name, entry, self._character.captured_at, info)
+        )
 
     def on_mount(self) -> None:
         self.query_one("#buys", DataTable).add_columns(
@@ -289,6 +462,7 @@ class TradingScreen(Screen[None]):
         except Exception as error:  # surface it instead of a blank screen
             status.update(f"[Character load failed] {type(error).__name__}: {error}")
             return
+        self._character = character_report
         self.query_one("#location", Static).update(f"📍 {character_report.station_name}")
         self._render_stats(character_report)
         self._render_training(character_report)
@@ -390,6 +564,7 @@ class TradingScreen(Screen[None]):
                 Text(f"{marker}{name} → L{entry.finished_level}", style=style),
                 Text(_time_left(entry, reference), style="yellow"),
                 Text(_completion(entry, reference), style="dim"),
+                key=str(entry.queue_position),
             )
 
 

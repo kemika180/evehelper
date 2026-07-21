@@ -128,6 +128,11 @@ class SkillQueueEntry(_EsiModel):
     queue_position: int
     start_date: datetime | None = None
     finish_date: datetime | None = None
+    # SP boundaries of this level and the SP the character held when this entry
+    # started training. Absent on a paused/undated queue; present otherwise.
+    training_start_sp: int | None = None
+    level_start_sp: int | None = None
+    level_end_sp: int | None = None
 
 
 class Station(_EsiModel):

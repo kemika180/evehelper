@@ -5,9 +5,10 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
-from textual.widgets import DataTable, OptionList, Static
+from textual.widgets import DataTable, OptionList, Static, TabbedContent
 
 from evetrader.advisor.state import CharacterState, TradeSkills
+from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import MarketHistoryDay, SkillQueueEntry
 from evetrader.market.fees import EffectiveFees
@@ -19,9 +20,11 @@ from evetrader.tui.app import (
     EveTraderApp,
     PriceHistoryScreen,
     RefreshFeed,
+    SkillInfoScreen,
     TradingScreen,
     _completion,
     _current_training,
+    _skill_progress,
 )
 
 
@@ -67,6 +70,62 @@ def test_completion_hidden_for_completed_skills() -> None:
     assert _completion(future, reference) != "—"  # still shown for not-yet-complete
 
 
+def _sp_entry(
+    start: datetime | None,
+    finish: datetime | None,
+    *,
+    level_start: int | None = 100_000,
+    level_end: int | None = 200_000,
+    training_start: int | None = 100_000,
+) -> SkillQueueEntry:
+    return SkillQueueEntry(
+        skill_id=1,
+        finished_level=5,
+        queue_position=0,
+        start_date=start,
+        finish_date=finish,
+        level_start_sp=level_start,
+        level_end_sp=level_end,
+        training_start_sp=training_start,
+    )
+
+
+def test_skill_progress_interpolates_the_training_skill_by_time() -> None:
+    entry = _sp_entry(datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 3, tzinfo=UTC))
+    progress = _skill_progress(entry, datetime(2026, 1, 2, tzinfo=UTC))  # halfway
+    assert progress.status == "training"
+    assert progress.level_sp == 100_000
+    assert progress.trained_sp == 50_000
+    assert progress.fraction == 0.5
+
+
+def test_skill_progress_queued_reflects_pre_training() -> None:
+    # Not started yet, but 20k SP into the level from earlier training.
+    entry = _sp_entry(
+        datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 2, 3, tzinfo=UTC), training_start=120_000
+    )
+    progress = _skill_progress(entry, datetime(2026, 1, 1, tzinfo=UTC))
+    assert progress.status == "queued"
+    assert progress.trained_sp == 20_000
+    assert progress.fraction == 0.2
+
+
+def test_skill_progress_completed_is_full() -> None:
+    entry = _sp_entry(datetime(2025, 1, 1, tzinfo=UTC), datetime(2025, 2, 1, tzinfo=UTC))
+    progress = _skill_progress(entry, datetime(2026, 1, 1, tzinfo=UTC))
+    assert progress.status == "completed"
+    assert progress.trained_sp == 100_000
+    assert progress.fraction == 1.0
+
+
+def test_skill_progress_paused_without_sp_has_no_fraction() -> None:
+    entry = _sp_entry(None, None, level_start=None, level_end=None, training_start=None)
+    progress = _skill_progress(entry, datetime(2026, 1, 1, tzinfo=UTC))
+    assert progress.status == "paused"
+    assert progress.level_sp is None
+    assert progress.fraction is None
+
+
 def _character_state() -> CharacterState:
     return CharacterState(
         station_id=60003760,
@@ -95,6 +154,15 @@ def _character_report() -> CharacterReport:
         holdings={34: 500},
         names={16622: "Accounting"},
         station_name="Jita IV - Moon 4 - Caldari Navy Assembly Plant",
+        skill_reference={
+            16622: SkillReference(
+                name="Accounting",
+                rank=3,
+                primary="Charisma",
+                secondary="Memory",
+                description="Reduces sales tax.",
+            )
+        },
     )
 
 
@@ -262,6 +330,40 @@ def test_selecting_a_buy_row_opens_the_price_chart(tmp_path: Path) -> None:
             await pilot.pause()
 
             assert isinstance(app.screen, PriceHistoryScreen)
+            await pilot.press("escape")
+
+    asyncio.run(_drive())
+
+
+def test_selecting_a_skill_row_opens_the_skill_info_popup(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            trading.query_one(TabbedContent).active = "queue"
+            await pilot.pause()
+            queue = trading.query_one("#skillqueue", DataTable)
+            queue.focus()
+            await pilot.pause()
+            await pilot.press("enter")  # select the highlighted skill row
+            await pilot.pause()
+
+            assert isinstance(app.screen, SkillInfoScreen)
+            popup_text = str(app.screen.query_one("#skillbody", Static).render())
+            assert "Accounting" in popup_text
+            assert "rank 3" in popup_text  # static reference facts
+            assert "Charisma / Memory" in popup_text
+            assert "Reduces sales tax." in popup_text  # bundled description
             await pilot.press("escape")
 
     asyncio.run(_drive())

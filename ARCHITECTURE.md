@@ -61,7 +61,8 @@ eve_trading/
 │       ├── data/              # ingestion: ESI/SDE -> normalized plain data
 │       │   ├── market.py      # market orders + history -> polars MarketSnapshot
 │       │   ├── character.py   # wallet/skills/standings/orders -> CharacterState
-│       │   └── universe.py    # type/region/station names (cached POST /universe/names/)
+│       │   ├── universe.py    # type/region/station names (cached POST /universe/names/)
+│       │   └── skills.py      # bundled static skills reference (skills.json, offline)
 │       ├── market/            # PURE analysis core (no I/O)
 │       │   ├── snapshot.py    # MarketSnapshot: polars frames + region + capture time
 │       │   ├── fees.py        # broker fee + sales tax from skills/standings
@@ -149,8 +150,11 @@ rough order:
 - **Active-listings overlay** — show the character's own open market orders inside
   the buy/sell lists, coloured green if still best price, red if undercut (sell) /
   overcut (buy).
-- **Skill-info popup** — select a skill in the queue (later the full skill list) to
-  see its details.
+- ~~**Skill-info popup**~~ — DONE. Select a skill-queue row to see its level, SP
+  progress (a bar, interpolated by time for the training skill), timing, and static
+  facts — rank, primary/secondary attribute, description — from a bundled skills
+  reference (`evetrader/data/skills.json`), read offline with no ESI call. Later:
+  extend to the full skill list.
 - **Downtrend guard** — distinguish a real dip from a structural decline (compare a
   short vs long average) so buys don't chase items that won't revert.
 
@@ -211,6 +215,15 @@ rough order:
   static SDE is deferred to hauling (milestone 6), where item volumes are needed —
   `/universe/names/` returns names only. ESI has no per-day request quota; the only
   budget is the error-limit (errors, not successes), so volume is not a constraint.
+- **Bundled skills reference** (2026-07-20): static skill facts (name, training
+  rank, primary/secondary attribute, description) ship as a checked-in
+  `evetrader/data/skills.json` and are read offline — no runtime ESI call — by
+  `data/skills.py` (a `@cache`d loader) for the skill-info popup. Generated once by
+  `scripts/build_skills_reference.py` (walks the public ESI universe endpoints:
+  skill category → groups → types), regenerated only when CCP adds/rebalances
+  skills. This is a small, self-contained slice of static data, distinct from the
+  full SDE (item volumes etc.) still deferred to hauling — the popup's "what is this
+  skill" need did not justify pulling in the whole SDE or hitting ESI per keystroke.
 - **Fee/tax constants** (milestone 3): `market/fees.py` stays pure and takes skill
   levels + standings + a `FeeRates` config block (base rates and per-level/standing
   reductions) as inputs. No CCP rate constants are baked into code; `FeeRates`
