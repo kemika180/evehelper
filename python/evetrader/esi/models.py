@@ -62,6 +62,28 @@ class Blueprint(_EsiModel):
     runs: int
 
 
+class IndustryJob(_EsiModel):
+    """One row of GET /characters/{id}/industry/jobs/ (a running/ready job).
+
+    ``activity_id`` is the industry activity (1 manufacturing, 3 TE research, 4 ME
+    research, 5 copying, 8 invention, 9 reactions). ``product_type_id`` is the item
+    produced (manufacturing/invention/reactions); it's absent for research/copying,
+    where the blueprint itself is the subject. ``status`` is one of active / paused /
+    ready / delivered / cancelled / reverted."""
+
+    job_id: int
+    activity_id: int
+    blueprint_type_id: int
+    product_type_id: int | None = None
+    facility_id: int
+    runs: int
+    status: str
+    start_date: datetime
+    end_date: datetime
+    cost: float | None = None
+    probability: float | None = None  # invention success chance, when applicable
+
+
 class CharacterOrder(_EsiModel):
     """One row of GET /characters/{id}/orders/ (the character's open orders)."""
 

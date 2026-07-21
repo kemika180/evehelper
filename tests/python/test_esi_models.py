@@ -6,6 +6,7 @@ from evetrader.esi.models import (
     Asset,
     Blueprint,
     CharacterOrder,
+    IndustryJob,
     Location,
     MarketOrder,
     TokenResponse,
@@ -114,3 +115,39 @@ def test_blueprint_copy_carries_finite_runs() -> None:
     assert copy.runs == 42
     assert copy.material_efficiency == 4
     assert copy.time_efficiency == 8
+
+
+def test_industry_job_manufacturing_parses_with_product() -> None:
+    job = IndustryJob.model_validate(
+        {
+            "job_id": 5,
+            "activity_id": 1,
+            "blueprint_type_id": 938,
+            "product_type_id": 587,
+            "facility_id": 60003760,
+            "runs": 10,
+            "status": "active",
+            "cost": 1234.5,
+            "start_date": "2020-01-01T00:00:00Z",
+            "end_date": "2020-01-02T00:00:00Z",
+        }
+    )
+    assert job.activity_id == 1
+    assert job.product_type_id == 587
+    assert job.probability is None  # absent on a manufacturing job
+
+
+def test_industry_job_research_omits_product() -> None:
+    job = IndustryJob.model_validate(
+        {
+            "job_id": 6,
+            "activity_id": 4,  # ME research — no product, the blueprint is the subject
+            "blueprint_type_id": 938,
+            "facility_id": 60003760,
+            "runs": 1,
+            "status": "active",
+            "start_date": "2020-01-01T00:00:00Z",
+            "end_date": "2020-01-02T00:00:00Z",
+        }
+    )
+    assert job.product_type_id is None

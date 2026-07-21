@@ -21,6 +21,7 @@ from evetrader.esi.models import (
     CharacterSkills,
     Corporation,
     EsiName,
+    IndustryJob,
     Location,
     MarketHistoryDay,
     MarketOrder,
@@ -34,6 +35,7 @@ _WALLET = TypeAdapter(float)
 _ASSETS = TypeAdapter(list[Asset])
 _ASSET_NAMES = TypeAdapter(list[AssetName])
 _BLUEPRINTS = TypeAdapter(list[Blueprint])
+_INDUSTRY_JOBS = TypeAdapter(list[IndustryJob])
 _CHARACTER_ORDERS = TypeAdapter(list[CharacterOrder])
 _MARKET_ORDERS = TypeAdapter(list[MarketOrder])
 _MARKET_HISTORY = TypeAdapter(list[MarketHistoryDay])
@@ -68,6 +70,15 @@ async def fetch_blueprints(
     """The character's blueprints (ME/TE, runs, original vs copy), paged like assets."""
     pages = await client.get_all_pages(f"/characters/{character_id}/blueprints/", token=token)
     return [bp for page in pages for bp in _BLUEPRINTS.validate_json(page)]
+
+
+async def fetch_industry_jobs(
+    client: EsiClient, character_id: int, token: str
+) -> list[IndustryJob]:
+    """Running/ready industry jobs (not the delivered/cancelled history — the default,
+    no ``include_completed``). A single unpaged response."""
+    body = await client.get(f"/characters/{character_id}/industry/jobs/", token=token)
+    return _INDUSTRY_JOBS.validate_json(body)
 
 
 async def fetch_open_orders(

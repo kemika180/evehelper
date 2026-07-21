@@ -162,6 +162,25 @@ def _handler(request: httpx.Request) -> httpx.Response:
             ],
             headers=exp,
         )
+    if path.endswith("/industry/jobs/"):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "job_id": 100,
+                    "activity_id": 1,
+                    "blueprint_type_id": _UNDERVALUED,
+                    "product_type_id": _HELD_DEAR,
+                    "facility_id": _STRUCTURE,  # named via the same structure lookup as assets
+                    "runs": 3,
+                    "status": "active",
+                    "cost": 12345.0,
+                    "start_date": "2020-01-01T00:00:00Z",
+                    "end_date": "2020-01-02T00:00:00Z",
+                }
+            ],
+            headers=exp,
+        )
     if path.endswith("/skillqueue/"):
         return httpx.Response(200, json=[], headers=exp)
     if path.endswith("/skills/"):
@@ -220,6 +239,9 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             # Blueprint research is keyed by asset item_id for the browser popup.
             assert character.blueprints[3].runs == 10
             assert character.blueprints[3].material_efficiency == 8
+            # Industry jobs come through, and the job's facility is named like any place.
+            assert [job.job_id for job in character.industry_jobs] == [100]
+            assert character.industry_jobs[0].product_type_id == _HELD_DEAR
             assert character.station_name == "Jita IV-4"
             # A player structure is named via /universe/structures + its system name.
             assert character.names[_STRUCTURE] == "V-3YG7 Fortizar · V-3YG7"

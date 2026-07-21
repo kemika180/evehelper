@@ -27,11 +27,18 @@ from evetrader.esi.endpoints import (
     fetch_asset_names,
     fetch_assets,
     fetch_blueprints,
+    fetch_industry_jobs,
     fetch_market_history,
     fetch_skillqueue,
     fetch_skills,
 )
-from evetrader.esi.models import Blueprint, MarketHistoryDay, Skill, SkillQueueEntry
+from evetrader.esi.models import (
+    Blueprint,
+    IndustryJob,
+    MarketHistoryDay,
+    Skill,
+    SkillQueueEntry,
+)
 from evetrader.market.investment import InvestmentSignal, find_opportunities, liquid_types
 
 # Bounded concurrency for the per-type history fetches.
@@ -58,6 +65,8 @@ class CharacterReport:
     asset_names: dict[int, str]
     # Blueprint research (ME/TE, runs, original vs copy), keyed by asset item_id.
     blueprints: dict[int, Blueprint]
+    # Running/ready industry jobs (manufacturing, research, copying, invention, …).
+    industry_jobs: list[IndustryJob]
 
 
 @dataclass(frozen=True)
@@ -119,6 +128,8 @@ async def fetch_character(
     # type), so key it by item_id to match a selected asset row in the browser.
     blueprints = {bp.item_id: bp for bp in await fetch_blueprints(client, character_id, token)}
 
+    industry_jobs = await fetch_industry_jobs(client, character_id, token)
+
     # Player-assigned names for containers/ships (POST, 1000 ids/call), to make them
     # findable in the browser. Only singleton items that hold things can be named.
     nameable = nameable_item_ids(asset_tree)
@@ -129,21 +140,25 @@ async def fetch_character(
             if named.name and named.name != "None":
                 asset_names[named.item_id] = named.name
 
-    # Player structures don't resolve via /universe/names; look them up individually
-    # (needs docking access) — except the home, which a config label already names.
+    # Places to name: asset locations plus each industry job's facility. Player
+    # structures don't resolve via /universe/names; look them up individually (needs
+    # docking access) — except the home, which a config label already names.
+    place_ids = {loc.location_id for loc in asset_tree} | {job.facility_id for job in industry_jobs}
     structure_ids = [
-        loc.location_id
-        for loc in asset_tree
-        if not _resolvable_location(loc.location_id) and loc.location_id != home.station_id
+        place_id
+        for place_id in place_ids
+        if not _resolvable_location(place_id) and place_id != home.station_id
     ]
     structures = await structure_cache.resolve(token, structure_ids)
 
     # Names back up the bundled reference for any skill it doesn't cover, and label
-    # asset types and their (resolvable) places plus each structure's solar system.
+    # asset/job types and their (resolvable) places plus each structure's solar system.
     name_ids = [entry.skill_id for entry in skill_queue]
     name_ids += [skill.skill_id for skill in skills.skills]
     name_ids += [asset.type_id for asset in assets]
-    name_ids += [loc.location_id for loc in asset_tree if _resolvable_location(loc.location_id)]
+    name_ids += [job.blueprint_type_id for job in industry_jobs]
+    name_ids += [job.product_type_id for job in industry_jobs if job.product_type_id is not None]
+    name_ids += [place_id for place_id in place_ids if _resolvable_location(place_id)]
     name_ids += [structure.solar_system_id for structure in structures.values()]
     if home.label is None:
         name_ids.append(home.station_id)
@@ -164,6 +179,7 @@ async def fetch_character(
         asset_tree,
         asset_names,
         blueprints,
+        industry_jobs,
     )
 
 

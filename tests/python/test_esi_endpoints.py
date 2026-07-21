@@ -14,6 +14,7 @@ from evetrader.esi.endpoints import (
     fetch_assets,
     fetch_blueprints,
     fetch_corporation,
+    fetch_industry_jobs,
     fetch_location,
     fetch_market_history,
     fetch_market_orders,
@@ -137,6 +138,32 @@ def test_fetch_blueprints_authenticates_and_pages() -> None:
         assert [bp.runs for bp in blueprints] == [1, 2]
         assert blueprints[0].material_efficiency == 10
         assert blueprints[0].time_efficiency == 20
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_fetch_industry_jobs_authenticates_and_parses() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("Authorization") == "Bearer tok"
+        job = {
+            "job_id": 1,
+            "activity_id": 1,
+            "blueprint_type_id": 938,
+            "product_type_id": 587,
+            "facility_id": 60003760,
+            "runs": 10,
+            "status": "active",
+            "cost": 1000.0,
+            "start_date": "2016-09-03T05:12:25Z",
+            "end_date": "2016-09-04T05:12:25Z",
+        }
+        return httpx.Response(200, json=[job], headers={"Expires": _FUTURE})
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        jobs = await fetch_industry_jobs(client, 42, token="tok")
+        assert len(jobs) == 1
+        assert jobs[0].activity_id == 1
+        assert jobs[0].product_type_id == 587
 
     _run(body, httpx.MockTransport(handler))
 

@@ -43,7 +43,13 @@ from textual_plotext import PlotextPlot
 from evetrader.data.assets import AssetLocation, AssetNode
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import Blueprint, MarketHistoryDay, Skill, SkillQueueEntry
+from evetrader.esi.models import (
+    Blueprint,
+    IndustryJob,
+    MarketHistoryDay,
+    Skill,
+    SkillQueueEntry,
+)
 from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
@@ -256,6 +262,52 @@ def _skill_queue_pips(
         else:
             pips.append("□", style="dim")  # untrained and not queued
     return pips
+
+
+# Industry activity ids -> human names (the current, non-legacy activities).
+_ACTIVITY_NAMES: dict[int, str] = {
+    1: "Manufacturing",
+    3: "TE Research",
+    4: "ME Research",
+    5: "Copying",
+    8: "Invention",
+    9: "Reactions",
+}
+
+# Per-state row marker + style and popup label, mirroring the skill-queue convention.
+_JOB_STATES: dict[str, tuple[str, str, str]] = {
+    # state: (row marker, style, popup label)
+    "ready": ("● ", "bold green", "● Ready to deliver"),
+    "active": ("▶ ", "cyan", "▶ In progress"),
+    "paused": ("⏸ ", "yellow", "⏸ Paused"),
+    "delivered": ("  ", "dim", "✓ Delivered"),
+    "cancelled": ("  ", "dim", "✗ Cancelled"),
+    "reverted": ("  ", "dim", "✗ Reverted"),
+}
+
+
+def _activity_name(activity_id: int) -> str:
+    return _ACTIVITY_NAMES.get(activity_id, f"Activity {activity_id}")
+
+
+def _job_state(job: IndustryJob, reference: datetime) -> str:
+    """Display state at `reference`: 'ready' (finished, awaiting delivery), 'paused',
+    'active', or a terminal status ESI may still return (delivered/cancelled/reverted)."""
+    if job.status in {"paused", "delivered", "cancelled", "reverted"}:
+        return job.status
+    return "ready" if job.end_date <= reference else "active"
+
+
+def _job_subject_type(job: IndustryJob) -> int:
+    """The type id that names the job — the product for manufacturing/invention/
+    reactions, else the blueprint (research and copying produce no new item)."""
+    return job.product_type_id if job.product_type_id is not None else job.blueprint_type_id
+
+
+def _job_time_left(job: IndustryJob, reference: datetime) -> str:
+    if job.end_date <= reference:
+        return "ready"
+    return _humanize_span(int((job.end_date - reference).total_seconds()))
 
 
 def _asset_signature(locations: list[AssetLocation]) -> tuple[object, ...]:
@@ -612,6 +664,68 @@ class BlueprintInfoScreen(ModalScreen[None]):
         return text
 
 
+class IndustryJobScreen(ModalScreen[None]):
+    """Detail for one industry job: activity, product/blueprint, runs, where it runs,
+    timing, cost, and (for invention) success chance."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        ("q", "dismiss", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    IndustryJobScreen { align: center middle; }
+    IndustryJobScreen #jobbox {
+        width: 64;
+        height: auto;
+        max-height: 90%;
+        overflow-y: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    IndustryJobScreen #jobhint { padding: 1 0 0 0; color: $text-muted; }
+    """
+
+    def __init__(self, name: str, job: IndustryJob, facility: str, reference: datetime) -> None:
+        super().__init__()
+        self._name = name
+        self._job = job
+        self._facility = facility
+        self._reference = reference
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="jobbox"):
+            yield Static(self._body(), id="jobbody")
+            yield Static("click or esc to close", id="jobhint")
+
+    def on_click(self) -> None:
+        self.dismiss()
+
+    def _body(self) -> Text:
+        job = self._job
+        state = _job_state(job, self._reference)
+        _, _, status_label = _JOB_STATES[state]
+
+        text = Text()
+        text.append(f"{self._name}\n", style="bold")
+        runs = "run" if job.runs == 1 else "runs"
+        text.append(f"{_activity_name(job.activity_id)}  ·  {job.runs:,} {runs}\n", style="dim")
+        text.append(f"{status_label}\n", style=_JOB_STATES[state][1])
+
+        if state == "active":
+            text.append(f"\n{_job_time_left(job, self._reference)} left\n", style="yellow")
+        text.append(f"\nat {self._facility}\n", style="dim")
+        text.append(f"starts  {_local(job.start_date)}\n", style="dim")
+        text.append(f"ends    {_local(job.end_date)}\n", style="dim")
+        if job.cost is not None:
+            text.append(f"job cost  {_isk(job.cost)} ISK\n", style="dim")
+        if job.probability is not None:
+            text.append(f"success   {job.probability:.0%}\n", style="dim")  # invention
+        return text
+
+
 class TradingScreen(Screen[None]):
     """Per-character advisor view: opportunities plus character and skill-queue."""
 
@@ -640,7 +754,7 @@ class TradingScreen(Screen[None]):
     }
     TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
     TradingScreen #buys, TradingScreen #sells, TradingScreen #skillqueue,
-    TradingScreen #skilltree, TradingScreen #assettree {
+    TradingScreen #skilltree, TradingScreen #assettree, TradingScreen #industry {
         margin: 0 1;
         height: 1fr;
     }
@@ -682,11 +796,16 @@ class TradingScreen(Screen[None]):
             with TabPane("Assets", id="assets"):
                 yield Input(placeholder="Search items…", id="assetsearch")
                 yield DepthTree[AssetNode]("Assets", id="assettree")
+            with TabPane("Industry", id="industry-tab"):
+                yield DataTable(id="industry", zebra_stripes=True, cursor_type="row")
         yield Footer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "skillqueue":
             self._open_skill_info(event)
+            return
+        if event.data_table.id == "industry":
+            self._open_industry_job(event)
             return
         if self._report is None or event.row_key.value is None:
             return
@@ -712,6 +831,20 @@ class TradingScreen(Screen[None]):
         name = self._skill_name(entry.skill_id, info)
         self.app.push_screen(
             SkillInfoScreen(name, info, entry=entry, reference=self._character.captured_at)
+        )
+
+    def _open_industry_job(self, event: DataTable.RowSelected) -> None:
+        if self._character is None or event.row_key.value is None:
+            return
+        job_id = int(event.row_key.value)
+        job = next((j for j in self._character.industry_jobs if j.job_id == job_id), None)
+        if job is None:
+            return
+        subject = _job_subject_type(job)
+        name = self._character.names.get(subject, str(subject))
+        facility = self._character.names.get(job.facility_id, str(job.facility_id))
+        self.app.push_screen(
+            IndustryJobScreen(name, job, facility, self._character.captured_at)
         )
 
     def on_tree_node_selected(self, event: Tree.NodeSelected[object]) -> None:
@@ -766,6 +899,9 @@ class TradingScreen(Screen[None]):
             "Item", "Held", "Bid", "Fair", "Range", "Est. gain", "Note"
         )
         self.query_one("#skillqueue", DataTable).add_columns("Skill", "Time left", "Completion")
+        self.query_one("#industry", DataTable).add_columns(
+            "Activity", "Item", "Runs", "Time left", "Where"
+        )
         self.run_worker(self._refresh(), exclusive=True)
         self.set_interval(self._interval, self._refresh)
 
@@ -785,6 +921,7 @@ class TradingScreen(Screen[None]):
         self._render_skill_queue(character_report)
         self._render_skills(character_report)
         self._render_assets(character_report)
+        self._render_industry(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
         status.update("Scanning for value…")
@@ -883,6 +1020,32 @@ class TradingScreen(Screen[None]):
                 Text(_train_time(entry, reference), style="yellow"),
                 Text(_completion(entry, reference), style="dim"),
                 key=str(entry.queue_position),
+            )
+
+    def _render_industry(self, report: CharacterReport) -> None:
+        """Running/ready industry jobs: Activity / Item / Runs / Time left / Where.
+        Ready-to-deliver jobs sort to the top; each row is coloured by state."""
+        table = self.query_one("#industry", DataTable)
+        table.clear()
+        reference = report.captured_at
+        jobs = sorted(
+            report.industry_jobs,
+            key=lambda job: (0 if _job_state(job, reference) == "ready" else 1, job.end_date),
+        )
+        for job in jobs:
+            state = _job_state(job, reference)
+            marker, style, _ = _JOB_STATES[state]
+            subject = _job_subject_type(job)
+            item = report.names.get(subject, str(subject))
+            where = report.names.get(job.facility_id, str(job.facility_id))
+            time_style = "green" if state == "ready" else "yellow"
+            table.add_row(
+                Text(f"{marker}{_activity_name(job.activity_id)}", style=style),
+                Text(item),
+                Text(f"{job.runs:,}", justify="right"),
+                Text(_job_time_left(job, reference), style=time_style),
+                Text(where, style="dim"),
+                key=str(job.job_id),
             )
 
     def _render_skills(self, report: CharacterReport) -> None:

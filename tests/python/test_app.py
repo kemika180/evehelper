@@ -12,7 +12,13 @@ from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.data.assets import AssetLocation, AssetNode
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import Blueprint, MarketHistoryDay, Skill, SkillQueueEntry
+from evetrader.esi.models import (
+    Blueprint,
+    IndustryJob,
+    MarketHistoryDay,
+    Skill,
+    SkillQueueEntry,
+)
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
@@ -21,12 +27,15 @@ from evetrader.tui.app import (
     BlueprintInfoScreen,
     CharacterPickerScreen,
     EveTraderApp,
+    IndustryJobScreen,
     PriceHistoryScreen,
     RefreshFeed,
     SkillInfoScreen,
     TradingScreen,
     _completion,
     _current_training,
+    _job_state,
+    _job_subject_type,
     _skill_progress,
     _skill_queue_pips,
     _train_time,
@@ -182,6 +191,8 @@ def _character_report() -> CharacterReport:
             35: "Pyerite",
             17363: "Giant Secure Container",
             938: "Rifter Blueprint",
+            587: "Rifter",
+            60003760: "Jita IV - Moon 4 - CNAP",
         },
         station_name="Jita IV - Moon 4 - Caldari Navy Assembly Plant",
         skill_reference={
@@ -210,6 +221,20 @@ def _character_report() -> CharacterReport:
                 quantity=-2, material_efficiency=10, time_efficiency=20, runs=42,
             )
         },
+        industry_jobs=[
+            IndustryJob(  # manufacturing, still running -> "active"
+                job_id=1, activity_id=1, blueprint_type_id=938, product_type_id=587,
+                facility_id=60003760, runs=10, status="active", cost=1_000_000.0,
+                start_date=datetime(2019, 12, 31, tzinfo=UTC),
+                end_date=datetime(2026, 8, 1, tzinfo=UTC),
+            ),
+            IndustryJob(  # ME research, finished -> "ready" (names the blueprint)
+                job_id=2, activity_id=4, blueprint_type_id=938, facility_id=60003760,
+                runs=1, status="active",
+                start_date=datetime(2019, 12, 1, tzinfo=UTC),
+                end_date=datetime(2019, 12, 20, tzinfo=UTC),
+            ),
+        ],
     )
 
 
@@ -532,6 +557,31 @@ def test_blueprint_info_screen_marks_an_original_unlimited() -> None:
     assert "unlimited runs" in body
 
 
+def _job(**overrides: object) -> IndustryJob:
+    payload: dict[str, object] = {
+        "job_id": 1, "activity_id": 1, "blueprint_type_id": 938, "product_type_id": 587,
+        "facility_id": 60003760, "runs": 10, "status": "active",
+        "start_date": datetime(2020, 1, 1, tzinfo=UTC),
+        "end_date": datetime(2020, 1, 2, tzinfo=UTC),
+    }
+    payload.update(overrides)
+    return IndustryJob.model_validate(payload)
+
+
+def test_job_state_ready_when_finished() -> None:
+    reference = datetime(2020, 1, 3, tzinfo=UTC)  # past the end date
+    assert _job_state(_job(), reference) == "ready"
+    # Still running at an earlier reference.
+    assert _job_state(_job(), datetime(2020, 1, 1, 12, tzinfo=UTC)) == "active"
+    # A paused job keeps its status regardless of the clock.
+    assert _job_state(_job(status="paused"), reference) == "paused"
+
+
+def test_job_subject_type_prefers_product_then_blueprint() -> None:
+    assert _job_subject_type(_job(product_type_id=587)) == 587  # manufacturing -> product
+    assert _job_subject_type(_job(product_type_id=None)) == 938  # research -> blueprint
+
+
 def test_skills_tab_groups_trained_skills(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
@@ -678,6 +728,7 @@ def _app_with_assets(store: CharacterStore, locations: list[AssetLocation], name
         locations,
         {},
         base.blueprints,
+        base.industry_jobs,
     )
 
     async def character() -> CharacterReport:
@@ -773,6 +824,7 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
         [AssetLocation(60003760, (container,))],
         {},
         base.blueprints,
+        base.industry_jobs,
     )
 
     async def _drive() -> None:
@@ -885,6 +937,46 @@ def test_selecting_a_blueprint_asset_opens_its_detail(tmp_path: Path) -> None:
             assert "Rifter Blueprint" in body
             assert "Blueprint Copy (BPC)" in body
             assert "42 runs remaining" in body
+            await pilot.press("escape")
+
+    asyncio.run(_drive())
+
+
+def test_industry_tab_lists_jobs_and_opens_detail(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "industry-tab"
+            await pilot.pause()
+            table = trading.query_one("#industry", DataTable)
+            assert table.row_count == 2
+            # The finished ME-research job (job 2) sorts to the top as ready-to-deliver;
+            # with no product it's named by its blueprint.
+            first = table.get_row_at(0)
+            assert "ME Research" in str(first[0]) and "ready" in str(first[3])
+            assert "Rifter Blueprint" in str(first[1])
+
+            table.focus()
+            await pilot.pause()
+            await pilot.press("down")  # move to the manufacturing job (product-named)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, IndustryJobScreen)
+            body = str(app.screen.query_one("#jobbody", Static).render())
+            assert "Rifter" in body and "Manufacturing" in body
+            assert "In progress" in body
             await pilot.press("escape")
 
     asyncio.run(_drive())

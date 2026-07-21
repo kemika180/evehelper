@@ -171,9 +171,23 @@ rough order:
   `InvestmentParams` (`trend_days=7`, `max_downtrend=0.10`).
 
 **Modules — crafting/PI before hauling**
-- **Crafting / industry** tracking & assistance, and **PI (planetary interaction)**
-  tracking & assistance. Self-contained (blueprints, jobs, PI setups) and don't
-  depend on volatile live conditions — so they come first.
+- **Crafting / industry** tracking & assistance.
+  - ~~Jobs tracker~~ — DONE (increment 1). An "Industry" tab lists running/ready jobs
+    (`GET /characters/{id}/industry/jobs/`, `esi-industry.read_character_jobs.v1`):
+    Activity / Item / Runs / Time left / Where, ready-to-deliver rows sorted to the top
+    and coloured by state; selecting a row opens `IndustryJobScreen` (timing, facility,
+    cost, invention success chance). Item names the product for manufacturing/invention/
+    reactions, the blueprint for research/copying. Facilities are named via the same
+    resolvable/structure-cache path as asset places. SDE-free.
+  - **Build-vs-buy engine** — NEXT (increment 2). Compare a recipe's input cost (buy
+    materials) against the product's sell value to flag worthwhile builds. This is the
+    slice that finally **brings the SDE forward** (bill-of-materials + product) — a
+    separate design task (how to source/bundle the SDE, à la the checked-in
+    `skills.json`). Build it as a **shared, generic pure-core component** (bill-of-
+    materials in → input cost vs output value out), *not* baked into crafting, because
+    **PI reuses the same comparison** for its P0→P4 chains.
+- **PI (planetary interaction)** tracking & assistance. Self-contained (colony setups,
+  extractors); its profitability view consumes the same build-vs-buy engine above.
 - **Hauling / regional arbitrage** (Jita ↔ your hub) — **after** crafting/PI, because
   it depends heavily on in-game context: routes, gate/route safety, cargo volume,
   what the alliance is actually bidding for. Must be route- and security-aware so it
