@@ -153,8 +153,11 @@ rough order:
 - ~~**Skill-info popup**~~ — DONE. Select a skill-queue row to see its level, SP
   progress (a bar, interpolated by time for the training skill), timing, and static
   facts — rank, primary/secondary attribute, description — from a bundled skills
-  reference (`evetrader/data/skills.json`), read offline with no ESI call. Later:
-  extend to the full skill list.
+  reference (`evetrader/data/skills.json`), read offline with no ESI call.
+- ~~**Full skill view**~~ — DONE. A "Skills" tab with a collapsible tree of all
+  trained skills grouped by category (level shown as pips); selecting a skill opens
+  the same detail popup — the live training detail if it's in the queue, otherwise
+  its trained level and static facts.
 - ~~**Downtrend guard**~~ — DONE. `market/investment.py` suppresses a BUY when the
   short-window average (last `trend_days`) sits more than `max_downtrend` below the
   full-window fair value: a sharp dip barely moves the short average, a sustained
@@ -218,10 +221,11 @@ rough order:
   static SDE is deferred to hauling (milestone 6), where item volumes are needed —
   `/universe/names/` returns names only. ESI has no per-day request quota; the only
   budget is the error-limit (errors, not successes), so volume is not a constraint.
-- **Bundled skills reference** (2026-07-20): static skill facts (name, training
-  rank, primary/secondary attribute, description) ship as a checked-in
+- **Bundled skills reference** (2026-07-20): static skill facts (name, group,
+  training rank, primary/secondary attribute, description) ship as a checked-in
   `evetrader/data/skills.json` and are read offline — no runtime ESI call — by
-  `data/skills.py` (a `@cache`d loader) for the skill-info popup. Generated once by
+  `data/skills.py` (a `@cache`d loader) for the skill-info popup and the full skill
+  view (grouped by `group`). Generated once by
   `scripts/build_skills_reference.py` (walks the public ESI universe endpoints:
   skill category → groups → types), regenerated only when CCP adds/rebalances
   skills. This is a small, self-contained slice of static data, distinct from the

@@ -16,7 +16,6 @@ from evetrader.esi.client import EsiClient
 from evetrader.esi.endpoints import (
     fetch_corporation,
     fetch_open_orders,
-    fetch_skills,
     fetch_standings,
     fetch_station,
     fetch_wallet_balance,
@@ -69,11 +68,19 @@ async def _resolve_broker_standings(
 
 
 async def build_character_state(
-    client: EsiClient, config: Config, character_id: int, token: str, station_id: int
+    client: EsiClient,
+    config: Config,
+    character_id: int,
+    token: str,
+    station_id: int,
+    skills: CharacterSkills,
 ) -> CharacterState:
-    """Fetch character data and build the pure CharacterState for the advisor."""
+    """Fetch character data and build the pure CharacterState for the advisor.
+
+    `skills` is passed in (already fetched by the caller, which also surfaces the
+    trained-skill list to the TUI) so it isn't fetched twice.
+    """
     wallet = await fetch_wallet_balance(client, character_id, token)
-    skills = await fetch_skills(client, character_id, token)
     open_orders = await fetch_open_orders(client, character_id, token)
 
     if station_id in _NPC_STATION_RANGE:

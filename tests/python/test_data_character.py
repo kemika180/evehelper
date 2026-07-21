@@ -8,6 +8,7 @@ import pytest
 from evetrader.config import Config, HomeMarket, RiskPreferences
 from evetrader.data.character import build_character_state
 from evetrader.esi.client import EsiClient
+from evetrader.esi.models import CharacterSkills
 
 _STATION = 60003760
 _OWNER_CORP = 1000035
@@ -45,18 +46,6 @@ def _handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     if path.endswith("/wallet/"):
         return httpx.Response(200, json=5_000_000.0)
-    if path.endswith("/skills/"):
-        return httpx.Response(
-            200,
-            json={
-                "skills": [
-                    {"skill_id": 16622, "active_skill_level": 5, "trained_skill_level": 5},  # Accounting
-                    {"skill_id": 3446, "active_skill_level": 4, "trained_skill_level": 4},  # Broker Relations
-                    {"skill_id": 3443, "active_skill_level": 5, "trained_skill_level": 5},  # Trade
-                ],
-                "total_sp": 10_000_000,
-            },
-        )
     if path.endswith("/orders/"):
         return httpx.Response(200, json=[_character_order(1), _character_order(2)])
     if path.endswith("/standings/"):
@@ -83,13 +72,25 @@ def _handler(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"unexpected path {path}")
 
 
+_SKILLS = CharacterSkills.model_validate(
+    {
+        "skills": [
+            {"skill_id": 16622, "active_skill_level": 5, "trained_skill_level": 5},  # Accounting
+            {"skill_id": 3446, "active_skill_level": 4, "trained_skill_level": 4},  # Broker Relations
+            {"skill_id": 3443, "active_skill_level": 5, "trained_skill_level": 5},  # Trade
+        ],
+        "total_sp": 10_000_000,
+    }
+)
+
+
 def test_build_character_state_computes_fees_and_free_slots() -> None:
     async def go() -> None:
         transport = httpx.MockTransport(_handler)
         async with httpx.AsyncClient(transport=transport) as http:
             client = EsiClient(_config(), http)
             state = await build_character_state(
-                client, _config(), character_id=42, token="tok", station_id=_STATION
+                client, _config(), 42, "tok", _STATION, _SKILLS
             )
 
             assert state.wallet_balance == 5_000_000.0

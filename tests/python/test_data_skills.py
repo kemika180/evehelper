@@ -9,6 +9,7 @@ def test_load_skills_reads_the_bundled_file() -> None:
 
     accounting = skills[16622]
     assert accounting.name == "Accounting"
+    assert accounting.group == "Trade"
     assert accounting.rank == 3
     assert accounting.primary == "Charisma"
     assert accounting.secondary == "Memory"

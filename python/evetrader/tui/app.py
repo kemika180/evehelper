@@ -12,6 +12,7 @@ is testable without ESI.
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,13 +23,22 @@ from textual.app import App, ComposeResult
 from textual.binding import BindingType
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, Footer, Header, OptionList, Static, TabbedContent, TabPane
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    OptionList,
+    Static,
+    TabbedContent,
+    TabPane,
+    Tree,
+)
 from textual.widgets.option_list import Option
 from textual_plotext import PlotextPlot
 
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import MarketHistoryDay, SkillQueueEntry
+from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
 from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
@@ -105,14 +115,9 @@ def _completion(entry: SkillQueueEntry, reference: datetime) -> str:
     return "—" if _is_completed(entry, reference) else _finish(entry)
 
 
-def _time_left(entry: SkillQueueEntry, reference: datetime) -> str:
-    """Human time from `reference` (the report's capture time) to completion."""
-    if entry.finish_date is None:
-        return "unknown"
-    total = int((entry.finish_date - reference).total_seconds())
-    if total <= 0:
-        return "done"
-    days, remainder = divmod(total, 86_400)
+def _humanize_span(total_seconds: int) -> str:
+    """A positive duration as `Nd Nh` / `Nh Nm` / `Nm`."""
+    days, remainder = divmod(total_seconds, 86_400)
     hours, remainder = divmod(remainder, 3_600)
     minutes = remainder // 60
     if days:
@@ -120,6 +125,32 @@ def _time_left(entry: SkillQueueEntry, reference: datetime) -> str:
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+def _time_left(entry: SkillQueueEntry, reference: datetime) -> str:
+    """Human time from `reference` (the report's capture time) to completion."""
+    if entry.finish_date is None:
+        return "unknown"
+    total = int((entry.finish_date - reference).total_seconds())
+    if total <= 0:
+        return "done"
+    return _humanize_span(total)
+
+
+def _train_time(entry: SkillQueueEntry, reference: datetime) -> str:
+    """Time to train just this skill level — the remaining time for the one in
+    progress, the full duration for a queued one — not the cumulative wait.
+
+    (`finish - max(start, reference)`: for the training skill `reference` is past
+    its start, so it's the remainder; for a queued skill nothing has elapsed yet.)
+    """
+    if entry.finish_date is None or entry.start_date is None:
+        return _time_left(entry, reference)
+    began = max(entry.start_date, reference)
+    total = int((entry.finish_date - began).total_seconds())
+    if total <= 0:
+        return "done"
+    return _humanize_span(total)
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -181,6 +212,12 @@ def _skill_progress(entry: SkillQueueEntry, reference: datetime) -> SkillProgres
 def _bar(fraction: float, width: int = 24) -> str:
     filled = round(_clamp(fraction, 0.0, 1.0) * width)
     return "█" * filled + "░" * (width - filled)
+
+
+def _level_dots(level: int) -> str:
+    """Trained skill level as filled/empty pips, e.g. L3 -> ●●●○○."""
+    filled = max(0, min(5, level))
+    return "●" * filled + "○" * (5 - filled)
 
 
 FetchCharacter = Callable[[], Awaitable[CharacterReport]]
@@ -304,36 +341,52 @@ class SkillInfoScreen(ModalScreen[None]):
     def __init__(
         self,
         name: str,
-        entry: SkillQueueEntry,
-        reference: datetime,
         info: SkillReference | None,
+        *,
+        entry: SkillQueueEntry | None = None,
+        reference: datetime | None = None,
+        trained_level: int | None = None,
     ) -> None:
         super().__init__()
         self._skill_name = name
+        self._info = info
         self._entry = entry
         self._reference = reference
-        self._info = info
+        self._trained_level = trained_level
 
     def compose(self) -> ComposeResult:
         with Vertical(id="skillbox"):
             yield Static(self._body(), id="skillbody")
-            yield Static("esc to close", id="skillhint")
+            yield Static("click or esc to close", id="skillhint")
+
+    def on_click(self) -> None:
+        self.dismiss()
 
     def _body(self) -> Text:
-        entry = self._entry
-        reference = self._reference
         info = self._info
-        progress = _skill_progress(entry, reference)
-        label, style = _STATUS_LABEL[progress.status]
 
         text = Text()
         text.append(self._skill_name, style="bold")
-        text.append(f"   →   Level {entry.finished_level}\n", style="bold")
+        if self._entry is not None:
+            text.append(f"   →   Level {self._entry.finished_level}\n", style="bold")
+        elif self._trained_level is not None:
+            text.append(f"   ·   Level {self._trained_level} trained\n", style="bold")
+        else:
+            text.append("\n")
         if info is not None:
-            text.append(
-                f"rank {info.rank}  ·  {info.primary} / {info.secondary}\n", style="dim"
-            )
+            text.append(f"rank {info.rank}  ·  {info.primary} / {info.secondary}\n", style="dim")
         text.append("\n")
+
+        if self._entry is not None and self._reference is not None:
+            self._append_training(text, self._entry, self._reference)
+        if info is not None and info.description:
+            text.append(info.description, style="italic dim")
+        return text
+
+    def _append_training(self, text: Text, entry: SkillQueueEntry, reference: datetime) -> None:
+        """The queue-side detail: status, SP progress, and timing."""
+        progress = _skill_progress(entry, reference)
+        label, style = _STATUS_LABEL[progress.status]
         text.append(f"{label}\n", style=style)
 
         if progress.fraction is not None and progress.trained_sp is not None:
@@ -350,9 +403,7 @@ class SkillInfoScreen(ModalScreen[None]):
             text.append(f"starts     {_local(entry.start_date)}\n", style="dim")
         if entry.finish_date is not None:
             text.append(f"completes  {_local(entry.finish_date)}\n", style="dim")
-        if info is not None and info.description:
-            text.append(f"\n{info.description}", style="italic dim")
-        return text
+        text.append("\n")
 
 
 class TradingScreen(Screen[None]):
@@ -363,6 +414,11 @@ class TradingScreen(Screen[None]):
     DEFAULT_CSS = """
     TradingScreen #location { padding: 0 2; text-style: bold; color: $accent; }
     TradingScreen #status { padding: 0 2; color: $text-muted; }
+    /* Fill the window down the tab chain so only the inner tables/tree scroll —
+       otherwise every level is height:auto and the screen scrolls too. */
+    TradingScreen TabbedContent,
+    TradingScreen ContentSwitcher,
+    TradingScreen TabPane { height: 1fr; }
     TradingScreen #stats { height: 6; padding: 1 1 0 1; }
     TradingScreen .stat {
         width: 1fr;
@@ -377,7 +433,8 @@ class TradingScreen(Screen[None]):
         background: $boost;
     }
     TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
-    TradingScreen #buys, TradingScreen #sells, TradingScreen #skillqueue {
+    TradingScreen #buys, TradingScreen #sells, TradingScreen #skillqueue,
+    TradingScreen #skilltree {
         margin: 0 1;
         height: 1fr;
     }
@@ -389,6 +446,9 @@ class TradingScreen(Screen[None]):
         self._interval = interval_seconds
         self._report: OpportunityReport | None = None
         self._character: CharacterReport | None = None
+        # Signature of the skills last drawn into the tree, so a periodic refresh
+        # doesn't rebuild it (and collapse the user's expansions) when nothing changed.
+        self._skills_key: tuple[tuple[int, int], ...] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -408,6 +468,8 @@ class TradingScreen(Screen[None]):
                 yield DataTable(id="sells", zebra_stripes=True, cursor_type="row")
             with TabPane("Skill Queue", id="queue"):
                 yield DataTable(id="skillqueue", zebra_stripes=True, cursor_type="row")
+            with TabPane("Skills", id="skills"):
+                yield Tree("Skills", id="skilltree")
         yield Footer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -435,12 +497,36 @@ class TradingScreen(Screen[None]):
         if entry is None:
             return
         info = self._character.skill_reference.get(entry.skill_id)
-        name = info.name if info is not None else self._character.names.get(
-            entry.skill_id, str(entry.skill_id)
-        )
+        name = self._skill_name(entry.skill_id, info)
         self.app.push_screen(
-            SkillInfoScreen(name, entry, self._character.captured_at, info)
+            SkillInfoScreen(name, info, entry=entry, reference=self._character.captured_at)
         )
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected[int]) -> None:
+        """A leaf in the Skills tree is a skill id; group nodes carry no data."""
+        if self._character is None or not isinstance(event.node.data, int):
+            return
+        skill_id = event.node.data
+        info = self._character.skill_reference.get(skill_id)
+        name = self._skill_name(skill_id, info)
+        # If it's currently in the queue, show the live training detail; otherwise
+        # just the trained level and static facts.
+        entry = next((e for e in self._character.skill_queue if e.skill_id == skill_id), None)
+        if entry is not None:
+            self.app.push_screen(
+                SkillInfoScreen(name, info, entry=entry, reference=self._character.captured_at)
+            )
+            return
+        trained = next(
+            (s.trained_skill_level for s in self._character.skills if s.skill_id == skill_id), None
+        )
+        self.app.push_screen(SkillInfoScreen(name, info, trained_level=trained))
+
+    def _skill_name(self, skill_id: int, info: SkillReference | None) -> str:
+        if info is not None:
+            return info.name
+        assert self._character is not None
+        return self._character.names.get(skill_id, str(skill_id))
 
     def on_mount(self) -> None:
         self.query_one("#buys", DataTable).add_columns(
@@ -467,6 +553,7 @@ class TradingScreen(Screen[None]):
         self._render_stats(character_report)
         self._render_training(character_report)
         self._render_skill_queue(character_report)
+        self._render_skills(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
         status.update("Scanning for value…")
@@ -562,10 +649,41 @@ class TradingScreen(Screen[None]):
                 marker, style = "  ", "cyan"
             table.add_row(
                 Text(f"{marker}{name} → L{entry.finished_level}", style=style),
-                Text(_time_left(entry, reference), style="yellow"),
+                Text(_train_time(entry, reference), style="yellow"),
                 Text(_completion(entry, reference), style="dim"),
                 key=str(entry.queue_position),
             )
+
+    def _render_skills(self, report: CharacterReport) -> None:
+        """All trained skills as a tree grouped by skill category; a leaf's data is
+        its skill id so selecting it opens the detail popup.
+
+        Skipped when the skill set is unchanged, so a periodic refresh leaves the
+        tree (and the user's expand/collapse state) untouched.
+        """
+        key = tuple(sorted((s.skill_id, s.trained_skill_level) for s in report.skills))
+        if key == self._skills_key:
+            return
+        self._skills_key = key
+
+        tree = self.query_one("#skilltree", Tree)
+        tree.clear()
+        tree.root.expand()
+
+        grouped: dict[str, list[Skill]] = defaultdict(list)
+        for skill in report.skills:
+            info = report.skill_reference.get(skill.skill_id)
+            grouped[info.group if info is not None else "Other"].append(skill)
+
+        def display_name(skill: Skill) -> str:
+            return self._skill_name(skill.skill_id, report.skill_reference.get(skill.skill_id))
+
+        for group in sorted(grouped):
+            branch = tree.root.add(group, expand=True)
+            for skill in sorted(grouped[group], key=lambda s: display_name(s).lower()):
+                label = Text(f"{display_name(skill)}  ")
+                label.append(_level_dots(skill.trained_skill_level), style="cyan")
+                branch.add_leaf(label, data=skill.skill_id)
 
 
 class CharacterPickerScreen(Screen[None]):

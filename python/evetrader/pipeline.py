@@ -21,8 +21,13 @@ from evetrader.data.skills import SkillReference, load_skills
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient, EsiError
-from evetrader.esi.endpoints import fetch_assets, fetch_market_history, fetch_skillqueue
-from evetrader.esi.models import MarketHistoryDay, SkillQueueEntry
+from evetrader.esi.endpoints import (
+    fetch_assets,
+    fetch_market_history,
+    fetch_skillqueue,
+    fetch_skills,
+)
+from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
 from evetrader.market.investment import InvestmentSignal, find_opportunities, liquid_types
 
 # Bounded concurrency for the per-type history fetches.
@@ -36,10 +41,12 @@ class CharacterReport:
     captured_at: datetime
     character: CharacterState
     skill_queue: list[SkillQueueEntry]
+    # The character's trained skills (id + trained level), for the full skill view.
+    skills: list[Skill]
     holdings: dict[int, int]
     names: dict[int, str]
     station_name: str
-    # Static skill facts (name/rank/attributes/description) for the skill-info popup.
+    # Static skill facts (name/group/rank/attributes/description) for the skill views.
     skill_reference: dict[int, SkillReference]
 
 
@@ -71,7 +78,10 @@ async def fetch_character(
 ) -> CharacterReport:
     """Wallet, skills, standings, fees, skill queue, and inventory — the quick fetches."""
     token = await authenticator.access_token(character_id)
-    character = await build_character_state(client, config, character_id, token, home.station_id)
+    skills = await fetch_skills(client, character_id, token)
+    character = await build_character_state(
+        client, config, character_id, token, home.station_id, skills
+    )
     skill_queue = await fetch_skillqueue(client, character_id, token)
 
     # Only holdings AT the home market are sellable there — don't suggest selling
@@ -83,13 +93,22 @@ async def fetch_character(
             holdings[asset.type_id] = holdings.get(asset.type_id, 0) + asset.quantity
 
     # Structures don't resolve via /universe/names — a config label names them.
+    # Names back up the bundled reference for any skill it doesn't cover.
     name_ids = [entry.skill_id for entry in skill_queue]
+    name_ids += [skill.skill_id for skill in skills.skills]
     if home.label is None:
         name_ids.append(home.station_id)
     names = await name_cache.resolve(name_ids)
     station_name = home.label or names.get(home.station_id, str(home.station_id))
     return CharacterReport(
-        now(), character, skill_queue, holdings, names, station_name, load_skills()
+        now(),
+        character,
+        skill_queue,
+        skills.skills,
+        holdings,
+        names,
+        station_name,
+        load_skills(),
     )
 
 

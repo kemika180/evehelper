@@ -153,7 +153,11 @@ def _handler(request: httpx.Request) -> httpx.Response:
     if "/universe/names/" in path:
         catalogue = {_UNDERVALUED: "Tritanium", _HELD_DEAR: "Pyerite", _STATION: "Jita IV-4"}
         return httpx.Response(
-            200, json=[{"id": i, "name": catalogue[i], "category": "x"} for i in json.loads(request.content)]
+            200,
+            json=[
+                {"id": i, "name": catalogue.get(i, f"type {i}"), "category": "x"}
+                for i in json.loads(request.content)
+            ],
         )
     raise AssertionError(f"unexpected {path}")
 

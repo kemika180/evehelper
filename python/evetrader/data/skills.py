@@ -21,6 +21,7 @@ class SkillReference(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: str
+    group: str  # in-game skill category, e.g. "Trade", "Gunnery"
     rank: int
     primary: str
     secondary: str
