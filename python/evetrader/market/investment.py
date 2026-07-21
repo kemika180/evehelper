@@ -4,7 +4,9 @@ Uses the same picture EVE's market history shows in-game — daily average, high
 and volume — to build a moving average and a Donchian channel (the high/low
 envelope over the window). Then:
 - BUY: the current ask sits near the bottom of the channel and below the moving
-  average (cheap versus its own recent range) — buy and hold for reversion.
+  average (cheap versus its own recent range) — buy and hold for reversion. A
+  downtrend guard suppresses this when a short-window average has fallen well below
+  the full-window fair value: that is a structural decline, not a revertible dip.
 - SELL: something you already hold has its bid near the top of the channel and
   above the moving average — a good time to sell.
 
@@ -54,14 +56,18 @@ def liquid_types(orders: pl.DataFrame, station_id: int, limit: int) -> list[int]
     return [int(type_id) for type_id in ranked["type_id"].to_list()]
 
 
-def _channels(history: pl.DataFrame, window: int) -> pl.DataFrame:
+def _channels(history: pl.DataFrame, window: int, trend_days: int) -> pl.DataFrame:
     recent = (
         history.sort("date", descending=True).group_by("type_id", maintain_order=True).head(window)
     )
-    return recent.group_by("type_id").agg(
+    # Rank days most-recent-first within each type so the short-window average can
+    # read just the latest `trend_days` for the downtrend guard.
+    ranked = recent.with_columns(pl.int_range(pl.len()).over("type_id").alias("_rank"))
+    return ranked.group_by("type_id").agg(
         # Median + trimmed bands are robust to one-off price spikes; a raw mean and
         # absolute min/max would swing on a single outlier day.
         pl.col("average").median().alias("fair_value"),
+        pl.col("average").filter(pl.col("_rank") < trend_days).mean().alias("short_avg"),
         pl.col("lowest").quantile(_BAND_QUANTILE).alias("low_band"),
         pl.col("highest").quantile(1.0 - _BAND_QUANTILE).alias("high_band"),
         pl.col("volume").mean().alias("avg_volume"),
@@ -103,11 +109,13 @@ def find_opportunities(
     window: int,
     buy_position: float,
     sell_position: float,
+    trend_days: int,
+    max_downtrend: float,
     min_daily_isk_volume: float,
     max_capital_per_item: float,
 ) -> list[InvestmentSignal]:
     """Buy signals (cheap) and sell signals (held and dear), best expected profit first."""
-    book = _channels(history, window).join(
+    book = _channels(history, window, trend_days).join(
         _current_prices(orders, station_id), on="type_id", how="inner"
     )
 
@@ -115,6 +123,7 @@ def find_opportunities(
     for row in book.iter_rows(named=True):
         type_id = int(row["type_id"])
         fair = float(row["fair_value"]) if row["fair_value"] is not None else 0.0
+        short_avg = float(row["short_avg"]) if row["short_avg"] is not None else fair
         low = float(row["low_band"]) if row["low_band"] is not None else 0.0
         high = float(row["high_band"]) if row["high_band"] is not None else 0.0
         avg_volume = float(row["avg_volume"]) if row["avg_volume"] is not None else 0.0
@@ -127,7 +136,10 @@ def find_opportunities(
         ask = float(row["ask"]) if row["ask"] is not None else None
         if ask is not None and ask > 0.0:
             position = (ask - low) / width
-            if position <= buy_position and ask < fair:
+            # Downtrend guard: a structural slide drags the short-window average well
+            # below fair value, so the price won't revert — only a real dip qualifies.
+            reverting = short_avg >= fair * (1.0 - max_downtrend)
+            if position <= buy_position and ask < fair and reverting:
                 units = int(max_capital_per_item // ask)
                 if units > 0:
                     # Buying from asks costs no broker fee; the eventual sale pays both.

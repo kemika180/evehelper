@@ -155,8 +155,11 @@ rough order:
   facts — rank, primary/secondary attribute, description — from a bundled skills
   reference (`evetrader/data/skills.json`), read offline with no ESI call. Later:
   extend to the full skill list.
-- **Downtrend guard** — distinguish a real dip from a structural decline (compare a
-  short vs long average) so buys don't chase items that won't revert.
+- ~~**Downtrend guard**~~ — DONE. `market/investment.py` suppresses a BUY when the
+  short-window average (last `trend_days`) sits more than `max_downtrend` below the
+  full-window fair value: a sharp dip barely moves the short average, a sustained
+  slide drags it well below, so only revertible dips pass. Tunable in
+  `InvestmentParams` (`trend_days=7`, `max_downtrend=0.10`).
 
 **Modules — crafting/PI before hauling**
 - **Crafting / industry** tracking & assistance, and **PI (planetary interaction)**

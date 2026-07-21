@@ -56,6 +56,14 @@ class InvestmentParams(BaseModel):
     buy_below_position: float = Field(default=0.15, ge=0.0, le=1.0)
     # Sell held items when the bid sits at/above this fraction (1 = the high).
     sell_above_position: float = Field(default=0.85, ge=0.0, le=1.0)
+    # Downtrend guard: the recent (short-window) average of the last this-many days,
+    # compared with the full-window fair value, tells a temporary dip apart from a
+    # structural decline. A sharp dip barely moves the short average; a sustained
+    # slide drags it well below fair value.
+    trend_days: int = Field(default=7, gt=0)
+    # Skip a buy when the short-window average sits more than this fraction below the
+    # fair value — the price is trending down, not dipping, so it won't revert.
+    max_downtrend: float = Field(default=0.10, ge=0.0, le=1.0)
 
 
 class RiskPreferences(BaseModel):

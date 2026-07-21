@@ -139,6 +139,8 @@ async def fetch_opportunities(
         window=config.investment.window_days,
         buy_position=config.investment.buy_below_position,
         sell_position=config.investment.sell_above_position,
+        trend_days=config.investment.trend_days,
+        max_downtrend=config.investment.max_downtrend,
         min_daily_isk_volume=config.risk.min_daily_isk_volume,
         max_capital_per_item=config.risk.max_capital_per_order_isk,
     )

@@ -49,7 +49,14 @@ def _order(order_id: int, type_id: int, *, is_buy: bool, price: float) -> Market
 _SWINGING = [900.0, 1100.0] * 5
 
 
-def _find(orders: list[MarketOrder], history: dict[int, list[MarketHistoryDay]], holdings: dict[int, int]):
+def _find(
+    orders: list[MarketOrder],
+    history: dict[int, list[MarketHistoryDay]],
+    holdings: dict[int, int],
+    *,
+    trend_days: int = 10,
+    max_downtrend: float = 0.10,
+):
     return find_opportunities(
         orders=orders_to_frame(orders),
         history=history_to_frame(history),
@@ -59,6 +66,8 @@ def _find(orders: list[MarketOrder], history: dict[int, list[MarketHistoryDay]],
         window=10,
         buy_position=0.2,
         sell_position=0.8,
+        trend_days=trend_days,
+        max_downtrend=max_downtrend,
         min_daily_isk_volume=0.0,
         max_capital_per_item=1_000_000.0,
     )
@@ -86,3 +95,35 @@ def test_overvalued_item_not_held_is_ignored() -> None:
 def test_price_within_normal_range_gives_nothing() -> None:
     signals = _find([_order(1, 100, is_buy=False, price=1000.0)], _history(100, _SWINGING), {})
     assert signals == []
+
+
+# A steady slide (oldest 1400 -> newest 500): the recent average sits far below the
+# full-window median, so the cheap ask is a falling knife, not a revertible dip.
+_DECLINING = [1400.0, 1300.0, 1200.0, 1100.0, 1000.0, 900.0, 800.0, 700.0, 600.0, 500.0]
+
+
+def test_downtrend_guard_suppresses_buy_in_a_structural_decline() -> None:
+    # Ask near the channel bottom would normally buy; the guard blocks it.
+    signals = _find(
+        [_order(1, 100, is_buy=False, price=520.0)], _history(100, _DECLINING), {}, trend_days=7
+    )
+    assert signals == []
+
+
+def test_downtrend_guard_disabled_lets_the_buy_through() -> None:
+    # Same falling series, but a wide-open guard (100% tolerance) permits the buy.
+    signals = _find(
+        [_order(1, 100, is_buy=False, price=520.0)],
+        _history(100, _DECLINING),
+        {},
+        trend_days=7,
+        max_downtrend=1.0,
+    )
+    assert len(signals) == 1 and signals[0].action == "BUY"
+
+
+def test_shallow_recent_dip_still_buys() -> None:
+    # A stable ~1000 history dipping only slightly at the end stays within tolerance.
+    history = _history(100, [1000.0] * 8 + [960.0, 940.0])
+    signals = _find([_order(1, 100, is_buy=False, price=700.0)], history, {}, trend_days=7)
+    assert len(signals) == 1 and signals[0].action == "BUY"
