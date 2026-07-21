@@ -15,13 +15,16 @@ import polars as pl
 
 from evetrader.advisor.state import CharacterState
 from evetrader.config import Config, HomeMarket
+from evetrader.data.assets import AssetLocation, build_asset_tree, nameable_item_ids
 from evetrader.data.character import build_character_state
 from evetrader.data.market import history_to_frame, orders_frame_from_pages
 from evetrader.data.skills import SkillReference, load_skills
+from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient, EsiError
 from evetrader.esi.endpoints import (
+    fetch_asset_names,
     fetch_assets,
     fetch_market_history,
     fetch_skillqueue,
@@ -48,6 +51,10 @@ class CharacterReport:
     station_name: str
     # Static skill facts (name/group/rank/attributes/description) for the skill views.
     skill_reference: dict[int, SkillReference]
+    # All assets as a nested tree (places -> items -> container/ship contents).
+    assets: list[AssetLocation]
+    # Player-assigned names for containers/ships, keyed by item_id.
+    asset_names: dict[int, str]
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,17 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _resolvable_location(location_id: int) -> bool:
+    """Whether ``/universe/names`` can name this place. Player structures (Keepstars
+    etc.) cannot be, and one unresolvable id 404s the whole batch — so exclude them;
+    they fall back to a config label or their id at the display layer."""
+    return (
+        10_000_000 <= location_id < 11_000_000  # regions
+        or 30_000_000 <= location_id < 32_000_000  # solar systems
+        or 60_000_000 <= location_id < 64_000_000  # NPC stations
+    )
+
+
 async def fetch_character(
     client: EsiClient,
     authenticator: Authenticator,
@@ -73,6 +91,7 @@ async def fetch_character(
     character_id: int,
     home: HomeMarket,
     name_cache: NameCache,
+    structure_cache: StructureCache,
     *,
     now: Callable[[], datetime] = _utc_now,
 ) -> CharacterReport:
@@ -91,14 +110,40 @@ async def fetch_character(
     for asset in assets:
         if asset.location_id == home.station_id:
             holdings[asset.type_id] = holdings.get(asset.type_id, 0) + asset.quantity
+    asset_tree = build_asset_tree(assets)
 
-    # Structures don't resolve via /universe/names — a config label names them.
-    # Names back up the bundled reference for any skill it doesn't cover.
+    # Player-assigned names for containers/ships (POST, 1000 ids/call), to make them
+    # findable in the browser. Only singleton items that hold things can be named.
+    nameable = nameable_item_ids(asset_tree)
+    asset_names: dict[int, str] = {}
+    for start in range(0, len(nameable), 1000):
+        chunk = nameable[start : start + 1000]
+        for named in await fetch_asset_names(client, character_id, token, chunk):
+            if named.name and named.name != "None":
+                asset_names[named.item_id] = named.name
+
+    # Player structures don't resolve via /universe/names; look them up individually
+    # (needs docking access) — except the home, which a config label already names.
+    structure_ids = [
+        loc.location_id
+        for loc in asset_tree
+        if not _resolvable_location(loc.location_id) and loc.location_id != home.station_id
+    ]
+    structures = await structure_cache.resolve(token, structure_ids)
+
+    # Names back up the bundled reference for any skill it doesn't cover, and label
+    # asset types and their (resolvable) places plus each structure's solar system.
     name_ids = [entry.skill_id for entry in skill_queue]
     name_ids += [skill.skill_id for skill in skills.skills]
+    name_ids += [asset.type_id for asset in assets]
+    name_ids += [loc.location_id for loc in asset_tree if _resolvable_location(loc.location_id)]
+    name_ids += [structure.solar_system_id for structure in structures.values()]
     if home.label is None:
         name_ids.append(home.station_id)
     names = await name_cache.resolve(name_ids)
+    for structure_id, structure in structures.items():
+        system = names.get(structure.solar_system_id)
+        names[structure_id] = f"{structure.name} · {system}" if system else structure.name
     station_name = home.label or names.get(home.station_id, str(home.station_id))
     return CharacterReport(
         now(),
@@ -109,6 +154,8 @@ async def fetch_character(
         names,
         station_name,
         load_skills(),
+        asset_tree,
+        asset_names,
     )
 
 

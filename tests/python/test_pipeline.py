@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 
 from evetrader.config import Config, HomeMarket, InvestmentParams, RiskPreferences
+from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient
@@ -20,6 +21,8 @@ _FACTION = 500001
 _FUTURE = "Wed, 21 Oct 2099 07:28:00 GMT"
 _UNDERVALUED = 34  # a cheap buy candidate
 _HELD_DEAR = 35  # held, and currently dear
+_STRUCTURE = 1_035_660_376_235  # a player structure the character can dock at
+_STRUCT_SYSTEM = 30004759
 
 
 def _config() -> Config:
@@ -122,7 +125,22 @@ def _handler(request: httpx.Request) -> httpx.Response:
                     "location_type": "station",
                     "is_singleton": False,
                 },
+                {
+                    "item_id": 3,
+                    "type_id": _UNDERVALUED,
+                    "quantity": 5,
+                    "location_id": _STRUCTURE,  # a player structure -> named via lookup
+                    "location_flag": "Hangar",
+                    "location_type": "item",
+                    "is_singleton": False,
+                },
             ],
+            headers=exp,
+        )
+    if "/universe/structures/" in path:
+        return httpx.Response(
+            200,
+            json={"name": "V-3YG7 Fortizar", "solar_system_id": _STRUCT_SYSTEM},
             headers=exp,
         )
     if path.endswith("/wallet/"):
@@ -151,7 +169,12 @@ def _handler(request: httpx.Request) -> httpx.Response:
     if "/corporations/" in path:
         return httpx.Response(200, json={"name": "Caldari Navy", "faction_id": _FACTION}, headers=exp)
     if "/universe/names/" in path:
-        catalogue = {_UNDERVALUED: "Tritanium", _HELD_DEAR: "Pyerite", _STATION: "Jita IV-4"}
+        catalogue = {
+            _UNDERVALUED: "Tritanium",
+            _HELD_DEAR: "Pyerite",
+            _STATION: "Jita IV-4",
+            _STRUCT_SYSTEM: "V-3YG7",
+        }
         return httpx.Response(
             200,
             json=[
@@ -169,14 +192,17 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             client = EsiClient(_config(), http)
             authenticator = Authenticator(_config(), http, _FakeStore())
             name_cache = NameCache(tmp_path / "names.json", client)
+            structure_cache = StructureCache(client)
             now = lambda: datetime(2020, 1, 1, tzinfo=UTC)  # noqa: E731
 
             home = _config().default_home
             character = await fetch_character(
-                client, authenticator, _config(), 42, home, name_cache, now=now
+                client, authenticator, _config(), 42, home, name_cache, structure_cache, now=now
             )
             assert character.holdings == {_HELD_DEAR: 10}
             assert character.station_name == "Jita IV-4"
+            # A player structure is named via /universe/structures + its system name.
+            assert character.names[_STRUCTURE] == "V-3YG7 Fortizar · V-3YG7"
 
             report = await fetch_opportunities(client, _config(), character, home, name_cache)
             assert [s.type_id for s in report.buys] == [_UNDERVALUED]

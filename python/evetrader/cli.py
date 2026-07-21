@@ -17,6 +17,7 @@ import httpx
 
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
+from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import (
     Authenticator,
@@ -85,6 +86,8 @@ def _run_tui(config: Config) -> None:
     def make_feed(character_id: int) -> RefreshFeed:
         record = next((r for r in store.records() if r.character_id == character_id), None)
         home = config.home_for(record.name if record is not None else str(character_id))
+        # Per-character: structure access (and its negative cache) is character-scoped.
+        structure_cache = StructureCache(resources.client)
 
         async def character() -> CharacterReport:
             return await fetch_character(
@@ -94,6 +97,7 @@ def _run_tui(config: Config) -> None:
                 character_id,
                 home,
                 resources.name_cache,
+                structure_cache,
             )
 
         async def opportunities(report: CharacterReport) -> OpportunityReport:

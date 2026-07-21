@@ -45,6 +45,16 @@ SCOPES: tuple[str, ...] = (
     "esi-skills.read_skills.v1",
     "esi-skills.read_skillqueue.v1",
     "esi-characters.read_standings.v1",
+    # Name player-owned Upwell structures the character can dock at (asset browser).
+    "esi-universe.read_structures.v1",
+    # Pre-provisioned for upcoming modules so they need no further re-login (added
+    # 2026-07-21). Requested now; the features that consume them land later.
+    "esi-industry.read_character_jobs.v1",  # crafting / industry jobs
+    "esi-characters.read_blueprints.v1",  # blueprints (ME/TE, runs)
+    "esi-planets.manage_planets.v1",  # PI colonies (read setups/extractors)
+    "esi-industry.read_character_mining.v1",  # mining ledger
+    "esi-contracts.read_character_contracts.v1",  # courier / hauling contracts
+    "esi-markets.structure_markets.v1",  # order books at private structures
 )
 
 
