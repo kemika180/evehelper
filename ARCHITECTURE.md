@@ -62,7 +62,9 @@ eve_trading/
 │       │   ├── market.py      # market orders + history -> polars MarketSnapshot
 │       │   ├── character.py   # wallet/skills/standings/orders -> CharacterState
 │       │   ├── universe.py    # type/region/station names (cached POST /universe/names/)
-│       │   └── skills.py      # bundled static skills reference (skills.json, offline)
+│       │   ├── skills.py      # bundled static skills reference (skills.json, offline)
+│       │   ├── assets.py      # rebuild the nested asset tree from ESI's flat list (pure)
+│       │   └── structures.py  # resolve player-structure names (negative-cached 403s)
 │       ├── market/            # PURE analysis core (no I/O)
 │       │   ├── snapshot.py    # MarketSnapshot: polars frames + region + capture time
 │       │   ├── fees.py        # broker fee + sales tax from skills/standings
@@ -172,8 +174,21 @@ rough order:
   it depends heavily on in-game context: routes, gate/route safety, cargo volume,
   what the alliance is actually bidding for. Must be route- and security-aware so it
   never suggests a dangerous trip. Needs the SDE (cargo volumes) + ESI route data.
-- **Asset browser + containers** — browse assets and look inside containers/ships
-  (rebuild the asset tree from ESI's flat list).
+- ~~**Asset browser + containers**~~ — DONE. An "Assets" tab with a tree grouped by
+  place (station/structure/system), expandable into containers and ships. The nested
+  hierarchy is rebuilt from ESI's flat list by the pure `data/assets.py` (an item
+  whose `location_id` is another item's `item_id` sits inside it; cycle-safe). A
+  ship/container's contents are grouped by compartment (Fit / Cargo / Drone Bay /
+  Fleet Hangar / …, derived from each item's `location_flag`); fitted modules read
+  "<slot> <item>" (slot name, no number). Containers and ships show their
+  player-assigned name (POST `/characters/{id}/assets/names/`) next to their type.
+  Places open by default, containers stay closed until opened; an item search
+  filters the tree to the path of matches (matching type or assigned name). NPC stations/systems are named via `/universe/names`;
+  player structures are named via `GET /universe/structures/{id}` (needs the
+  `esi-universe.read_structures.v1` scope + docking access) with a negative cache
+  (`data/structures.py`) so an inaccessible one — which 403s, counting against the
+  error-limit budget — isn't re-asked each refresh, falling back to its id. Rows are
+  tinted by depth for readability (`DepthTree`).
 
 **Persistence / data (enables several of the above)**
 - **Advisor state persistence** (sqlite vs polars/parquet) — remember past
@@ -213,8 +228,16 @@ rough order:
   a local loopback server catches the redirect. Scopes requested up front:
   `esi-wallet.read_character_wallet.v1`, `esi-assets.read_assets.v1`,
   `esi-markets.read_character_orders.v1`, `esi-location.read_location.v1`,
-  `esi-skills.read_skills.v1`, `esi-characters.read_standings.v1` (skills and
-  standings included now so fee/tax computation needs no re-auth).
+  `esi-skills.read_skills.v1`, `esi-skills.read_skillqueue.v1`,
+  `esi-characters.read_standings.v1`, and `esi-universe.read_structures.v1` (added
+  2026-07-21 to name player structures in the asset browser). Also **pre-provisioned**
+  (2026-07-21) so upcoming modules need no further re-login, though nothing requests
+  them yet: `esi-industry.read_character_jobs.v1`, `esi-characters.read_blueprints.v1`
+  (crafting), `esi-planets.manage_planets.v1` (PI), `esi-industry.read_character_mining.v1`,
+  `esi-contracts.read_character_contracts.v1` (hauling), `esi-markets.structure_markets.v1`
+  (private-structure order books). The registered app must enable every requested
+  scope or SSO rejects the login ("scope not valid"); a scope change needs a re-login
+  because a refresh token's scopes are fixed at authorization time.
 - **Universe reference source** (milestone 3): live ESI `POST /universe/names/`
   (bulk id→name, up to 1000/call) plus a persistent local name cache in `data/`,
   since names are immutable and the client's Expires-cache does not cover POST. The

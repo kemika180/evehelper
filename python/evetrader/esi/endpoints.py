@@ -15,6 +15,7 @@ from pydantic import TypeAdapter
 from evetrader.esi.client import EsiClient
 from evetrader.esi.models import (
     Asset,
+    AssetName,
     CharacterOrder,
     CharacterSkills,
     Corporation,
@@ -25,10 +26,12 @@ from evetrader.esi.models import (
     SkillQueueEntry,
     Standing,
     Station,
+    Structure,
 )
 
 _WALLET = TypeAdapter(float)
 _ASSETS = TypeAdapter(list[Asset])
+_ASSET_NAMES = TypeAdapter(list[AssetName])
 _CHARACTER_ORDERS = TypeAdapter(list[CharacterOrder])
 _MARKET_ORDERS = TypeAdapter(list[MarketOrder])
 _MARKET_HISTORY = TypeAdapter(list[MarketHistoryDay])
@@ -45,6 +48,16 @@ async def fetch_wallet_balance(client: EsiClient, character_id: int, token: str)
 async def fetch_assets(client: EsiClient, character_id: int, token: str) -> list[Asset]:
     pages = await client.get_all_pages(f"/characters/{character_id}/assets/", token=token)
     return [asset for page in pages for asset in _ASSETS.validate_json(page)]
+
+
+async def fetch_asset_names(
+    client: EsiClient, character_id: int, token: str, item_ids: Sequence[int]
+) -> list[AssetName]:
+    """Assigned names for singleton items (ships/containers), up to 1000 ids per call."""
+    body = await client.post_json(
+        f"/characters/{character_id}/assets/names/", body=list(item_ids), token=token
+    )
+    return _ASSET_NAMES.validate_json(body)
 
 
 async def fetch_open_orders(
@@ -97,6 +110,12 @@ async def fetch_skillqueue(
 async def fetch_station(client: EsiClient, station_id: int) -> Station:
     body = await client.get(f"/universe/stations/{station_id}/")
     return Station.model_validate_json(body)
+
+
+async def fetch_structure(client: EsiClient, structure_id: int, token: str) -> Structure:
+    """A player-owned structure's public info; needs docking access (else 403)."""
+    body = await client.get(f"/universe/structures/{structure_id}/", token=token)
+    return Structure.model_validate_json(body)
 
 
 async def fetch_corporation(client: EsiClient, corporation_id: int) -> Corporation:

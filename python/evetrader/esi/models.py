@@ -35,6 +35,14 @@ class Asset(_EsiModel):
     is_singleton: bool
 
 
+class AssetName(_EsiModel):
+    """One row of POST /characters/{id}/assets/names/ — a singleton item's assigned
+    name (ships, containers). Unnamed items come back as the string ``"None"``."""
+
+    item_id: int
+    name: str
+
+
 class CharacterOrder(_EsiModel):
     """One row of GET /characters/{id}/orders/ (the character's open orders)."""
 
@@ -152,3 +160,16 @@ class Corporation(_EsiModel):
     name: str
     # Present for NPC corporations; the faction whose standing affects broker fees.
     faction_id: int | None = None
+
+
+class Structure(_EsiModel):
+    """GET /universe/structures/{structure_id}/ — a player-owned Upwell structure.
+
+    Requires docking access (the `esi-universe.read_structures.v1` scope); an
+    inaccessible structure returns 403 rather than these fields.
+    """
+
+    name: str
+    solar_system_id: int
+    type_id: int | None = None
+    owner_id: int | None = None

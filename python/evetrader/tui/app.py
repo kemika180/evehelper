@@ -16,17 +16,20 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import ClassVar
+from typing import ClassVar, TypeVar
 
+from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import BindingType
+from textual.color import Color
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     DataTable,
     Footer,
     Header,
+    Input,
     OptionList,
     Static,
     TabbedContent,
@@ -34,8 +37,10 @@ from textual.widgets import (
     Tree,
 )
 from textual.widgets.option_list import Option
+from textual.widgets.tree import TreeNode
 from textual_plotext import PlotextPlot
 
+from evetrader.data.assets import AssetLocation, AssetNode
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
@@ -218,6 +223,109 @@ def _level_dots(level: int) -> str:
     """Trained skill level as filled/empty pips, e.g. L3 -> ●●●○○."""
     filled = max(0, min(5, level))
     return "●" * filled + "○" * (5 - filled)
+
+
+def _asset_signature(locations: list[AssetLocation]) -> tuple[object, ...]:
+    """A value that changes iff the asset tree changed — item moves between places,
+    stack sizes, additions/removals — so the tree only rebuilds when it must."""
+
+    def flatten(nodes: tuple[AssetNode, ...]) -> tuple[tuple[int, int], ...]:
+        out: list[tuple[int, int]] = []
+        for node in nodes:
+            out.append((node.item_id, node.quantity))
+            out.extend(flatten(node.children))
+        return tuple(out)
+
+    return tuple((loc.location_id, flatten(loc.items)) for loc in locations)
+
+
+# Fitted-module slots collapse into one "Fit" group; each is labelled by slot type.
+_SLOT_NAMES: tuple[tuple[str, str], ...] = (
+    ("HiSlot", "High Slot"),
+    ("MedSlot", "Mid Slot"),
+    ("LoSlot", "Low Slot"),
+    ("RigSlot", "Rig"),
+    ("SubSystemSlot", "Subsystem"),
+    ("ServiceSlot", "Service"),
+)
+_SLOT_PREFIXES = tuple(prefix for prefix, _ in _SLOT_NAMES)
+# location_flags that just mean "loosely here" — no compartment worth grouping under.
+_LOOSE_FLAGS = frozenset({"", "Hangar", "HangarAll", "Unlocked", "Locked", "AutoFit", "Deliveries"})
+
+
+def _humanize_flag(flag: str) -> str:
+    """Split a CamelCase location_flag: 'DroneBay' -> 'Drone Bay', 'OreHold' -> 'Ore Hold'."""
+    out: list[str] = []
+    for index, char in enumerate(flag):
+        if index and char.isupper() and not flag[index - 1].isupper():
+            out.append(" ")
+        out.append(char)
+    return "".join(out)
+
+
+def _asset_section(flag: str) -> str | None:
+    """The ship/container compartment a flag belongs to (a group heading), or None for
+    items that just sit loose in a hangar."""
+    if flag == "Cargo":
+        return "Cargo"
+    if flag.startswith("FighterTube"):
+        return "Fighter Bay"
+    if flag.startswith(_SLOT_PREFIXES):
+        return "Fit"
+    if flag in _LOOSE_FLAGS:
+        return None
+    if flag.endswith(("Bay", "Hold", "Hangar")):
+        return _humanize_flag(flag)  # DroneBay, FleetHangar, OreHold, FuelBay…
+    return None
+
+
+def _slot_label(flag: str) -> str:
+    for prefix, name in _SLOT_NAMES:
+        if flag.startswith(prefix):
+            return name
+    return _humanize_flag(flag)
+
+
+def _slot_rank(flag: str) -> int:
+    for rank, prefix in enumerate(_SLOT_PREFIXES):
+        if flag.startswith(prefix):
+            return rank
+    return len(_SLOT_PREFIXES)
+
+
+def _section_order(section: str) -> tuple[int, str]:
+    return ({"Fit": 0, "Cargo": 1}.get(section, 2), section)
+
+
+# Theme colours cycled by tree depth to tint each row's full-width background — a
+# faint hierarchy guide (mostly the surface colour, a hint of hue), not a loud bar.
+# Only always-defined theme fields (some themes leave warning/error unset -> None).
+_DEPTH_HUES = ("primary", "accent", "success", "secondary")
+_BAR_MIX = 0.78  # blend fraction toward the surface colour
+
+TreeData = TypeVar("TreeData")
+
+
+class DepthTree(Tree[TreeData]):
+    """A tree that tints each row's full-width background by depth, for readability."""
+
+    DEFAULT_CSS = "DepthTree { overflow-x: hidden; }"
+
+    def render_label(self, node: TreeNode[TreeData], base_style: Style, style: Style) -> Text:
+        label = super().render_label(node, base_style, style)
+        depth = 0
+        parent = node.parent
+        while parent is not None:
+            depth += 1
+            parent = parent.parent
+        theme = self.app.current_theme
+        # Guard against a theme leaving a field unset (None); primary is always set.
+        hue = getattr(theme, _DEPTH_HUES[depth % len(_DEPTH_HUES)]) or theme.primary
+        surface = theme.surface or theme.background or "#000000"
+        bar = Color.parse(hue).blend(Color.parse(surface), _BAR_MIX)
+        label.pad_right(max(0, self.size.width - label.cell_len))  # fill the row width
+        label.stylize(Style(bgcolor=bar.rich_color))  # bg only, keep the fg accents
+        return label
 
 
 FetchCharacter = Callable[[], Awaitable[CharacterReport]]
@@ -434,10 +542,11 @@ class TradingScreen(Screen[None]):
     }
     TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
     TradingScreen #buys, TradingScreen #sells, TradingScreen #skillqueue,
-    TradingScreen #skilltree {
+    TradingScreen #skilltree, TradingScreen #assettree {
         margin: 0 1;
         height: 1fr;
     }
+    TradingScreen #assetsearch { margin: 0 1; }
     """
 
     def __init__(self, feed: RefreshFeed, interval_seconds: int) -> None:
@@ -446,9 +555,11 @@ class TradingScreen(Screen[None]):
         self._interval = interval_seconds
         self._report: OpportunityReport | None = None
         self._character: CharacterReport | None = None
-        # Signature of the skills last drawn into the tree, so a periodic refresh
-        # doesn't rebuild it (and collapse the user's expansions) when nothing changed.
+        # Signatures of the data last drawn into each tree, so a periodic refresh
+        # doesn't rebuild them (and collapse the user's expansions) when unchanged.
         self._skills_key: tuple[tuple[int, int], ...] | None = None
+        self._assets_key: object | None = None
+        self._asset_query: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -469,7 +580,10 @@ class TradingScreen(Screen[None]):
             with TabPane("Skill Queue", id="queue"):
                 yield DataTable(id="skillqueue", zebra_stripes=True, cursor_type="row")
             with TabPane("Skills", id="skills"):
-                yield Tree("Skills", id="skilltree")
+                yield DepthTree[int]("Skills", id="skilltree")
+            with TabPane("Assets", id="assets"):
+                yield Input(placeholder="Search items…", id="assetsearch")
+                yield DepthTree[None]("Assets", id="assettree")
         yield Footer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -554,6 +668,7 @@ class TradingScreen(Screen[None]):
         self._render_training(character_report)
         self._render_skill_queue(character_report)
         self._render_skills(character_report)
+        self._render_assets(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
         status.update("Scanning for value…")
@@ -684,6 +799,124 @@ class TradingScreen(Screen[None]):
                 label = Text(f"{display_name(skill)}  ")
                 label.append(_level_dots(skill.trained_skill_level), style="cyan")
                 branch.add_leaf(label, data=skill.skill_id)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "assetsearch" and self._character is not None:
+            self._asset_query = event.value
+            self._render_assets(self._character)
+
+    def _render_assets(self, report: CharacterReport) -> None:
+        """All assets as a tree of places -> items -> container/ship contents,
+        filtered to the search box.
+
+        Skipped when neither the assets nor the query changed, so a periodic refresh
+        leaves the tree (and the user's expand/collapse state) alone.
+        """
+        query = self._asset_query.strip().lower()
+        key = (_asset_signature(report.assets), query)
+        if key == self._assets_key:
+            return
+        self._assets_key = key
+
+        tree = self.query_one("#assettree", Tree)
+        tree.clear()
+        tree.root.expand()
+        for location in report.assets:
+            if query and not any(self._asset_matches(i, report, query) for i in location.items):
+                continue  # nothing here matches the search
+            # Places open so their top-level items show; containers/ships stay closed
+            # until opened — unless a search needs them open to reveal a match.
+            place = tree.root.add(self._location_label(location.location_id, report), expand=True)
+            self._add_asset_children(place, location.items, report, query=query, show_all=not query)
+
+    def _add_asset_children(
+        self,
+        parent: TreeNode[None],
+        children: tuple[AssetNode, ...],
+        report: CharacterReport,
+        *,
+        query: str,
+        show_all: bool,
+    ) -> None:
+        """Render a node's contents, grouping ship/container compartments (Fit, Cargo,
+        Drone Bay…) under headings; loose items list directly."""
+        visible = (
+            list(children)
+            if show_all
+            else [c for c in children if self._asset_matches(c, report, query)]
+        )
+        sections: dict[str | None, list[AssetNode]] = defaultdict(list)
+        for child in visible:
+            sections[_asset_section(child.location_flag)].append(child)
+
+        def by_name(item: AssetNode) -> str:
+            return self._asset_label_name(item, report)
+
+        for child in sorted(sections.pop(None, []), key=by_name):
+            self._add_asset_node(
+                parent, child, report, query=query, show_all=show_all, section=None
+            )
+
+        for section in sorted((s for s in sections if s is not None), key=_section_order):
+            items = sections[section]
+            heading = Text(f"{section}  ({len(items)})", style="italic dim")
+            node = parent.add(heading, expand=bool(query))
+            if section == "Fit":
+                items.sort(key=lambda i: (_slot_rank(i.location_flag), by_name(i)))
+            else:
+                items.sort(key=by_name)
+            for child in items:
+                self._add_asset_node(
+                    node, child, report, query=query, show_all=show_all, section=section
+                )
+
+    def _add_asset_node(
+        self,
+        parent: TreeNode[None],
+        item: AssetNode,
+        report: CharacterReport,
+        *,
+        query: str,
+        show_all: bool,
+        section: str | None,
+    ) -> None:
+        name = report.names.get(item.type_id, str(item.type_id))
+        custom = report.asset_names.get(item.item_id)
+        label = Text()
+        if section == "Fit":  # fitted module: slot name first, then the item, no number
+            label.append(f"{_slot_label(item.location_flag)}   ", style="cyan")
+        if item.children and custom and custom != name:
+            # A named container/ship: its player name, then its type dimmed.
+            label.append(custom, style="bold")
+            label.append(f"  {name}", style="dim")
+        else:
+            label.append(name, style="bold" if item.children else "")
+        if item.quantity > 1:
+            label.append(f"  ×{item.quantity:,}", style="cyan")  # noqa: RUF001 (multiplier)
+        if not item.children:
+            parent.add_leaf(label)
+            return
+        node = parent.add(label, expand=bool(query))
+        # A container/ship matched by name reveals everything inside it.
+        child_show_all = show_all or (bool(query) and query in name.lower())
+        self._add_asset_children(node, item.children, report, query=query, show_all=child_show_all)
+
+    def _asset_matches(self, item: AssetNode, report: CharacterReport, query: str) -> bool:
+        """Whether this item, its assigned name, or anything nested inside it matches."""
+        if query in report.names.get(item.type_id, str(item.type_id)).lower():
+            return True
+        custom = report.asset_names.get(item.item_id)
+        if custom is not None and query in custom.lower():
+            return True
+        return any(self._asset_matches(child, report, query) for child in item.children)
+
+    def _asset_label_name(self, item: AssetNode, report: CharacterReport) -> str:
+        return report.names.get(item.type_id, str(item.type_id)).lower()
+
+    def _location_label(self, location_id: int, report: CharacterReport) -> str:
+        if location_id == report.character.station_id:
+            return report.station_name  # the home place, named (incl. structures)
+        return report.names.get(location_id, f"Location {location_id}")
 
 
 class CharacterPickerScreen(Screen[None]):

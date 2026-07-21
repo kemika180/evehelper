@@ -5,9 +5,10 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
-from textual.widgets import DataTable, OptionList, Static, TabbedContent, Tree
+from textual.widgets import DataTable, Input, OptionList, Static, TabbedContent, Tree
 
 from evetrader.advisor.state import CharacterState, TradeSkills
+from evetrader.data.assets import AssetLocation, AssetNode
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
@@ -171,7 +172,13 @@ def _character_report() -> CharacterReport:
             Skill(skill_id=3443, active_skill_level=3, trained_skill_level=3),  # Trade
         ],
         holdings={34: 500},
-        names={16622: "Accounting", 3443: "Trade"},
+        names={
+            16622: "Accounting",
+            3443: "Trade",
+            34: "Tritanium",
+            35: "Pyerite",
+            17363: "Giant Secure Container",
+        },
         station_name="Jita IV - Moon 4 - Caldari Navy Assembly Plant",
         skill_reference={
             16622: SkillReference(
@@ -191,7 +198,34 @@ def _character_report() -> CharacterReport:
                 description="Basic trading.",
             ),
         },
+        assets=_asset_tree(),
+        asset_names={11: "Ammo Box"},  # the Giant Secure Container has a player name
     )
+
+
+def _asset_tree() -> list[AssetLocation]:
+    # A hangar with a stack and a container holding another stack.
+    return [
+        AssetLocation(
+            location_id=60003760,
+            items=(
+                AssetNode(
+                    item_id=10, type_id=34, quantity=1_000, location_flag="Hangar",
+                    is_singleton=False, children=(),
+                ),
+                AssetNode(
+                    item_id=11, type_id=17363, quantity=1, location_flag="Hangar",
+                    is_singleton=True,
+                    children=(
+                        AssetNode(
+                            item_id=12, type_id=35, quantity=500, location_flag="Hangar",
+                            is_singleton=False, children=(),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    ]
 
 
 def _signal(type_id: int, action: str, current: float, fair: float, position: float) -> InvestmentSignal:
@@ -454,6 +488,221 @@ def test_skill_tree_survives_a_refresh_when_skills_unchanged(tmp_path: Path) -> 
             assert same is trade
             assert not same.is_expanded
             await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_assets_tab_shows_places_and_nested_containers(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            tree = app.screen.query_one("#assettree", Tree)
+            place = tree.root.children[0]
+            assert "Jita" in str(place.label)  # the home place is named, not an id
+            labels = [str(node.label) for node in place.children]
+            assert any("Tritanium" in text and "1,000" in text for text in labels)
+
+            container = next(n for n in place.children if "Giant Secure Container" in str(n.label))
+            # The container shows its player-assigned name alongside its type.
+            assert "Ammo Box" in str(container.label)
+            inside = [str(child.label) for child in container.children]
+            assert any("Pyerite" in text for text in inside)  # look inside the container
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_asset_search_filters_to_matching_items(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            tree = trading.query_one("#assettree", Tree)
+            trading.query_one("#assetsearch", Input).value = "pyerite"
+            await pilot.pause()
+
+            # Only the path to Pyerite (inside the container) survives; the hangar
+            # Tritanium stack is filtered out.
+            top = [str(node.label) for node in tree.root.children[0].children]
+            assert not any("Tritanium" in text for text in top)
+            container = next(
+                n for n in tree.root.children[0].children if "Giant Secure Container" in str(n.label)
+            )
+            assert any("Pyerite" in str(child.label) for child in container.children)
+
+            # Search also matches a container's player-assigned name.
+            trading.query_one("#assetsearch", Input).value = "ammo box"
+            await pilot.pause()
+            top = [str(node.label) for node in tree.root.children[0].children]
+            assert any("Ammo Box" in text for text in top)
+
+            trading.query_one("#assetsearch", Input).value = ""  # cleared -> full tree
+            await pilot.pause()
+            top = [str(node.label) for node in tree.root.children[0].children]
+            assert any("Tritanium" in text for text in top)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def _app_with_assets(store: CharacterStore, locations: list[AssetLocation], names: dict[int, str]):
+    base = _character_report()
+    report = CharacterReport(
+        base.captured_at,
+        base.character,
+        base.skill_queue,
+        base.skills,
+        base.holdings,
+        {**base.names, **names},
+        base.station_name,
+        base.skill_reference,
+        locations,
+        {},
+    )
+
+    async def character() -> CharacterReport:
+        return report
+
+    async def opportunities(state: CharacterState) -> OpportunityReport:
+        return _opportunity_report()
+
+    async def login_fn() -> CharacterIdentity:
+        return CharacterIdentity(999, "New Char")
+
+    return EveTraderApp(
+        store,
+        lambda cid: RefreshFeed(character=character, opportunities=opportunities),
+        login_fn,
+        lambda cid: None,
+        interval_seconds=30,
+    )
+
+
+def test_ship_contents_group_into_sections_with_slot_names(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    ship = AssetNode(
+        2,
+        24696,  # Harbinger
+        1,
+        "Hangar",
+        True,
+        (
+            AssetNode(3, 34, 1, "HiSlot0", True, ()),  # a high-slot module
+            AssetNode(4, 35, 1, "LoSlot2", True, ()),  # a low-slot module
+            AssetNode(5, 36, 500, "Cargo", False, ()),  # ammo in cargo
+            AssetNode(6, 37, 3, "DroneBay", False, ()),  # drones
+        ),
+    )
+    names = {24696: "Harbinger", 34: "Smartbomb", 35: "Plate", 36: "Ammo", 37: "Hobgoblin"}
+    app = _app_with_assets(store, [AssetLocation(60003760, (ship,))], names)
+
+    async def _drive() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+            tree = app.screen.query_one("#assettree", Tree)
+            ship_node = tree.root.children[0].children[0]
+            assert "Harbinger" in str(ship_node.label)
+
+            sections = [str(node.label) for node in ship_node.children]
+            # Fit first, then Cargo, then Drone Bay; each with a count.
+            assert sections[0].startswith("Fit")
+            assert any(s.startswith("Cargo") for s in sections)
+            assert any(s.startswith("Drone Bay") for s in sections)
+
+            fit = ship_node.children[0]
+            fit_items = [str(node.label) for node in fit.children]
+            # Slot name first, then the item; raw flag / slot number not shown.
+            assert any(
+                t.startswith("High Slot") and "Smartbomb" in t and "HiSlot0" not in t
+                for t in fit_items
+            )
+            assert any(t.startswith("Low Slot") and "Plate" in t for t in fit_items)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
+    # A fitted ship inside a container reaches depth 4+, where the depth-colour palette
+    # once indexed a theme field the theme left unset (None) and crashed on render.
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    def _leaf(item_id: int, type_id: int, flag: str) -> AssetNode:
+        return AssetNode(item_id, type_id, 1, flag, True, ())
+
+    ship = AssetNode(
+        3, 24696, 1, "Hangar", True, (_leaf(4, 34, "HiSlot6"), _leaf(5, 35, "MedSlot0"))
+    )
+    container = AssetNode(2, 17363, 1, "Hangar", True, (ship,))
+    base = _character_report()
+    report = CharacterReport(
+        base.captured_at,
+        base.character,
+        base.skill_queue,
+        base.skills,
+        base.holdings,
+        {**base.names, 24696: "Harbinger", 17363: "Container"},
+        base.station_name,
+        base.skill_reference,
+        [AssetLocation(60003760, (container,))],
+        {},
+    )
+
+    async def _drive() -> None:
+        async def character() -> CharacterReport:
+            return report
+
+        async def opportunities(state: CharacterState) -> OpportunityReport:
+            return _opportunity_report()
+
+        async def login_fn() -> CharacterIdentity:
+            return CharacterIdentity(999, "New Char")
+
+        app = EveTraderApp(
+            store,
+            lambda cid: RefreshFeed(character=character, opportunities=opportunities),
+            login_fn,
+            lambda cid: None,
+            interval_seconds=30,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+            tree = app.screen.query_one("#assettree", Tree)
+            tree.root.expand_all()  # make every depth visible -> render_label runs at each
+            for _ in range(3):
+                await pilot.pause()
+            assert len(tree._tree_lines) >= 5  # built through depth 4, no crash
 
     asyncio.run(_drive())
 
