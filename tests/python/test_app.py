@@ -5,12 +5,12 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
-from textual.widgets import DataTable, OptionList, Static, TabbedContent
+from textual.widgets import DataTable, OptionList, Static, TabbedContent, Tree
 
 from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import MarketHistoryDay, SkillQueueEntry
+from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
@@ -25,6 +25,7 @@ from evetrader.tui.app import (
     _completion,
     _current_training,
     _skill_progress,
+    _train_time,
 )
 
 
@@ -126,6 +127,20 @@ def test_skill_progress_paused_without_sp_has_no_fraction() -> None:
     assert progress.fraction is None
 
 
+def test_train_time_is_per_skill_not_cumulative() -> None:
+    reference = datetime(2026, 1, 1, tzinfo=UTC)
+    # A queued skill: its own duration (5 days), not the ~36-day wait before it.
+    queued = _queue_entry(
+        1, 1, datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 2, 6, tzinfo=UTC)
+    )
+    assert _train_time(queued, reference) == "5d 0h"
+    # The training skill: the remaining time, from now to its completion (2 days).
+    active = _queue_entry(
+        2, 0, datetime(2025, 12, 30, tzinfo=UTC), datetime(2026, 1, 3, tzinfo=UTC)
+    )
+    assert _train_time(active, reference) == "2d 0h"
+
+
 def _character_state() -> CharacterState:
     return CharacterState(
         station_id=60003760,
@@ -151,17 +166,30 @@ def _character_report() -> CharacterReport:
                 finish_date=datetime(2026, 8, 1, 12, 0, tzinfo=UTC),
             )
         ],
+        skills=[
+            Skill(skill_id=16622, active_skill_level=5, trained_skill_level=5),  # Accounting
+            Skill(skill_id=3443, active_skill_level=3, trained_skill_level=3),  # Trade
+        ],
         holdings={34: 500},
-        names={16622: "Accounting"},
+        names={16622: "Accounting", 3443: "Trade"},
         station_name="Jita IV - Moon 4 - Caldari Navy Assembly Plant",
         skill_reference={
             16622: SkillReference(
                 name="Accounting",
+                group="Trade",
                 rank=3,
                 primary="Charisma",
                 secondary="Memory",
                 description="Reduces sales tax.",
-            )
+            ),
+            3443: SkillReference(
+                name="Trade",
+                group="Trade",
+                rank=1,
+                primary="Charisma",
+                secondary="Memory",
+                description="Basic trading.",
+            ),
         },
     )
 
@@ -364,6 +392,106 @@ def test_selecting_a_skill_row_opens_the_skill_info_popup(tmp_path: Path) -> Non
             assert "rank 3" in popup_text  # static reference facts
             assert "Charisma / Memory" in popup_text
             assert "Reduces sales tax." in popup_text  # bundled description
+            await pilot.click("#skillbody")  # clicking the popup dismisses it
+            await pilot.pause()
+            assert isinstance(app.screen, TradingScreen)
+
+    asyncio.run(_drive())
+
+
+def test_skills_tab_groups_trained_skills(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            tree = app.screen.query_one("#skilltree", Tree)
+            groups = {str(node.label): node for node in tree.root.children}
+            assert "Trade" in groups  # both fixture skills live under Trade
+            leaves = [str(leaf.label) for leaf in groups["Trade"].children]
+            assert any("Accounting" in text and "●●●●●" in text for text in leaves)
+            assert any("Trade" in text and "●●●○○" in text for text in leaves)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_skill_tree_survives_a_refresh_when_skills_unchanged(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            tree = trading.query_one("#skilltree", Tree)
+            trade = next(node for node in tree.root.children if str(node.label) == "Trade")
+            assert trade.is_expanded  # groups start open
+            trade.collapse()
+            await pilot.pause()
+
+            await trading._refresh()  # a periodic refresh with the same skills
+            await pilot.pause()
+
+            # Same node, still collapsed — the tree was not rebuilt.
+            same = next(node for node in tree.root.children if str(node.label) == "Trade")
+            assert same is trade
+            assert not same.is_expanded
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_selecting_a_trained_skill_opens_its_detail(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            trading.query_one(TabbedContent).active = "skills"
+            await pilot.pause()
+            tree = trading.query_one("#skilltree", Tree)
+            tree.focus()
+            # Trade (3443) isn't in the queue -> the trained-skill detail path.
+            leaf = next(
+                lf for grp in tree.root.children for lf in grp.children if lf.data == 3443
+            )
+            leaf.parent.expand()  # a group is collapsed until opened
+            await pilot.pause()
+            tree.move_cursor(leaf)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, SkillInfoScreen)
+            body = str(app.screen.query_one("#skillbody", Static).render())
+            assert "Trade" in body and "Level 3 trained" in body
+            assert "Basic trading." in body  # bundled description
             await pilot.press("escape")
 
     asyncio.run(_drive())

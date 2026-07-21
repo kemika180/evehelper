@@ -40,20 +40,22 @@ async def _get(client: httpx.AsyncClient, path: str) -> dict | list:
     return response.json()
 
 
-async def _skill_type_ids(client: httpx.AsyncClient) -> list[int]:
+async def _skill_groups(client: httpx.AsyncClient) -> dict[int, str]:
+    """Type id -> its skill group name (the in-game skill category)."""
     category = await _get(client, f"/universe/categories/{_SKILL_CATEGORY}/")
     assert isinstance(category, dict)
-    type_ids: list[int] = []
+    groups: dict[int, str] = {}
     for group_id in category["groups"]:
         group = await _get(client, f"/universe/groups/{group_id}/")
         assert isinstance(group, dict)
         if group.get("published"):
-            type_ids.extend(group["types"])
-    return sorted(set(type_ids))
+            for type_id in group["types"]:
+                groups[type_id] = group["name"]
+    return groups
 
 
 async def _skill(
-    client: httpx.AsyncClient, sem: asyncio.Semaphore, type_id: int
+    client: httpx.AsyncClient, sem: asyncio.Semaphore, type_id: int, group: str
 ) -> tuple[int, dict] | None:
     async with sem:
         payload = await _get(client, f"/universe/types/{type_id}/")
@@ -65,6 +67,7 @@ async def _skill(
         return None
     return type_id, {
         "name": payload["name"],
+        "group": group,
         "rank": int(attrs[_RANK]),
         "primary": _ATTRIBUTE_NAMES.get(int(attrs.get(_PRIMARY, 0)), "?"),
         "secondary": _ATTRIBUTE_NAMES.get(int(attrs.get(_SECONDARY, 0)), "?"),
@@ -74,10 +77,12 @@ async def _skill(
 
 async def main() -> None:
     async with httpx.AsyncClient(headers={"User-Agent": _USER_AGENT}, timeout=30.0) as client:
-        type_ids = await _skill_type_ids(client)
-        print(f"Fetching {len(type_ids)} skill types…")
+        groups = await _skill_groups(client)
+        print(f"Fetching {len(groups)} skill types…")
         sem = asyncio.Semaphore(16)
-        results = await asyncio.gather(*(_skill(client, sem, tid) for tid in type_ids))
+        results = await asyncio.gather(
+            *(_skill(client, sem, tid, group) for tid, group in sorted(groups.items()))
+        )
     skills = {str(tid): info for pair in results if pair is not None for tid, info in [pair]}
     payload = json.dumps(skills, ensure_ascii=False, indent=0, sort_keys=True)
     _OUT.write_text(payload, encoding="utf-8")
