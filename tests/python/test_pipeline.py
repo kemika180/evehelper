@@ -145,6 +145,23 @@ def _handler(request: httpx.Request) -> httpx.Response:
         )
     if path.endswith("/wallet/"):
         return httpx.Response(200, json=5_000_000.0, headers=exp)
+    if path.endswith("/blueprints/"):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "item_id": 3,  # the same item that appears in the asset list
+                    "type_id": _UNDERVALUED,
+                    "location_id": _STRUCTURE,
+                    "location_flag": "Hangar",
+                    "quantity": -2,
+                    "material_efficiency": 8,
+                    "time_efficiency": 16,
+                    "runs": 10,
+                }
+            ],
+            headers=exp,
+        )
     if path.endswith("/skillqueue/"):
         return httpx.Response(200, json=[], headers=exp)
     if path.endswith("/skills/"):
@@ -200,6 +217,9 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
                 client, authenticator, _config(), 42, home, name_cache, structure_cache, now=now
             )
             assert character.holdings == {_HELD_DEAR: 10}
+            # Blueprint research is keyed by asset item_id for the browser popup.
+            assert character.blueprints[3].runs == 10
+            assert character.blueprints[3].material_efficiency == 8
             assert character.station_name == "Jita IV-4"
             # A player structure is named via /universe/structures + its system name.
             assert character.names[_STRUCTURE] == "V-3YG7 Fortizar · V-3YG7"

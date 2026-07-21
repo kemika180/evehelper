@@ -43,6 +43,25 @@ class AssetName(_EsiModel):
     name: str
 
 
+class Blueprint(_EsiModel):
+    """One row of GET /characters/{id}/blueprints/.
+
+    ``runs`` is -1 for a blueprint original (BPO, unlimited runs); a positive count
+    is the runs remaining on a blueprint copy (BPC). ``quantity`` is -1 for a single
+    original, -2 for a copy, or a positive stack size of (unresearched) originals.
+    ``material_efficiency``/``time_efficiency`` are the percentage saved (0-10 / 0-20).
+    """
+
+    item_id: int
+    type_id: int
+    location_id: int
+    location_flag: str
+    quantity: int
+    material_efficiency: int
+    time_efficiency: int
+    runs: int
+
+
 class CharacterOrder(_EsiModel):
     """One row of GET /characters/{id}/orders/ (the character's open orders)."""
 

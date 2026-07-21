@@ -26,11 +26,12 @@ from evetrader.esi.client import EsiClient, EsiError
 from evetrader.esi.endpoints import (
     fetch_asset_names,
     fetch_assets,
+    fetch_blueprints,
     fetch_market_history,
     fetch_skillqueue,
     fetch_skills,
 )
-from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
+from evetrader.esi.models import Blueprint, MarketHistoryDay, Skill, SkillQueueEntry
 from evetrader.market.investment import InvestmentSignal, find_opportunities, liquid_types
 
 # Bounded concurrency for the per-type history fetches.
@@ -55,6 +56,8 @@ class CharacterReport:
     assets: list[AssetLocation]
     # Player-assigned names for containers/ships, keyed by item_id.
     asset_names: dict[int, str]
+    # Blueprint research (ME/TE, runs, original vs copy), keyed by asset item_id.
+    blueprints: dict[int, Blueprint]
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,10 @@ async def fetch_character(
             holdings[asset.type_id] = holdings.get(asset.type_id, 0) + asset.quantity
     asset_tree = build_asset_tree(assets)
 
+    # Blueprint research is per-item (ME/TE/runs differ between two copies of one
+    # type), so key it by item_id to match a selected asset row in the browser.
+    blueprints = {bp.item_id: bp for bp in await fetch_blueprints(client, character_id, token)}
+
     # Player-assigned names for containers/ships (POST, 1000 ids/call), to make them
     # findable in the browser. Only singleton items that hold things can be named.
     nameable = nameable_item_ids(asset_tree)
@@ -156,6 +163,7 @@ async def fetch_character(
         load_skills(),
         asset_tree,
         asset_names,
+        blueprints,
     )
 
 

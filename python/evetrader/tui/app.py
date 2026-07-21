@@ -43,7 +43,7 @@ from textual_plotext import PlotextPlot
 from evetrader.data.assets import AssetLocation, AssetNode
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import MarketHistoryDay, Skill, SkillQueueEntry
+from evetrader.esi.models import Blueprint, MarketHistoryDay, Skill, SkillQueueEntry
 from evetrader.market.investment import InvestmentSignal
 from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
@@ -219,10 +219,43 @@ def _bar(fraction: float, width: int = 24) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _level_dots(level: int) -> str:
-    """Trained skill level as filled/empty pips, e.g. L3 -> ●●●○○."""
-    filled = max(0, min(5, level))
-    return "●" * filled + "○" * (5 - filled)
+def _skill_queue_pips(
+    skill_id: int, trained: int, queue: list[SkillQueueEntry], reference: datetime
+) -> Text:
+    """Five level pips (mirroring the in-game squares), with queued levels coloured.
+
+    A trained level is a cyan ■ and an untrained one a dim □ — the same regardless of
+    the queue. On top of that, a level *pending* training is highlighted magenta: the
+    one part-trained right now shows a ◪, other queued levels a □. So a skill not in
+    the queue reads plainly, and a queued skill lights up exactly the levels it will
+    train.
+
+    A queue level that has already *finished* counts as trained (a full ■), even if the
+    skills endpoint hasn't caught up to it yet — so a just-completed level never lingers
+    as a queued/part-trained box."""
+    entries = [e for e in queue if e.skill_id == skill_id]
+    finished = max((e.finished_level for e in entries if _is_completed(e, reference)), default=0)
+    trained = max(0, min(5, max(trained, finished)))
+    pending = [e for e in entries if not _is_completed(e, reference)]
+    queued = {entry.finished_level for entry in pending}
+    partial_level: int | None = None
+    for entry in pending:
+        progress = _skill_progress(entry, reference)
+        if progress.fraction is not None and 0.0 < progress.fraction < 1.0:
+            partial_level = entry.finished_level
+            break
+
+    pips = Text()
+    for level in range(1, 6):
+        if level <= trained:
+            pips.append("■", style="cyan")  # trained: unchanged by the queue
+        elif level == partial_level:
+            pips.append("◪", style="magenta")  # queued and part-trained now
+        elif level in queued:
+            pips.append("□", style="magenta")  # queued, not yet started
+        else:
+            pips.append("□", style="dim")  # untrained and not queued
+    return pips
 
 
 def _asset_signature(locations: list[AssetLocation]) -> tuple[object, ...]:
@@ -514,6 +547,71 @@ class SkillInfoScreen(ModalScreen[None]):
         text.append("\n")
 
 
+class BlueprintInfoScreen(ModalScreen[None]):
+    """Blueprint detail: original vs copy, research (ME/TE savings), and runs.
+
+    Only blueprints get a popup — for an ordinary asset there's nothing solid to show
+    without the SDE (volume/group, deferred to hauling) or a per-click ESI fetch (which
+    the cache rules forbid), so those rows are inert."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        ("q", "dismiss", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    BlueprintInfoScreen { align: center middle; }
+    BlueprintInfoScreen #bpbox {
+        width: 64;
+        height: auto;
+        max-height: 90%;
+        overflow-y: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    BlueprintInfoScreen #bphint { padding: 1 0 0 0; color: $text-muted; }
+    """
+
+    def __init__(self, name: str, node: AssetNode, blueprint: Blueprint) -> None:
+        super().__init__()
+        self._name = name
+        self._node = node
+        self._blueprint = blueprint
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="bpbox"):
+            yield Static(self._body(), id="bpbody")
+            yield Static("click or esc to close", id="bphint")
+
+    def on_click(self) -> None:
+        self.dismiss()
+
+    def _body(self) -> Text:
+        blueprint = self._blueprint
+        original = blueprint.runs == -1
+        text = Text()
+        text.append(f"{self._name}\n", style="bold")
+        text.append(
+            "Blueprint Original (BPO)\n" if original else "Blueprint Copy (BPC)\n",
+            style="bold magenta",
+        )
+        # ESI reports ME/TE as the percentage saved directly (ME 0-10%, TE 0-20%).
+        text.append(
+            f"-{blueprint.material_efficiency}% materials  ·  "
+            f"-{blueprint.time_efficiency}% time\n",
+            style="cyan",
+        )
+        if original:
+            text.append("unlimited runs\n", style="dim")
+        else:
+            text.append(f"{blueprint.runs:,} runs remaining\n", style="dim")
+        if self._node.quantity > 1:
+            text.append(f"stack of {self._node.quantity:,}\n", style="dim")
+        return text
+
+
 class TradingScreen(Screen[None]):
     """Per-character advisor view: opportunities plus character and skill-queue."""
 
@@ -557,7 +655,7 @@ class TradingScreen(Screen[None]):
         self._character: CharacterReport | None = None
         # Signatures of the data last drawn into each tree, so a periodic refresh
         # doesn't rebuild them (and collapse the user's expansions) when unchanged.
-        self._skills_key: tuple[tuple[int, int], ...] | None = None
+        self._skills_key: object | None = None
         self._assets_key: object | None = None
         self._asset_query: str = ""
 
@@ -583,7 +681,7 @@ class TradingScreen(Screen[None]):
                 yield DepthTree[int]("Skills", id="skilltree")
             with TabPane("Assets", id="assets"):
                 yield Input(placeholder="Search items…", id="assetsearch")
-                yield DepthTree[None]("Assets", id="assettree")
+                yield DepthTree[AssetNode]("Assets", id="assettree")
         yield Footer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -616,11 +714,21 @@ class TradingScreen(Screen[None]):
             SkillInfoScreen(name, info, entry=entry, reference=self._character.captured_at)
         )
 
-    def on_tree_node_selected(self, event: Tree.NodeSelected[int]) -> None:
-        """A leaf in the Skills tree is a skill id; group nodes carry no data."""
-        if self._character is None or not isinstance(event.node.data, int):
+    def on_tree_node_selected(self, event: Tree.NodeSelected[object]) -> None:
+        """Both trees share this handler; the node's data type says which it is: a
+        Skills-tree leaf carries its skill id (int), an Assets-tree blueprint leaf its
+        AssetNode. Everything else (groups, places, containers, non-blueprint items)
+        carries no data and is ignored."""
+        if self._character is None:
             return
-        skill_id = event.node.data
+        data = event.node.data
+        if isinstance(data, int):
+            self._open_skill_detail(data)
+        elif isinstance(data, AssetNode):
+            self._open_blueprint_detail(data)
+
+    def _open_skill_detail(self, skill_id: int) -> None:
+        assert self._character is not None
         info = self._character.skill_reference.get(skill_id)
         name = self._skill_name(skill_id, info)
         # If it's currently in the queue, show the live training detail; otherwise
@@ -635,6 +743,14 @@ class TradingScreen(Screen[None]):
             (s.trained_skill_level for s in self._character.skills if s.skill_id == skill_id), None
         )
         self.app.push_screen(SkillInfoScreen(name, info, trained_level=trained))
+
+    def _open_blueprint_detail(self, node: AssetNode) -> None:
+        assert self._character is not None
+        blueprint = self._character.blueprints.get(node.item_id)
+        if blueprint is None:  # only blueprint leaves carry data, but guard anyway
+            return
+        name = self._character.names.get(node.type_id, str(node.type_id))
+        self.app.push_screen(BlueprintInfoScreen(name, node, blueprint))
 
     def _skill_name(self, skill_id: int, info: SkillReference | None) -> str:
         if info is not None:
@@ -776,7 +892,14 @@ class TradingScreen(Screen[None]):
         Skipped when the skill set is unchanged, so a periodic refresh leaves the
         tree (and the user's expand/collapse state) untouched.
         """
-        key = tuple(sorted((s.skill_id, s.trained_skill_level) for s in report.skills))
+        # Rebuild when the trained set changes, or the queue's shape does (so the
+        # queued-skill highlight tracks queue edits) — but not on continuous SP, which
+        # would collapse the tree every tick.
+        trained_key = tuple(sorted((s.skill_id, s.trained_skill_level) for s in report.skills))
+        queue_key = tuple(
+            sorted((e.skill_id, e.finished_level, e.queue_position) for e in report.skill_queue)
+        )
+        key = (trained_key, queue_key)
         if key == self._skills_key:
             return
         self._skills_key = key
@@ -797,7 +920,14 @@ class TradingScreen(Screen[None]):
             branch = tree.root.add(group, expand=True)
             for skill in sorted(grouped[group], key=lambda s: display_name(s).lower()):
                 label = Text(f"{display_name(skill)}  ")
-                label.append(_level_dots(skill.trained_skill_level), style="cyan")
+                label.append_text(
+                    _skill_queue_pips(
+                        skill.skill_id,
+                        skill.trained_skill_level,
+                        report.skill_queue,
+                        report.captured_at,
+                    )
+                )
                 branch.add_leaf(label, data=skill.skill_id)
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -831,7 +961,7 @@ class TradingScreen(Screen[None]):
 
     def _add_asset_children(
         self,
-        parent: TreeNode[None],
+        parent: TreeNode[AssetNode],
         children: tuple[AssetNode, ...],
         report: CharacterReport,
         *,
@@ -872,7 +1002,7 @@ class TradingScreen(Screen[None]):
 
     def _add_asset_node(
         self,
-        parent: TreeNode[None],
+        parent: TreeNode[AssetNode],
         item: AssetNode,
         report: CharacterReport,
         *,
@@ -893,8 +1023,13 @@ class TradingScreen(Screen[None]):
             label.append(name, style="bold" if item.children else "")
         if item.quantity > 1:
             label.append(f"  ×{item.quantity:,}", style="cyan")  # noqa: RUF001 (multiplier)
+        # Blueprints are the only items with a detail popup; tag them (BPO/BPC) so it's
+        # clear which rows open one, and only they carry data so only they respond.
+        blueprint = report.blueprints.get(item.item_id) if not item.children else None
+        if blueprint is not None:
+            label.append(f"  {'BPO' if blueprint.runs == -1 else 'BPC'}", style="magenta")
         if not item.children:
-            parent.add_leaf(label)
+            parent.add_leaf(label, data=item if blueprint is not None else None)
             return
         node = parent.add(label, expand=bool(query))
         # A container/ship matched by name reveals everything inside it.

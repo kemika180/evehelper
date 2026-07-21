@@ -16,6 +16,7 @@ from evetrader.esi.client import EsiClient
 from evetrader.esi.models import (
     Asset,
     AssetName,
+    Blueprint,
     CharacterOrder,
     CharacterSkills,
     Corporation,
@@ -32,6 +33,7 @@ from evetrader.esi.models import (
 _WALLET = TypeAdapter(float)
 _ASSETS = TypeAdapter(list[Asset])
 _ASSET_NAMES = TypeAdapter(list[AssetName])
+_BLUEPRINTS = TypeAdapter(list[Blueprint])
 _CHARACTER_ORDERS = TypeAdapter(list[CharacterOrder])
 _MARKET_ORDERS = TypeAdapter(list[MarketOrder])
 _MARKET_HISTORY = TypeAdapter(list[MarketHistoryDay])
@@ -58,6 +60,14 @@ async def fetch_asset_names(
         f"/characters/{character_id}/assets/names/", body=list(item_ids), token=token
     )
     return _ASSET_NAMES.validate_json(body)
+
+
+async def fetch_blueprints(
+    client: EsiClient, character_id: int, token: str
+) -> list[Blueprint]:
+    """The character's blueprints (ME/TE, runs, original vs copy), paged like assets."""
+    pages = await client.get_all_pages(f"/characters/{character_id}/blueprints/", token=token)
+    return [bp for page in pages for bp in _BLUEPRINTS.validate_json(page)]
 
 
 async def fetch_open_orders(

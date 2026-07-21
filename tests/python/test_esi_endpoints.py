@@ -12,6 +12,7 @@ from evetrader.config import Config, HomeMarket, RiskPreferences
 from evetrader.esi.client import EsiClient
 from evetrader.esi.endpoints import (
     fetch_assets,
+    fetch_blueprints,
     fetch_corporation,
     fetch_location,
     fetch_market_history,
@@ -111,6 +112,31 @@ def test_fetch_assets_concatenates_pages() -> None:
     async def body(client: EsiClient, _: dict[str, str | None]) -> None:
         assets = await fetch_assets(client, 42, token="tok")
         assert [a.quantity for a in assets] == [1, 2, 3]
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_fetch_blueprints_authenticates_and_pages() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("Authorization") == "Bearer tok"
+        page = int(request.url.params.get("page", "1"))
+        blueprint = {
+            "item_id": 1000 + page,
+            "type_id": 938,
+            "location_id": 60003760,
+            "location_flag": "Hangar",
+            "quantity": -2,
+            "material_efficiency": 10,
+            "time_efficiency": 20,
+            "runs": page,
+        }
+        return httpx.Response(200, json=[blueprint], headers={"X-Pages": "2", "Expires": _FUTURE})
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        blueprints = await fetch_blueprints(client, 42, token="tok")
+        assert [bp.runs for bp in blueprints] == [1, 2]
+        assert blueprints[0].material_efficiency == 10
+        assert blueprints[0].time_efficiency == 20
 
     _run(body, httpx.MockTransport(handler))
 
