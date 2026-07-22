@@ -5,12 +5,52 @@ from datetime import UTC, datetime
 import polars as pl
 
 from evetrader.data.market import (
+    best_ask_prices,
     build_market_snapshot,
     history_to_frame,
     orders_frame_from_pages,
     orders_to_frame,
 )
 from evetrader.esi.models import MarketHistoryDay, MarketOrder
+
+
+def _typed_order(
+    order_id: int, type_id: int, location_id: int, *, is_buy: bool, price: float
+) -> MarketOrder:
+    return MarketOrder.model_validate(
+        {
+            "order_id": order_id,
+            "type_id": type_id,
+            "location_id": location_id,
+            "system_id": 30000142,
+            "is_buy_order": is_buy,
+            "price": price,
+            "volume_remain": 10,
+            "volume_total": 20,
+            "min_volume": 1,
+            "range": "region",
+            "duration": 90,
+            "issued": "2020-01-01T00:00:00Z",
+        }
+    )
+
+
+def test_best_ask_prices_takes_lowest_sell_per_type_at_the_station() -> None:
+    frame = orders_to_frame(
+        [
+            _typed_order(1, 34, 60003760, is_buy=False, price=700.0),
+            _typed_order(2, 34, 60003760, is_buy=False, price=650.0),  # lower ask wins
+            _typed_order(3, 34, 60003760, is_buy=True, price=800.0),  # a buy order, ignored
+            _typed_order(4, 35, 60003760, is_buy=False, price=1400.0),
+            _typed_order(5, 34, 99999999, is_buy=False, price=1.0),  # other station, ignored
+        ]
+    )
+    assert best_ask_prices(frame, 60003760) == {34: 650.0, 35: 1400.0}
+
+
+def test_best_ask_prices_empty_without_sell_orders() -> None:
+    frame = orders_to_frame([_typed_order(1, 34, 60003760, is_buy=True, price=700.0)])
+    assert best_ask_prices(frame, 60003760) == {}
 
 
 def _order(order_id: int, *, is_buy: bool, price: float) -> MarketOrder:

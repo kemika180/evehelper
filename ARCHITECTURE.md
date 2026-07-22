@@ -179,13 +179,20 @@ rough order:
     cost, invention success chance). Item names the product for manufacturing/invention/
     reactions, the blueprint for research/copying. Facilities are named via the same
     resolvable/structure-cache path as asset places. SDE-free.
-  - **Build-vs-buy engine** — NEXT (increment 2). Compare a recipe's input cost (buy
-    materials) against the product's sell value to flag worthwhile builds. This is the
-    slice that finally **brings the SDE forward** (bill-of-materials + product) — a
-    separate design task (how to source/bundle the SDE, à la the checked-in
-    `skills.json`). Build it as a **shared, generic pure-core component** (bill-of-
-    materials in → input cost vs output value out), *not* baked into crafting, because
-    **PI reuses the same comparison** for its P0→P4 chains.
+  - ~~Build-vs-buy engine~~ — DONE (increment 2). A "Manufacturing" tab ranks owned
+    blueprints by margin, and the blueprint popup shows a per-run build-vs-buy block;
+    both priced against **Jita** (`config.reference_market`, The Forge / Jita 4-4),
+    independent of where the character is docked. The pure `market/production.py`
+    engine (`analyze_build` → `BuildAnalysis`, ME-adjusted material cost vs fee-adjusted
+    sale value) is a **shared, generic component** — `Recipe` is activity-agnostic, so
+    reactions and PI feed their own recipes through the same engine. It brought the SDE
+    forward: `evetrader sde` downloads the Fuzzwork SQLite (gitignored), `data/sde.py`
+    reads a blueprint's bill of materials, and the pipeline prices materials/product
+    from the reference region's sell orders (`data/market.best_ask_prices`) — no new
+    keystroke ESI calls, computed in the market phase. Reactions and invention are
+    future increments on the same engine (invention needs a probability/expected-value
+    extension). Documented simplifications: material formula ignores structure/rig
+    bonuses; the character's home-station broker fee is used for the (Jita) sale.
 - **PI (planetary interaction)** tracking & assistance. Self-contained (colony setups,
   extractors); its profitability view consumes the same build-vs-buy engine above.
 - **Hauling / regional arbitrage** (Jita ↔ your hub) — **after** crafting/PI, because

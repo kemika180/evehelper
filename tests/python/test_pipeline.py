@@ -2,12 +2,14 @@
 
 import asyncio
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from evetrader.config import Config, HomeMarket, InvestmentParams, RiskPreferences
+from evetrader.data.sde import SdeDatabase
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
@@ -221,6 +223,24 @@ def _handler(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"unexpected {path}")
 
 
+def _make_recipe_sde(path: Path) -> None:
+    """A minimal SDE where the owned blueprint (type _UNDERVALUED) manufactures
+    _HELD_DEAR from one unit of _UNDERVALUED — both priced by the mock order book."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE industryActivityProducts "
+        "(typeID INT, activityID INT, productTypeID INT, quantity INT)"
+    )
+    conn.execute(
+        "CREATE TABLE industryActivityMaterials "
+        "(typeID INT, activityID INT, materialTypeID INT, quantity INT)"
+    )
+    conn.execute("INSERT INTO industryActivityProducts VALUES (?, 1, ?, 1)", (_UNDERVALUED, _HELD_DEAR))
+    conn.execute("INSERT INTO industryActivityMaterials VALUES (?, 1, ?, 1)", (_UNDERVALUED, _UNDERVALUED))
+    conn.commit()
+    conn.close()
+
+
 def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
     async def go() -> None:
         transport = httpx.MockTransport(_handler)
@@ -246,11 +266,26 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             # A player structure is named via /universe/structures + its system name.
             assert character.names[_STRUCTURE] == "V-3YG7 Fortizar · V-3YG7"
 
-            report = await fetch_opportunities(client, _config(), character, home, name_cache)
+            sde_path = tmp_path / "sde.sqlite"
+            _make_recipe_sde(sde_path)
+            sde = SdeDatabase(sde_path)
+            report = await fetch_opportunities(
+                client, _config(), character, home, name_cache, sde
+            )
             assert [s.type_id for s in report.buys] == [_UNDERVALUED]
             assert [(s.type_id, s.quantity) for s in report.sells] == [(_HELD_DEAR, 10)]
             assert report.names[_UNDERVALUED] == "Tritanium"
             # History for signalled items is retained for plotting.
             assert _UNDERVALUED in report.history and len(report.history[_UNDERVALUED]) == 4
+
+            # Build-vs-buy: the owned blueprint's product is priced at Jita and ranked.
+            assert len(report.builds) == 1
+            build = report.builds[0]
+            assert build.blueprint_type_id == _UNDERVALUED
+            assert build.product_type_id == _HELD_DEAR
+            assert build.analysis.priced
+            assert build.analysis.verdict == "BUILD"
+            assert report.names[_HELD_DEAR] == "Pyerite"  # product name resolved
+            sde.close()
 
     asyncio.run(go())

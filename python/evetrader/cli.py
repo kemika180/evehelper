@@ -17,6 +17,7 @@ import httpx
 
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
+from evetrader.data.sde import SdeDatabase, SdeError
 from evetrader.data.sde_download import download_sde
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
@@ -44,6 +45,16 @@ class _Resources:
     client: EsiClient
     authenticator: Authenticator
     name_cache: NameCache
+    sde: SdeDatabase | None
+
+
+def _load_sde() -> SdeDatabase | None:
+    """The local SDE if it's been downloaded, else None — build-vs-buy is optional and
+    the rest of the app runs without it."""
+    try:
+        return SdeDatabase(sde_path())
+    except SdeError:
+        return None
 
 
 def _build_resources(config: Config) -> _Resources:
@@ -54,6 +65,7 @@ def _build_resources(config: Config) -> _Resources:
         client=client,
         authenticator=Authenticator(config, http, KeyringTokenStore()),
         name_cache=NameCache(default_data_dir() / "names.json", client),
+        sde=_load_sde(),
     )
 
 
@@ -107,7 +119,7 @@ def _run_tui(config: Config) -> None:
 
         async def opportunities(report: CharacterReport) -> OpportunityReport:
             return await fetch_opportunities(
-                resources.client, config, report, home, resources.name_cache
+                resources.client, config, report, home, resources.name_cache, resources.sde
             )
 
         return RefreshFeed(character=character, opportunities=opportunities)

@@ -51,6 +51,7 @@ from evetrader.esi.models import (
     SkillQueueEntry,
 )
 from evetrader.market.investment import InvestmentSignal
+from evetrader.market.production import BuildAnalysis
 from evetrader.pipeline import CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
@@ -626,11 +627,18 @@ class BlueprintInfoScreen(ModalScreen[None]):
     BlueprintInfoScreen #bphint { padding: 1 0 0 0; color: $text-muted; }
     """
 
-    def __init__(self, name: str, node: AssetNode, blueprint: Blueprint) -> None:
+    def __init__(
+        self,
+        name: str,
+        node: AssetNode,
+        blueprint: Blueprint,
+        build: BuildAnalysis | None = None,
+    ) -> None:
         super().__init__()
         self._name = name
         self._node = node
         self._blueprint = blueprint
+        self._build = build
 
     def compose(self) -> ComposeResult:
         with Vertical(id="bpbox"):
@@ -661,7 +669,28 @@ class BlueprintInfoScreen(ModalScreen[None]):
             text.append(f"{blueprint.runs:,} runs remaining\n", style="dim")
         if self._node.quantity > 1:
             text.append(f"stack of {self._node.quantity:,}\n", style="dim")
+        if self._build is not None:
+            _append_build(text, self._build)
         return text
+
+
+def _append_build(text: Text, build: BuildAnalysis) -> None:
+    """The build-vs-buy block: material cost vs Jita sale value, per run."""
+    text.append("\nBuild vs buy — per run (Jita)\n", style="bold")
+    text.append(f"  materials   {_isk(build.material_cost)}\n", style="dim")
+    text.append(f"  sell value  {_isk(build.net_product_value)}  after fees\n", style="dim")
+    positive = build.margin > 0
+    colour = "green" if positive else "yellow"
+    prefix = "+" if positive else ""
+    line = f"  margin      {prefix}{_isk(build.margin)}"
+    if build.margin_fraction is not None:
+        line += f"  ({build.margin_fraction:+.0%})"
+    text.append(f"{line}\n", style=colour)
+    if not build.priced:
+        missing = len(build.missing_material_prices)
+        text.append(f"  no Jita price for {missing} material(s) — margin partial\n", style="yellow")
+    else:
+        text.append(f"  → {build.verdict}\n", style=f"bold {colour}")
 
 
 class IndustryJobScreen(ModalScreen[None]):
@@ -754,7 +783,8 @@ class TradingScreen(Screen[None]):
     }
     TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
     TradingScreen #buys, TradingScreen #sells, TradingScreen #skillqueue,
-    TradingScreen #skilltree, TradingScreen #assettree, TradingScreen #industry {
+    TradingScreen #skilltree, TradingScreen #assettree, TradingScreen #industry,
+    TradingScreen #manufacturing {
         margin: 0 1;
         height: 1fr;
     }
@@ -798,6 +828,8 @@ class TradingScreen(Screen[None]):
                 yield DepthTree[AssetNode]("Assets", id="assettree")
             with TabPane("Industry", id="industry-tab"):
                 yield DataTable(id="industry", zebra_stripes=True, cursor_type="row")
+            with TabPane("Manufacturing", id="manufacturing-tab"):
+                yield DataTable(id="manufacturing", zebra_stripes=True, cursor_type="row")
         yield Footer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -883,7 +915,14 @@ class TradingScreen(Screen[None]):
         if blueprint is None:  # only blueprint leaves carry data, but guard anyway
             return
         name = self._character.names.get(node.type_id, str(node.type_id))
-        self.app.push_screen(BlueprintInfoScreen(name, node, blueprint))
+        # Attach the build-vs-buy analysis if the market phase has produced one.
+        build: BuildAnalysis | None = None
+        if self._report is not None:
+            match = next(
+                (b for b in self._report.builds if b.blueprint_item_id == node.item_id), None
+            )
+            build = match.analysis if match is not None else None
+        self.app.push_screen(BlueprintInfoScreen(name, node, blueprint, build))
 
     def _skill_name(self, skill_id: int, info: SkillReference | None) -> str:
         if info is not None:
@@ -901,6 +940,9 @@ class TradingScreen(Screen[None]):
         self.query_one("#skillqueue", DataTable).add_columns("Skill", "Time left", "Completion")
         self.query_one("#industry", DataTable).add_columns(
             "Activity", "Item", "Runs", "Time left", "Where"
+        )
+        self.query_one("#manufacturing", DataTable).add_columns(
+            "Product", "ME", "Materials", "Sell (net)", "Margin", ""
         )
         self.run_worker(self._refresh(), exclusive=True)
         self.set_interval(self._interval, self._refresh)
@@ -933,6 +975,7 @@ class TradingScreen(Screen[None]):
         self._report = report
         self._render_buys(report)
         self._render_sells(report)
+        self._render_builds(report)
         status.update(f"{len(report.buys)} to buy · {len(report.sells)} to sell — updated")
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
@@ -982,6 +1025,32 @@ class TradingScreen(Screen[None]):
                 Text(_isk(signal.expected_profit), justify="right", style="bold yellow"),
                 Text(signal.reasoning, style="dim"),
                 key=str(signal.type_id),
+            )
+
+    def _render_builds(self, report: OpportunityReport) -> None:
+        """Owned blueprints ranked by Jita build margin (per run); BUILD rows in green,
+        partial rows (a material with no Jita price) flagged."""
+        table = self.query_one("#manufacturing", DataTable)
+        table.clear()
+        for build in report.builds:
+            analysis = build.analysis
+            name = report.names.get(build.product_type_id, str(build.product_type_id))
+            positive = analysis.margin > 0
+            margin_style = "green" if positive else "yellow"
+            if not analysis.priced:
+                verdict, verdict_style = "partial", "yellow"
+            else:
+                verdict = analysis.verdict
+                verdict_style = "bold green" if verdict == "BUILD" else "dim"
+            margin_text = f"{'+' if positive else ''}{_isk(analysis.margin)}"
+            table.add_row(
+                Text(name, style="bold" if verdict == "BUILD" else ""),
+                Text(f"ME {build.material_efficiency}", justify="right", style="dim"),
+                Text(_isk(analysis.material_cost), justify="right"),
+                Text(_isk(analysis.net_product_value), justify="right", style="dim"),
+                Text(margin_text, justify="right", style=margin_style),
+                Text(verdict, style=verdict_style),
+                key=str(build.blueprint_item_id),
             )
 
     def _render_training(self, report: CharacterReport) -> None:

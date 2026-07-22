@@ -74,6 +74,19 @@ def orders_frame_from_pages(pages: list[bytes]) -> pl.DataFrame:
     )
 
 
+def best_ask_prices(orders: pl.DataFrame, station_id: int) -> dict[int, float]:
+    """Lowest sell-order (ask) price per type at one station — the price you'd pay to
+    buy each type there. Pure: a plain reduction over an order frame."""
+    asks = orders.filter((pl.col("location_id") == station_id) & (~pl.col("is_buy_order")))
+    if asks.is_empty():
+        return {}
+    grouped = asks.group_by("type_id").agg(pl.col("price").min().alias("ask"))
+    return {
+        int(type_id): float(ask)
+        for type_id, ask in zip(grouped["type_id"], grouped["ask"], strict=True)
+    }
+
+
 def history_to_frame(history_by_type: dict[int, list[MarketHistoryDay]]) -> pl.DataFrame:
     rows = [
         {"type_id": type_id, **day.model_dump()}

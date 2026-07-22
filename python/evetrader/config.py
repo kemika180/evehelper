@@ -94,6 +94,13 @@ class Config(BaseModel):
     default_home: HomeMarket
     # Per-character home markets, keyed by character name.
     homes: dict[str, HomeMarket] = Field(default_factory=dict)
+    # Reference market for build-vs-buy pricing — Jita (The Forge) by default, the
+    # canonical price hub, independent of where a character is docked.
+    reference_market: HomeMarket = Field(
+        default_factory=lambda: HomeMarket(
+            region_id=10_000_002, station_id=60_003_760, label="Jita IV - Moon 4 - CNAP"
+        )
+    )
     # Total ISK available to allocate across all suggested orders.
     total_capital_isk: float = Field(gt=0.0)
     # Type ids to always analyse for station trading (in addition to discovery).

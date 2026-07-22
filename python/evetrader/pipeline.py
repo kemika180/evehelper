@@ -17,7 +17,8 @@ from evetrader.advisor.state import CharacterState
 from evetrader.config import Config, HomeMarket
 from evetrader.data.assets import AssetLocation, build_asset_tree, nameable_item_ids
 from evetrader.data.character import build_character_state
-from evetrader.data.market import history_to_frame, orders_frame_from_pages
+from evetrader.data.market import best_ask_prices, history_to_frame, orders_frame_from_pages
+from evetrader.data.sde import SdeDatabase
 from evetrader.data.skills import SkillReference, load_skills
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
@@ -40,6 +41,7 @@ from evetrader.esi.models import (
     SkillQueueEntry,
 )
 from evetrader.market.investment import InvestmentSignal, find_opportunities, liquid_types
+from evetrader.market.production import BuildAnalysis, analyze_build
 
 # Bounded concurrency for the per-type history fetches.
 _MAX_CONCURRENT_HISTORY = 8
@@ -70,6 +72,19 @@ class CharacterReport:
 
 
 @dataclass(frozen=True)
+class BuildOpportunity:
+    """A build-vs-buy result for one owned blueprint, priced against the reference
+    market (Jita). Per single run, so two copies of a type with different ME rank
+    separately."""
+
+    blueprint_item_id: int
+    blueprint_type_id: int
+    product_type_id: int
+    material_efficiency: int
+    analysis: BuildAnalysis
+
+
+@dataclass(frozen=True)
 class OpportunityReport:
     """Slow phase: value suggestions split into buys and sells of holdings."""
 
@@ -79,6 +94,9 @@ class OpportunityReport:
     # Daily history for the signalled types, retained so a selected row can be
     # plotted without a fresh (keystroke-triggered) ESI call.
     history: dict[int, list[MarketHistoryDay]]
+    # Build-vs-buy for owned blueprints, ranked by margin (empty if the SDE isn't
+    # installed or no owned blueprint is manufacturable).
+    builds: list[BuildOpportunity]
 
 
 def _utc_now() -> datetime:
@@ -200,12 +218,72 @@ async def _histories(
     return {type_id: days for type_id, days in results if days}
 
 
+async def _reference_ask_prices(
+    client: EsiClient, reference: HomeMarket, type_ids: set[int]
+) -> dict[int, float]:
+    """Lowest sell price at the reference market (Jita) for each wanted type. Fetches
+    only the sell side of the reference region's book (asks) — half the pages."""
+    if not type_ids:
+        return {}
+    pages = await client.get_all_pages(
+        f"/markets/{reference.region_id}/orders/", params={"order_type": "sell"}
+    )
+    asks = best_ask_prices(orders_frame_from_pages(pages), reference.station_id)
+    return {type_id: asks[type_id] for type_id in type_ids if type_id in asks}
+
+
+async def _build_opportunities(
+    client: EsiClient, config: Config, character: CharacterReport, sde: SdeDatabase
+) -> list[BuildOpportunity]:
+    """Build-vs-buy for each owned, manufacturable blueprint, priced at the reference
+    market. Per single run; ranked by margin (best first)."""
+    recipes = [
+        (item_id, blueprint, recipe)
+        for item_id, blueprint in character.blueprints.items()
+        if (recipe := sde.manufacturing_recipe(blueprint.type_id)) is not None
+    ]
+    if not recipes:
+        return []
+
+    wanted = {recipe.product_type_id for _, _, recipe in recipes}
+    wanted |= {material.type_id for _, _, recipe in recipes for material in recipe.materials}
+    ask = await _reference_ask_prices(client, config.reference_market, wanted)
+
+    fees = character.character.fees  # home-station fees; sales tax is skill-based, broker approx
+    builds: list[BuildOpportunity] = []
+    for item_id, blueprint, recipe in recipes:
+        product_price = ask.get(recipe.product_type_id)
+        if product_price is None:
+            continue  # the product doesn't sell at the reference market — can't value it
+        material_prices = {m.type_id: ask[m.type_id] for m in recipe.materials if m.type_id in ask}
+        analysis = analyze_build(
+            recipe,
+            material_efficiency=blueprint.material_efficiency,
+            material_prices=material_prices,
+            product_price=product_price,
+            sales_tax=fees.sales_tax,
+            broker_fee=fees.broker_fee,
+        )
+        builds.append(
+            BuildOpportunity(
+                blueprint_item_id=item_id,
+                blueprint_type_id=blueprint.type_id,
+                product_type_id=recipe.product_type_id,
+                material_efficiency=blueprint.material_efficiency,
+                analysis=analysis,
+            )
+        )
+    builds.sort(key=lambda build: build.analysis.margin, reverse=True)
+    return builds
+
+
 async def fetch_opportunities(
     client: EsiClient,
     config: Config,
     character: CharacterReport,
     home: HomeMarket,
     name_cache: NameCache,
+    sde: SdeDatabase | None = None,
 ) -> OpportunityReport:
     """Scan the home market, then find undervalued buys and overvalued holdings."""
     pages = await client.get_all_pages(
@@ -234,9 +312,13 @@ async def fetch_opportunities(
         min_daily_isk_volume=config.risk.min_daily_isk_volume,
         max_capital_per_item=config.risk.max_capital_per_order_isk,
     )
+    builds = await _build_opportunities(client, config, character, sde) if sde is not None else []
+
     buys = [signal for signal in signals if signal.action == "BUY"]
     sells = [signal for signal in signals if signal.action == "SELL"]
-    names = await name_cache.resolve([signal.type_id for signal in signals])
+    name_ids = [signal.type_id for signal in signals]
+    name_ids += [build.product_type_id for build in builds]
+    names = await name_cache.resolve(name_ids)
     signalled = {signal.type_id for signal in signals}
     window = config.investment.window_days
     retained = {
@@ -244,4 +326,6 @@ async def fetch_opportunities(
         for type_id in signalled
         if type_id in history
     }
-    return OpportunityReport(buys=buys, sells=sells, names=names, history=retained)
+    return OpportunityReport(
+        buys=buys, sells=sells, names=names, history=retained, builds=builds
+    )

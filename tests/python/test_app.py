@@ -21,7 +21,8 @@ from evetrader.esi.models import (
 )
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import InvestmentSignal
-from evetrader.pipeline import CharacterReport, OpportunityReport
+from evetrader.market.production import BuildAnalysis
+from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
     BlueprintInfoScreen,
@@ -302,8 +303,23 @@ def _opportunity_report() -> OpportunityReport:
     return OpportunityReport(
         buys=[_signal(34, "BUY", current=700.0, fair=1000.0, position=0.05)],
         sells=[_signal(35, "SELL", current=1300.0, fair=1000.0, position=0.95)],
-        names={34: "Tritanium", 35: "Pyerite"},
+        names={34: "Tritanium", 35: "Pyerite", 587: "Rifter"},
         history={34: _history_days(), 35: _history_days()},
+        builds=[
+            BuildOpportunity(  # the owned Rifter Blueprint (item 13) builds at a profit
+                blueprint_item_id=13,
+                blueprint_type_id=938,
+                product_type_id=587,
+                material_efficiency=10,
+                analysis=BuildAnalysis(
+                    runs=1,
+                    material_cost=1_200_000.0,
+                    product_value=1_850_000.0,
+                    net_product_value=1_800_000.0,
+                    missing_material_prices=(),
+                ),
+            )
+        ],
     )
 
 
@@ -937,7 +953,38 @@ def test_selecting_a_blueprint_asset_opens_its_detail(tmp_path: Path) -> None:
             assert "Rifter Blueprint" in body
             assert "Blueprint Copy (BPC)" in body
             assert "42 runs remaining" in body
+            # The market phase has produced a build-vs-buy analysis for this blueprint.
+            assert "Build vs buy" in body
+            assert "BUILD" in body
             await pilot.press("escape")
+
+    asyncio.run(_drive())
+
+
+def test_manufacturing_tab_ranks_owned_blueprints(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "manufacturing-tab"
+            await pilot.pause()
+            table = trading.query_one("#manufacturing", DataTable)
+            assert table.row_count == 1
+            row = table.get_row_at(0)
+            assert "Rifter" in str(row[0])  # product name
+            assert "BUILD" in str(row[5])  # profitable -> BUILD
+            await pilot.press("q")
 
     asyncio.run(_drive())
 
