@@ -26,6 +26,7 @@ from textual.color import Color
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
+    Button,
     DataTable,
     Footer,
     Header,
@@ -52,7 +53,7 @@ from evetrader.esi.models import (
 )
 from evetrader.market.investment import InvestmentSignal
 from evetrader.market.production import BuildAnalysis
-from evetrader.pipeline import CharacterReport, OpportunityReport
+from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
 
@@ -418,6 +419,9 @@ FetchCharacter = Callable[[], Awaitable[CharacterReport]]
 FetchOpportunities = Callable[[CharacterReport], Awaitable[OpportunityReport]]
 LoginFn = Callable[[], Awaitable[CharacterIdentity]]
 RemoveTokenFn = Callable[[int], None]
+# Download the SDE (in the background) and make it available; True on success. None
+# when the host didn't wire it (e.g. tests) — the download button is hidden then.
+DownloadSdeFn = Callable[[], Awaitable[bool]]
 
 
 @dataclass
@@ -678,6 +682,9 @@ def _append_build(text: Text, build: BuildAnalysis) -> None:
     """The build-vs-buy block: material cost vs Jita sale value, per run."""
     text.append("\nBuild vs buy — per run (Jita)\n", style="bold")
     text.append(f"  materials   {_isk(build.material_cost)}\n", style="dim")
+    if not build.product_priced:
+        text.append("  product not sold at Jita — value unknown\n", style="yellow")
+        return
     text.append(f"  sell value  {_isk(build.net_product_value)}  after fees\n", style="dim")
     positive = build.margin > 0
     colour = "green" if positive else "yellow"
@@ -686,7 +693,7 @@ def _append_build(text: Text, build: BuildAnalysis) -> None:
     if build.margin_fraction is not None:
         line += f"  ({build.margin_fraction:+.0%})"
     text.append(f"{line}\n", style=colour)
-    if not build.priced:
+    if build.missing_material_prices:
         missing = len(build.missing_material_prices)
         text.append(f"  no Jita price for {missing} material(s) — margin partial\n", style="yellow")
     else:
@@ -755,6 +762,64 @@ class IndustryJobScreen(ModalScreen[None]):
         return text
 
 
+class MaterialsScreen(ModalScreen[None]):
+    """The bill of materials for one build: each input, its ME-adjusted quantity (per
+    run), unit Jita price, and line cost."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        ("q", "dismiss", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    MaterialsScreen { align: center middle; }
+    MaterialsScreen #matbox {
+        width: 72;
+        height: auto;
+        max-height: 90%;
+        overflow-y: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    MaterialsScreen #mathint { padding: 1 0 0 0; color: $text-muted; }
+    """
+
+    def __init__(self, title: str, build: BuildOpportunity, names: dict[int, str]) -> None:
+        super().__init__()
+        self._title = title
+        self._build = build
+        self._names = names
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="matbox"):
+            yield Static(self._body(), id="matbody")
+            yield Static("click or esc to close", id="mathint")
+
+    def on_click(self) -> None:
+        self.dismiss()
+
+    def _body(self) -> Text:
+        analysis = self._build.analysis
+        text = Text()
+        text.append(f"{self._title}\n", style="bold")
+        text.append(f"ME {self._build.material_efficiency}  ·  materials per run\n", style="dim")
+        text.append(f"build cost  {_isk(analysis.material_cost)}\n", style="cyan")
+        if analysis.missing_material_prices:
+            missing = len(analysis.missing_material_prices)
+            text.append(f"{missing} material(s) not priced at Jita\n", style="yellow")
+        text.append("\n")
+        for line in analysis.materials:
+            name = self._names.get(line.type_id, str(line.type_id))
+            if len(name) > 28:
+                name = name[:27] + "…"
+            cost = _isk(line.line_cost) if line.line_cost is not None else "—"
+            row = f"{line.quantity:>10,}  {name:<28} {cost:>10}"
+            text.append(f"{row}\n", style="" if line.line_cost is not None else "dim")
+        return text
+
+
 class TradingScreen(Screen[None]):
     """Per-character advisor view: opportunities plus character and skill-queue."""
 
@@ -789,19 +854,33 @@ class TradingScreen(Screen[None]):
         height: 1fr;
     }
     TradingScreen #assetsearch { margin: 0 1; }
+    TradingScreen #manufacturing-hint { padding: 0 2; color: $text-muted; }
+    TradingScreen #download-sde { margin: 0 2; }
+    TradingScreen #manufacturing-search { margin: 0 1; }
     """
 
-    def __init__(self, feed: RefreshFeed, interval_seconds: int) -> None:
+    def __init__(
+        self,
+        feed: RefreshFeed,
+        interval_seconds: int,
+        download_sde_fn: DownloadSdeFn | None = None,
+    ) -> None:
         super().__init__()
         self._feed = feed
         self._interval = interval_seconds
+        self._download_sde_fn = download_sde_fn
         self._report: OpportunityReport | None = None
         self._character: CharacterReport | None = None
-        # Signatures of the data last drawn into each tree, so a periodic refresh
-        # doesn't rebuild them (and collapse the user's expansions) when unchanged.
+        # Signatures of the data last drawn into each view, so a periodic refresh
+        # doesn't rebuild it (resetting cursor/scroll/expansions) when unchanged.
         self._skills_key: object | None = None
         self._assets_key: object | None = None
+        self._buys_key: object | None = None
+        self._sells_key: object | None = None
+        self._builds_key: object | None = None
         self._asset_query: str = ""
+        self._mfg_query: str = ""
+        self._mfg_sort: tuple[int, bool] = (4, True)  # Manufacturing: margin, descending
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -829,6 +908,10 @@ class TradingScreen(Screen[None]):
             with TabPane("Industry", id="industry-tab"):
                 yield DataTable(id="industry", zebra_stripes=True, cursor_type="row")
             with TabPane("Manufacturing", id="manufacturing-tab"):
+                yield Static("", id="manufacturing-hint")
+                if self._download_sde_fn is not None:
+                    yield Button("⬇ Download / update SDE", id="download-sde", compact=True)
+                yield Input(placeholder="Search products…", id="manufacturing-search")
                 yield DataTable(id="manufacturing", zebra_stripes=True, cursor_type="row")
         yield Footer()
 
@@ -838,6 +921,9 @@ class TradingScreen(Screen[None]):
             return
         if event.data_table.id == "industry":
             self._open_industry_job(event)
+            return
+        if event.data_table.id == "manufacturing":
+            self._open_materials(event)
             return
         if self._report is None or event.row_key.value is None:
             return
@@ -864,6 +950,16 @@ class TradingScreen(Screen[None]):
         self.app.push_screen(
             SkillInfoScreen(name, info, entry=entry, reference=self._character.captured_at)
         )
+
+    def _open_materials(self, event: DataTable.RowSelected) -> None:
+        if self._report is None or event.row_key.value is None:
+            return
+        item_id = int(event.row_key.value)
+        build = next((b for b in self._report.builds if b.blueprint_item_id == item_id), None)
+        if build is None:
+            return
+        name = self._report.names.get(build.product_type_id, str(build.product_type_id))
+        self.app.push_screen(MaterialsScreen(name, build, self._report.names))
 
     def _open_industry_job(self, event: DataTable.RowSelected) -> None:
         if self._character is None or event.row_key.value is None:
@@ -996,6 +1092,10 @@ class TradingScreen(Screen[None]):
         self._set_tile("#stat-broker", "BROKER FEE", f"{fees.broker_fee:.2%}", "bold yellow")
 
     def _render_buys(self, report: OpportunityReport) -> None:
+        key = tuple(report.buys)  # frozen signals -> compares by value; skip if unchanged
+        if key == self._buys_key:
+            return
+        self._buys_key = key
         table = self.query_one("#buys", DataTable)
         table.clear()
         for index, signal in enumerate(report.buys):
@@ -1012,6 +1112,10 @@ class TradingScreen(Screen[None]):
             )
 
     def _render_sells(self, report: OpportunityReport) -> None:
+        key = tuple(report.sells)
+        if key == self._sells_key:
+            return
+        self._sells_key = key
         table = self.query_one("#sells", DataTable)
         table.clear()
         for signal in report.sells:
@@ -1027,31 +1131,111 @@ class TradingScreen(Screen[None]):
                 key=str(signal.type_id),
             )
 
+    def _sorted_builds(self, report: OpportunityReport) -> list[tuple[BuildOpportunity, int]]:
+        """Owned builds as (build, copies-owned), filtered by the product search and
+        ordered by the active column sort (default: margin, descending). Copies of a
+        blueprint at the same research level are identical, so they collapse to one row
+        carrying the count."""
+        query = self._mfg_query.strip().lower()
+
+        def product(build: BuildOpportunity) -> str:
+            return report.names.get(build.product_type_id, str(build.product_type_id))
+
+        counts: dict[tuple[int, int], int] = {}
+        for build in report.builds:
+            row_id = (build.blueprint_type_id, build.material_efficiency)
+            counts[row_id] = counts.get(row_id, 0) + 1
+
+        rows: list[tuple[BuildOpportunity, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for build in report.builds:
+            row_id = (build.blueprint_type_id, build.material_efficiency)
+            if row_id in seen or query not in product(build).lower():
+                continue
+            seen.add(row_id)
+            rows.append((build, counts[row_id]))
+
+        column, reverse = self._mfg_sort
+        if column == 0:
+            rows.sort(key=lambda row: product(row[0]).lower(), reverse=reverse)
+        elif column == 1:
+            rows.sort(key=lambda row: row[0].material_efficiency, reverse=reverse)
+        elif column == 2:
+            rows.sort(key=lambda row: row[0].analysis.material_cost, reverse=reverse)
+        elif column == 3:
+            rows.sort(key=lambda row: row[0].analysis.net_product_value, reverse=reverse)
+        elif column == 4:
+            rows.sort(key=lambda row: row[0].analysis.margin, reverse=reverse)
+        else:
+            rows.sort(key=lambda row: row[0].analysis.verdict, reverse=reverse)
+        return rows
+
     def _render_builds(self, report: OpportunityReport) -> None:
-        """Owned blueprints ranked by Jita build margin (per run); BUILD rows in green,
-        partial rows (a material with no Jita price) flagged."""
+        """Owned blueprints, filtered/sorted, ranked by Jita build margin (per run);
+        BUILD rows in green, partial rows (a material with no Jita price) flagged. When
+        there's nothing to show, the hint line says why so the tab is never blank."""
+        # Hint + download-button visibility have no cursor, so refresh them every call.
+        self.query_one("#manufacturing-hint", Static).update(self._manufacturing_hint(report))
+        if self._download_sde_fn is not None:
+            # The button is only useful before the SDE exists — hide it once it does.
+            self.query_one("#download-sde", Button).display = not report.sde_available
+
+        rows = self._sorted_builds(report)
+        key = (tuple(rows), self._mfg_query, self._mfg_sort)
+        if key == self._builds_key:
+            return
+        self._builds_key = key
         table = self.query_one("#manufacturing", DataTable)
         table.clear()
-        for build in report.builds:
+        for build, copies in rows:
             analysis = build.analysis
             name = report.names.get(build.product_type_id, str(build.product_type_id))
-            positive = analysis.margin > 0
-            margin_style = "green" if positive else "yellow"
-            if not analysis.priced:
-                verdict, verdict_style = "partial", "yellow"
+            if not analysis.product_priced:
+                # Product not sold at Jita — shown, but its value/margin is unknown.
+                verdict, verdict_style = "no price", "yellow"
+                sell_cell = Text("—", justify="right", style="dim")
+                margin_cell = Text("—", justify="right", style="dim")
             else:
-                verdict = analysis.verdict
-                verdict_style = "bold green" if verdict == "BUILD" else "dim"
-            margin_text = f"{'+' if positive else ''}{_isk(analysis.margin)}"
+                positive = analysis.margin > 0
+                margin_style = "green" if positive else "yellow"
+                sell_cell = Text(_isk(analysis.net_product_value), justify="right", style="dim")
+                margin_cell = Text(
+                    f"{'+' if positive else ''}{_isk(analysis.margin)}",
+                    justify="right",
+                    style=margin_style,
+                )
+                if analysis.missing_material_prices:
+                    verdict, verdict_style = "partial", "yellow"
+                else:
+                    verdict = analysis.verdict
+                    verdict_style = "bold green" if verdict == "BUILD" else "dim"
+            product = Text(name, style="bold" if verdict == "BUILD" else "")
+            if copies > 1:
+                product.append(f"  ×{copies}", style="cyan")  # noqa: RUF001 (copies owned)
             table.add_row(
-                Text(name, style="bold" if verdict == "BUILD" else ""),
+                product,
                 Text(f"ME {build.material_efficiency}", justify="right", style="dim"),
                 Text(_isk(analysis.material_cost), justify="right"),
-                Text(_isk(analysis.net_product_value), justify="right", style="dim"),
-                Text(margin_text, justify="right", style=margin_style),
+                sell_cell,
+                margin_cell,
                 Text(verdict, style=verdict_style),
                 key=str(build.blueprint_item_id),
             )
+
+    def _manufacturing_hint(self, report: OpportunityReport) -> Text:
+        if report.builds:
+            return Text(
+                f"{len(report.builds)} blueprint(s) ranked by Jita build margin, per run."
+            )
+        if not report.sde_available:
+            hint = Text()
+            hint.append("Build-vs-buy needs the EVE SDE. Download it once:  ", style="yellow")
+            hint.append("uv run evetrader sde", style="bold")
+            return hint
+        owns_blueprints = self._character is not None and bool(self._character.blueprints)
+        if not owns_blueprints:
+            return Text("No blueprints owned — this tab ranks blueprints you hold.")
+        return Text("No owned blueprint is manufacturable and priced at Jita.")
 
     def _render_training(self, report: CharacterReport) -> None:
         """The skill actually training now, on the main tab."""
@@ -1162,10 +1346,52 @@ class TradingScreen(Screen[None]):
                 )
                 branch.add_leaf(label, data=skill.skill_id)
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "download-sde":
+            self.run_worker(self._download_sde(), exclusive=False)
+
+    async def _download_sde(self) -> None:
+        """Fetch the SDE in the background (a non-ESI static-data download, so it's fine
+        off the cache-driven refresh), then recompute build-vs-buy with it."""
+        if self._download_sde_fn is None:
+            return
+        hint = self.query_one("#manufacturing-hint", Static)
+        button = self.query_one("#download-sde", Button)
+        button.disabled = True
+        hint.update("Downloading the EVE SDE… (~140 MB — this can take a minute)")
+        try:
+            downloaded = await self._download_sde_fn()
+        except Exception as error:  # surface it rather than silently failing
+            hint.update(f"[SDE download failed] {type(error).__name__}: {error}")
+            button.disabled = False
+            return
+        button.disabled = False
+        if downloaded:
+            hint.update("SDE downloaded — recomputing…")
+            await self._refresh()  # re-runs the market phase, now with the SDE
+        else:
+            hint.update("SDE download did not complete.")
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "assetsearch" and self._character is not None:
             self._asset_query = event.value
             self._render_assets(self._character)
+        elif event.input.id == "manufacturing-search" and self._report is not None:
+            self._mfg_query = event.value
+            self._render_builds(self._report)
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        """Click a Manufacturing column header to sort by it; click again to reverse."""
+        if event.data_table.id != "manufacturing":
+            return
+        column, reverse = self._mfg_sort
+        if event.column_index == column:
+            reverse = not reverse
+        else:
+            reverse = event.column_index in (1, 2, 3, 4)  # numeric columns start descending
+        self._mfg_sort = (event.column_index, reverse)
+        if self._report is not None:
+            self._render_builds(self._report)
 
     def _render_assets(self, report: CharacterReport) -> None:
         """All assets as a tree of places -> items -> container/ship contents,
@@ -1302,6 +1528,7 @@ class CharacterPickerScreen(Screen[None]):
         login_fn: LoginFn,
         remove_token_fn: RemoveTokenFn,
         interval_seconds: int,
+        download_sde_fn: DownloadSdeFn | None = None,
     ) -> None:
         super().__init__()
         self._store = store
@@ -1309,6 +1536,7 @@ class CharacterPickerScreen(Screen[None]):
         self._login_fn = login_fn
         self._remove_token_fn = remove_token_fn
         self._interval = interval_seconds
+        self._download_sde_fn = download_sde_fn
         self._last_character_id: int | None = None
 
     def compose(self) -> ComposeResult:
@@ -1333,7 +1561,9 @@ class CharacterPickerScreen(Screen[None]):
 
     def select_character(self, character_id: int) -> None:
         self._last_character_id = character_id
-        self.app.push_screen(TradingScreen(self._make_feed(character_id), self._interval))
+        self.app.push_screen(
+            TradingScreen(self._make_feed(character_id), self._interval, self._download_sde_fn)
+        )
 
     def action_resume(self) -> None:
         """Esc with a character already open returns to it, rather than sitting here."""
@@ -1383,6 +1613,7 @@ class EveTraderApp(App[None]):
         remove_token_fn: RemoveTokenFn,
         interval_seconds: int,
         theme: str = "kemika-purple",
+        download_sde_fn: DownloadSdeFn | None = None,
     ) -> None:
         super().__init__()
         self._store = store
@@ -1391,6 +1622,7 @@ class EveTraderApp(App[None]):
         self._remove_token_fn = remove_token_fn
         self._interval = interval_seconds
         self._theme_name = theme
+        self._download_sde_fn = download_sde_fn
 
     def on_mount(self) -> None:
         # Register the custom theme, then apply the configured one if it's known.
@@ -1406,4 +1638,5 @@ class EveTraderApp(App[None]):
             self._login_fn,
             self._remove_token_fn,
             self._interval,
+            self._download_sde_fn,
         )

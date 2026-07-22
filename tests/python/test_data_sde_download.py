@@ -1,6 +1,6 @@
-"""The SDE downloader streams a bz2 dump and decompresses it to a local file."""
+"""The SDE downloader streams a gzip dump and decompresses it to a local file."""
 
-import bz2
+import gzip
 from pathlib import Path
 
 import httpx
@@ -10,7 +10,7 @@ from evetrader.data.sde_download import download_sde, write_decompressed
 
 def test_write_decompressed_reassembles_across_chunks(tmp_path: Path) -> None:
     payload = b"CREATE TABLE industryActivityProducts;" * 500
-    compressed = bz2.compress(payload)
+    compressed = gzip.compress(payload)
     # Feed it in tiny chunks to exercise the streaming decompressor across boundaries.
     chunks = [compressed[i : i + 7] for i in range(0, len(compressed), 7)]
 
@@ -23,7 +23,7 @@ def test_write_decompressed_reassembles_across_chunks(tmp_path: Path) -> None:
 
 def test_download_sde_streams_decompresses_and_sends_user_agent(tmp_path: Path) -> None:
     payload = b"sqlite-bytes"
-    compressed = bz2.compress(payload)
+    compressed = gzip.compress(payload)
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert "evetrader" in request.headers.get("User-Agent", "")

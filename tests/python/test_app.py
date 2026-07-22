@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.text import Text
-from textual.widgets import DataTable, Input, OptionList, Static, TabbedContent, Tree
+from textual.widgets import Button, DataTable, Input, OptionList, Static, TabbedContent, Tree
 
 from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.data.assets import AssetLocation, AssetNode
@@ -21,14 +21,16 @@ from evetrader.esi.models import (
 )
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import InvestmentSignal
-from evetrader.market.production import BuildAnalysis
+from evetrader.market.production import BuildAnalysis, MaterialLine
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
     BlueprintInfoScreen,
     CharacterPickerScreen,
+    DownloadSdeFn,
     EveTraderApp,
     IndustryJobScreen,
+    MaterialsScreen,
     PriceHistoryScreen,
     RefreshFeed,
     SkillInfoScreen,
@@ -320,16 +322,65 @@ def _opportunity_report() -> OpportunityReport:
                 ),
             )
         ],
+        sde_available=True,
     )
 
 
-def _build_app(store: CharacterStore) -> EveTraderApp:
+def _build(
+    item_id: int,
+    bp_type: int,
+    product: int,
+    me: int,
+    margin: float,
+    materials: tuple[MaterialLine, ...] = (),
+) -> BuildOpportunity:
+    return BuildOpportunity(
+        blueprint_item_id=item_id,
+        blueprint_type_id=bp_type,
+        product_type_id=product,
+        material_efficiency=me,
+        analysis=BuildAnalysis(
+            runs=1,
+            material_cost=1_000_000.0,
+            product_value=1_000_000.0 + margin,
+            net_product_value=1_000_000.0 + margin,
+            missing_material_prices=(),
+            materials=materials,
+        ),
+    )
+
+
+def _manufacturing_report() -> OpportunityReport:
+    return OpportunityReport(
+        buys=[],
+        sells=[],
+        names={587: "Rifter", 588: "Breacher", 34: "Tritanium", 35: "Pyerite"},
+        history={},
+        builds=[
+            _build(
+                13, 900, 587, 10, 600_000.0,
+                materials=(MaterialLine(34, 90, 5.0), MaterialLine(35, 45, 10.0)),
+            ),
+            _build(14, 900, 587, 10, 600_000.0),  # a second identical copy -> collapses
+            _build(15, 901, 588, 2, 100_000.0),
+        ],
+        sde_available=True,
+    )
+
+
+def _build_app(
+    store: CharacterStore,
+    opportunity: OpportunityReport | None = None,
+    download_sde_fn: DownloadSdeFn | None = None,
+) -> EveTraderApp:
+    report = opportunity if opportunity is not None else _opportunity_report()
+
     def make_feed(character_id: int) -> RefreshFeed:
         async def character() -> CharacterReport:
             return _character_report()
 
         async def opportunities(state: CharacterState) -> OpportunityReport:
-            return _opportunity_report()
+            return report
 
         return RefreshFeed(character=character, opportunities=opportunities)
 
@@ -339,7 +390,14 @@ def _build_app(store: CharacterStore) -> EveTraderApp:
     def remove_token_fn(character_id: int) -> None:
         pass
 
-    return EveTraderApp(store, make_feed, login_fn, remove_token_fn, interval_seconds=30)
+    return EveTraderApp(
+        store,
+        make_feed,
+        login_fn,
+        remove_token_fn,
+        interval_seconds=30,
+        download_sde_fn=download_sde_fn,
+    )
 
 
 def test_picker_lists_set_up_characters(tmp_path: Path) -> None:
@@ -985,6 +1043,220 @@ def test_manufacturing_tab_ranks_owned_blueprints(tmp_path: Path) -> None:
             assert "Rifter" in str(row[0])  # product name
             assert "BUILD" in str(row[5])  # profitable -> BUILD
             await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_manufacturing_tab_explains_a_missing_sde(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+    empty = OpportunityReport(
+        buys=[], sells=[], names={}, history={}, builds=[], sde_available=False
+    )
+
+    async def _drive() -> None:
+        app = _build_app(store, empty)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "manufacturing-tab"
+            await pilot.pause()
+            assert trading.query_one("#manufacturing", DataTable).row_count == 0
+            hint = str(trading.query_one("#manufacturing-hint", Static).render())
+            assert "evetrader sde" in hint  # tells the user how to enable it
+            # No download callable wired -> no in-UI download button.
+            assert not trading.query("#download-sde")
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_manufacturing_dedupes_counts_searches_and_sorts(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store, _manufacturing_report())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "manufacturing-tab"
+            await pilot.pause()
+            table = trading.query_one("#manufacturing", DataTable)
+
+            # Two identical Rifter copies collapse to one row that shows the count.
+            assert table.row_count == 2
+            assert "Rifter" in str(table.get_row_at(0)[0])  # highest margin, default sort
+            assert "×2" in str(table.get_row_at(0)[0])  # two copies owned
+            assert "Breacher" in str(table.get_row_at(1)[0])
+            assert "×" not in str(table.get_row_at(1)[0])  # a single copy shows no count
+
+            # Search filters by product name.
+            trading.query_one("#manufacturing-search", Input).value = "brea"
+            await pilot.pause()
+            assert table.row_count == 1
+            assert "Breacher" in str(table.get_row_at(0)[0])
+            trading.query_one("#manufacturing-search", Input).value = ""
+            await pilot.pause()
+            assert table.row_count == 2
+
+            # Sorting: click the ME header (column 1) — numeric, so descending first.
+            keys = list(table.columns.keys())
+            trading.on_data_table_header_selected(
+                DataTable.HeaderSelected(table, keys[1], 1, table.columns[keys[1]].label)
+            )
+            await pilot.pause()
+            assert trading._mfg_sort == (1, True)
+            assert "Rifter" in str(table.get_row_at(0)[0])  # ME 10 before ME 2
+            # Click again to reverse.
+            trading.on_data_table_header_selected(
+                DataTable.HeaderSelected(table, keys[1], 1, table.columns[keys[1]].label)
+            )
+            await pilot.pause()
+            assert trading._mfg_sort == (1, False)
+            assert "Breacher" in str(table.get_row_at(0)[0])  # ME 2 first
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_manufacturing_row_opens_material_breakdown(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store, _manufacturing_report())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "manufacturing-tab"
+            await pilot.pause()
+            table = trading.query_one("#manufacturing", DataTable)
+            table.focus()  # default sort puts the Rifter (with materials) at row 0
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert isinstance(app.screen, MaterialsScreen)
+            body = str(app.screen.query_one("#matbody", Static).render())
+            assert "Rifter" in body
+            assert "Tritanium" in body and "Pyerite" in body  # the required materials
+            await pilot.press("escape")
+
+    asyncio.run(_drive())
+
+
+def test_manufacturing_refresh_preserves_cursor_when_unchanged(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store, _manufacturing_report())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "manufacturing-tab"
+            await pilot.pause()
+            table = trading.query_one("#manufacturing", DataTable)
+            table.move_cursor(row=1)
+            cursor = table.cursor_coordinate
+
+            assert trading._report is not None
+            trading._render_builds(trading._report)  # a refresh with identical data
+            # The guard skips the rebuild, so the cursor isn't reset to the top.
+            assert table.cursor_coordinate == cursor
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_manufacturing_download_button_hidden_once_sde_present(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def fake_download() -> bool:
+        return True
+
+    async def _drive() -> None:
+        # SDE present (builds available) -> the download button hides itself.
+        app = _build_app(store, _manufacturing_report(), download_sde_fn=fake_download)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "manufacturing-tab"
+            await pilot.pause()
+            assert trading.query_one("#download-sde", Button).display is False
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_manufacturing_download_button_invokes_the_downloader(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+    empty = OpportunityReport(
+        buys=[], sells=[], names={}, history={}, builds=[], sde_available=False
+    )
+    calls: list[bool] = []
+
+    async def fake_download() -> bool:
+        calls.append(True)
+        return True
+
+    async def _drive() -> None:
+        app = _build_app(store, empty, download_sde_fn=fake_download)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "manufacturing-tab"
+            await pilot.pause()
+            assert trading.query_one("#download-sde", Button)  # wired -> button present
+            await pilot.click("#download-sde")
+            for _ in range(4):
+                await pilot.pause()
+            assert calls == [True]  # the button ran the download callable
 
     asyncio.run(_drive())
 

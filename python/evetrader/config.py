@@ -109,8 +109,10 @@ class Config(BaseModel):
     # best-spread items (0 = watchlist only). The full region fetch is slow the
     # first time, then cached.
     scan_candidates: int = Field(default=50, ge=0)
-    # How often the TUI re-runs the pipeline; the client cache gates real fetches.
-    refresh_interval_seconds: int = Field(default=30, gt=0)
+    # How often the TUI re-runs the pipeline; the client cache gates real fetches, and
+    # renders skip when their data is unchanged, so this can be relaxed. Market orders
+    # cache ~5 min and assets ~1h, so a few minutes keeps advice fresh without churn.
+    refresh_interval_seconds: int = Field(default=300, gt=0)
     # TUI colour theme: "kemika-purple" (default) or any built-in Textual theme.
     theme: str = "kemika-purple"
     risk: RiskPreferences

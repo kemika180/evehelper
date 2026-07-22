@@ -131,6 +131,12 @@ def _run_tui(config: Config) -> None:
         with contextlib.suppress(Exception):
             KeyringTokenStore().delete(character_id)
 
+    async def download_sde_fn() -> bool:
+        # Blocking download off the event loop; then reload so the next scan sees it.
+        await asyncio.to_thread(download_sde, sde_path(), contact=config.contact)
+        resources.sde = _load_sde()
+        return resources.sde is not None
+
     EveTraderApp(
         store,
         make_feed,
@@ -138,6 +144,7 @@ def _run_tui(config: Config) -> None:
         remove_token_fn,
         config.refresh_interval_seconds,
         theme=config.theme,
+        download_sde_fn=download_sde_fn,
     ).run()
 
 

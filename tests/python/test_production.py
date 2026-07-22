@@ -70,6 +70,30 @@ def test_analyze_build_scales_with_runs_and_calls_a_loss_a_buy() -> None:
     assert analysis.verdict == "BUY"
 
 
+def test_analyze_build_returns_me_adjusted_material_breakdown() -> None:
+    analysis = analyze_build(
+        _recipe(),
+        material_efficiency=10,
+        material_prices={34: 5.0, 35: 10.0},
+        product_price=2000.0,
+    )
+    lines = [(m.type_id, m.quantity, m.unit_price, m.line_cost) for m in analysis.materials]
+    assert lines == [(34, 90, 5.0, 450.0), (35, 45, 10.0, 450.0)]
+
+
+def test_material_breakdown_marks_unpriced_lines() -> None:
+    analysis = analyze_build(
+        _recipe(),
+        material_efficiency=0,
+        material_prices={34: 5.0},  # no price for 35
+        product_price=2000.0,
+    )
+    unpriced = next(m for m in analysis.materials if m.type_id == 35)
+    assert unpriced.unit_price is None
+    assert unpriced.line_cost is None
+    assert unpriced.quantity == 50  # quantity still reported
+
+
 def test_margin_fraction_is_none_without_material_cost() -> None:
     empty = Recipe(blueprint_type_id=1, product_type_id=2, product_quantity=1, materials=())
     analysis = analyze_build(empty, material_efficiency=0, material_prices={}, product_price=50.0)

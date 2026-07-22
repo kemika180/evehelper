@@ -97,6 +97,9 @@ class OpportunityReport:
     # Build-vs-buy for owned blueprints, ranked by margin (empty if the SDE isn't
     # installed or no owned blueprint is manufacturable).
     builds: list[BuildOpportunity]
+    # Whether the local SDE was available this run — lets the UI explain an empty
+    # Manufacturing tab (needs `evetrader sde`) instead of leaving it blank.
+    sde_available: bool
 
 
 def _utc_now() -> datetime:
@@ -252,9 +255,9 @@ async def _build_opportunities(
     fees = character.character.fees  # home-station fees; sales tax is skill-based, broker approx
     builds: list[BuildOpportunity] = []
     for item_id, blueprint, recipe in recipes:
+        # A product with no Jita sell order (a thin market — e.g. a Black Ops hull) is
+        # kept as an unvalued row, not dropped, so every manufacturable blueprint shows.
         product_price = ask.get(recipe.product_type_id)
-        if product_price is None:
-            continue  # the product doesn't sell at the reference market — can't value it
         material_prices = {m.type_id: ask[m.type_id] for m in recipe.materials if m.type_id in ask}
         analysis = analyze_build(
             recipe,
@@ -318,6 +321,8 @@ async def fetch_opportunities(
     sells = [signal for signal in signals if signal.action == "SELL"]
     name_ids = [signal.type_id for signal in signals]
     name_ids += [build.product_type_id for build in builds]
+    # Material type ids too, so a build's bill-of-materials view can name each input.
+    name_ids += [line.type_id for build in builds for line in build.analysis.materials]
     names = await name_cache.resolve(name_ids)
     signalled = {signal.type_id for signal in signals}
     window = config.investment.window_days
@@ -327,5 +332,10 @@ async def fetch_opportunities(
         if type_id in history
     }
     return OpportunityReport(
-        buys=buys, sells=sells, names=names, history=retained, builds=builds
+        buys=buys,
+        sells=sells,
+        names=names,
+        history=retained,
+        builds=builds,
+        sde_available=sde is not None,
     )

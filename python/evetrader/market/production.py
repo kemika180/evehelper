@@ -39,16 +39,36 @@ class Recipe:
 
 
 @dataclass(frozen=True)
+class MaterialLine:
+    """One input of a build: the material, its ME-adjusted quantity for the analyzed
+    run count, and its unit price (None if not priced at the reference market)."""
+
+    type_id: int
+    quantity: int
+    unit_price: float | None
+
+    @property
+    def line_cost(self) -> float | None:
+        """Quantity times unit price, or None when the material has no price."""
+        return self.quantity * self.unit_price if self.unit_price is not None else None
+
+
+@dataclass(frozen=True)
 class BuildAnalysis:
     """The build-vs-buy verdict for one recipe at a given ME, run count, and prices."""
 
     runs: int
     material_cost: float  # total cost of the (priced) materials for `runs` runs
-    product_value: float  # gross sale value of the output before fees
+    product_value: float  # gross sale value of the output before fees (0 if unpriced)
     net_product_value: float  # after sales tax + broker fee
-    # Missing prices leave the material cost understated, so a verdict isn't trustworthy
-    # until this is empty — the caller should surface that rather than trust `verdict`.
+    # Missing prices leave the margin unreliable, so a verdict isn't trustworthy until
+    # `priced` — the caller should surface that rather than trust `verdict`.
     missing_material_prices: tuple[int, ...]
+    # False when the product has no sell price at the reference market, so its value
+    # (and therefore the margin) is unknown — the build is still listed, just unvalued.
+    product_priced: bool = True
+    # The per-material breakdown (the bill of materials), for a build's detail view.
+    materials: tuple[MaterialLine, ...] = ()
 
     @property
     def margin(self) -> float:
@@ -63,8 +83,9 @@ class BuildAnalysis:
 
     @property
     def priced(self) -> bool:
-        """Whether every material had a price — i.e. the margin is complete."""
-        return not self.missing_material_prices
+        """Whether the product and every material had a price — i.e. the margin is
+        complete and the verdict trustworthy."""
+        return self.product_priced and not self.missing_material_prices
 
     @property
     def verdict(self) -> str:
@@ -88,7 +109,7 @@ def analyze_build(
     *,
     material_efficiency: int,
     material_prices: Mapping[int, float],
-    product_price: float,
+    product_price: float | None,
     sales_tax: float = 0.0,
     broker_fee: float = 0.0,
     runs: int = 1,
@@ -96,19 +117,34 @@ def analyze_build(
     """Cost a build and compare it to buying the product outright. Pure.
 
     ``material_prices`` is the unit acquisition cost per material type; ``product_price``
-    the unit sale value of the output. Sale fees (``sales_tax`` + ``broker_fee``, as
-    fractions) are applied to the product side. Prices and fees are policy handed in by
-    the caller — the engine just arithmetic, so it stays deterministic and reusable."""
+    the unit sale value of the output (``None`` if it isn't sold at the reference market
+    — the build is still returned, just unvalued). Sale fees (``sales_tax`` +
+    ``broker_fee``, as fractions) are applied to the product side. Prices and fees are
+    policy handed in by the caller — the engine is just arithmetic, so it stays
+    deterministic and reusable."""
     material_cost = 0.0
     missing: list[int] = []
+    lines: list[MaterialLine] = []
     for material in recipe.materials:
+        quantity = adjusted_material_quantity(material.quantity, runs, material_efficiency)
         price = material_prices.get(material.type_id)
+        lines.append(MaterialLine(type_id=material.type_id, quantity=quantity, unit_price=price))
         if price is None:
             missing.append(material.type_id)
-            continue
-        quantity = adjusted_material_quantity(material.quantity, runs, material_efficiency)
-        material_cost += quantity * price
+        else:
+            material_cost += quantity * price
+    materials = tuple(lines)
 
+    if product_price is None:
+        return BuildAnalysis(
+            runs=runs,
+            material_cost=material_cost,
+            product_value=0.0,
+            net_product_value=0.0,
+            missing_material_prices=tuple(missing),
+            product_priced=False,
+            materials=materials,
+        )
     product_value = recipe.product_quantity * runs * product_price
     net_product_value = product_value * (1 - sales_tax - broker_fee)
     return BuildAnalysis(
@@ -117,4 +153,5 @@ def analyze_build(
         product_value=product_value,
         net_product_value=net_product_value,
         missing_material_prices=tuple(missing),
+        materials=materials,
     )

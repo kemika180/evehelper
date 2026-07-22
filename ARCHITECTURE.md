@@ -182,17 +182,26 @@ rough order:
   - ~~Build-vs-buy engine~~ — DONE (increment 2). A "Manufacturing" tab ranks owned
     blueprints by margin, and the blueprint popup shows a per-run build-vs-buy block;
     both priced against **Jita** (`config.reference_market`, The Forge / Jita 4-4),
-    independent of where the character is docked. The pure `market/production.py`
+    independent of where the character is docked. The tab is searchable (by product)
+    and sortable (click a column header, click again to reverse), collapses duplicate
+    copies of a blueprint at the same ME into one row showing the count, and offers an
+    in-app SDE download button (hidden once installed; `evetrader sde` also works). It
+    explains an empty state (missing SDE / no blueprints) rather than blanking. The pure `market/production.py`
     engine (`analyze_build` → `BuildAnalysis`, ME-adjusted material cost vs fee-adjusted
     sale value) is a **shared, generic component** — `Recipe` is activity-agnostic, so
     reactions and PI feed their own recipes through the same engine. It brought the SDE
     forward: `evetrader sde` downloads the Fuzzwork SQLite (gitignored), `data/sde.py`
     reads a blueprint's bill of materials, and the pipeline prices materials/product
     from the reference region's sell orders (`data/market.best_ask_prices`) — no new
-    keystroke ESI calls, computed in the market phase. Reactions and invention are
-    future increments on the same engine (invention needs a probability/expected-value
-    extension). Documented simplifications: material formula ignores structure/rig
-    bonuses; the character's home-station broker fee is used for the (Jita) sale.
+    keystroke ESI calls, computed in the market phase. Pricing is **hybrid**: a product
+    the market prices shows margin + BUILD/BUY; one it can't (capitals sell by contract,
+    never on a hub, and ESI exposes no alliance-contract prices) still lists with its
+    build cost, marked unvalued rather than dropped. Selecting a row opens
+    `MaterialsScreen` — the bill of materials (each input's ME-adjusted quantity, unit
+    Jita price, line cost). Reactions and invention are future increments on the same
+    engine (invention needs a probability/expected-value extension). Documented
+    simplifications: material formula ignores structure/rig bonuses; the character's
+    home-station broker fee is used for the (Jita) sale.
 - **PI (planetary interaction)** tracking & assistance. Self-contained (colony setups,
   extractors); its profitability view consumes the same build-vs-buy engine above.
 - **Hauling / regional arbitrage** (Jita ↔ your hub) — **after** crafting/PI, because
