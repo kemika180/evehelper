@@ -17,6 +17,7 @@ import httpx
 
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
+from evetrader.data.sde_download import download_sde
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import (
@@ -58,6 +59,10 @@ def _build_resources(config: Config) -> _Resources:
 
 def _characters_path() -> Path:
     return default_data_dir() / "characters.json"
+
+
+def sde_path() -> Path:
+    return default_data_dir() / "sde.sqlite"
 
 
 async def _run_login(config: Config) -> CharacterIdentity:
@@ -126,7 +131,7 @@ def _run_tui(config: Config) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="evetrader")
-    parser.add_argument("command", nargs="?", default="run", choices=["run", "login"])
+    parser.add_argument("command", nargs="?", default="run", choices=["run", "login", "sde"])
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
 
@@ -138,5 +143,10 @@ def main() -> None:
             CharacterRecord(identity.character_id, identity.name)
         )
         print(f"Logged in as {identity.name} ({identity.character_id}).")
+    elif args.command == "sde":
+        dest = sde_path()
+        print(f"Downloading the EVE SDE to {dest} … (~250 MB, one-time; re-run to update)")
+        download_sde(dest, contact=config.contact)
+        print("SDE ready.")
     else:
         _run_tui(config)

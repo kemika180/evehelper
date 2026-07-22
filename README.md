@@ -40,6 +40,17 @@ uv sync
 uv run evetrader
 ```
 
+For the crafting build-vs-buy analysis, download the EVE SDE (static data — blueprint
+recipes; ~250 MB, one-time, re-run to update after a patch):
+
+```
+uv run evetrader sde
+```
+
+It's fetched from the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLite mirror into
+your local data dir (gitignored, never committed). The rest of the app works without
+it; only the build-vs-buy view needs it.
+
 ## Checks
 
 All four must pass before any change is considered complete:
