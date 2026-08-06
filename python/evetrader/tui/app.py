@@ -411,17 +411,25 @@ class DepthTree(Tree[TreeData]):
 
     def render_label(self, node: TreeNode[TreeData], base_style: Style, style: Style) -> Text:
         label = super().render_label(node, base_style, style)
+        theme = self.app.current_theme
+        label.pad_right(max(0, self.size.width - label.cell_len))  # fill the row width
+        # The cursor row would be lost under the per-depth tint below, so give it an
+        # unmistakable full-width bar: bright accent bg with dark bold text. Only while
+        # focused, so it doesn't shout when the search box holds focus instead.
+        if node is self.cursor_node and self.has_focus:
+            accent = Color.parse(theme.accent or theme.primary)
+            ink = Color.parse(theme.background or "#000000")
+            label.stylize(Style(color=ink.rich_color, bgcolor=accent.rich_color, bold=True))
+            return label
         depth = 0
         parent = node.parent
         while parent is not None:
             depth += 1
             parent = parent.parent
-        theme = self.app.current_theme
         # Guard against a theme leaving a field unset (None); primary is always set.
         hue = getattr(theme, _DEPTH_HUES[depth % len(_DEPTH_HUES)]) or theme.primary
         surface = theme.surface or theme.background or "#000000"
         bar = Color.parse(hue).blend(Color.parse(surface), _BAR_MIX)
-        label.pad_right(max(0, self.size.width - label.cell_len))  # fill the row width
         label.stylize(Style(bgcolor=bar.rich_color))  # bg only, keep the fg accents
         return label
 
@@ -964,6 +972,13 @@ class TradingScreen(Screen[None]):
         max-height: 8;
     }
     TradingScreen #assetsearch { margin: 0 1; }
+    /* Make the selected row unmistakable — the theme default is a muted purple
+       that's easy to lose, especially over zebra stripes. */
+    TradingScreen DataTable > .datatable--cursor {
+        background: $accent;
+        color: $background;
+        text-style: bold;
+    }
     TradingScreen #manufacturing-hint { padding: 0 2; color: $text-muted; }
     TradingScreen #download-sde { margin: 0 2; }
     TradingScreen #manufacturing-search { margin: 0 1; }
