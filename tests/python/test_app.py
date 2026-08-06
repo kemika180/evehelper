@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.text import Text
-from textual.widgets import Button, DataTable, Input, OptionList, Static, TabbedContent, Tree
+from textual.widgets import DataTable, Input, OptionList, Static, TabbedContent, Tree
 
 from evetrader.advisor.state import CharacterState, TradeSkills
 from evetrader.data.assets import AssetLocation, AssetNode
@@ -23,6 +23,7 @@ from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import TrackedStatus
 from evetrader.market.listings import ListingStatus
 from evetrader.market.production import BuildAnalysis, MaterialLine
+from evetrader.data.sde_download import SdeState
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
@@ -34,6 +35,8 @@ from evetrader.tui.app import (
     MaterialsScreen,
     PriceHistoryScreen,
     RefreshFeed,
+    SdeCheckFn,
+    SdeUpdateScreen,
     SkillInfoScreen,
     TradingScreen,
     _completion,
@@ -396,6 +399,7 @@ def _build_app(
     store: CharacterStore,
     opportunity: OpportunityReport | None = None,
     download_sde_fn: DownloadSdeFn | None = None,
+    sde_check_fn: SdeCheckFn | None = None,
 ) -> EveTraderApp:
     report = opportunity if opportunity is not None else _opportunity_report()
 
@@ -421,6 +425,7 @@ def _build_app(
         remove_token_fn,
         interval_seconds=30,
         download_sde_fn=download_sde_fn,
+        sde_check_fn=sde_check_fn,
     )
 
 
@@ -1371,66 +1376,81 @@ def test_manufacturing_refresh_preserves_cursor_when_unchanged(tmp_path: Path) -
     asyncio.run(_drive())
 
 
-def test_manufacturing_download_button_hidden_once_sde_present(tmp_path: Path) -> None:
+def test_launch_prompts_to_download_when_sde_missing(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
-
-    async def fake_download() -> bool:
-        return True
-
-    async def _drive() -> None:
-        # SDE present (builds available) -> the download button hides itself.
-        app = _build_app(store, _manufacturing_report(), download_sde_fn=fake_download)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            picker = app.screen
-            assert isinstance(picker, CharacterPickerScreen)
-            picker.select_character(1)
-            for _ in range(4):
-                await pilot.pause()
-
-            trading = app.screen
-            assert isinstance(trading, TradingScreen)
-            trading.query_one(TabbedContent).active = "manufacturing-tab"
-            await pilot.pause()
-            assert trading.query_one("#download-sde", Button).display is False
-            await pilot.press("q")
-
-    asyncio.run(_drive())
-
-
-def test_manufacturing_download_button_invokes_the_downloader(tmp_path: Path) -> None:
-    store = CharacterStore(tmp_path / "characters.json")
-    store.add(CharacterRecord(1, "Alice"))
-    empty = OpportunityReport(
-        tracked=[], listing_buys=[], listing_sells=[], names={}, history={},
-        builds=[], sde_available=False
-    )
     calls: list[bool] = []
 
     async def fake_download() -> bool:
         calls.append(True)
         return True
 
-    async def _drive() -> None:
-        app = _build_app(store, empty, download_sde_fn=fake_download)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            picker = app.screen
-            assert isinstance(picker, CharacterPickerScreen)
-            picker.select_character(1)
-            for _ in range(4):
-                await pilot.pause()
+    async def fake_check() -> SdeState:
+        return SdeState.MISSING
 
-            trading = app.screen
-            assert isinstance(trading, TradingScreen)
-            trading.query_one(TabbedContent).active = "manufacturing-tab"
-            await pilot.pause()
-            assert trading.query_one("#download-sde", Button)  # wired -> button present
-            await pilot.click("#download-sde")
+    async def _drive() -> None:
+        app = _build_app(store, download_sde_fn=fake_download, sde_check_fn=fake_check)
+        async with app.run_test() as pilot:
             for _ in range(4):
                 await pilot.pause()
-            assert calls == [True]  # the button ran the download callable
+            # Before any character is picked, the launch prompt is up.
+            assert isinstance(app.screen, SdeUpdateScreen)
+            await pilot.click("#sde-download")
+            for _ in range(4):
+                await pilot.pause()
+            assert calls == [True]  # the prompt ran the download callable
+            # Once done it dismisses back to the picker.
+            assert isinstance(app.screen, CharacterPickerScreen)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_launch_prompt_skips_without_downloading(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+    calls: list[bool] = []
+
+    async def fake_download() -> bool:
+        calls.append(True)
+        return True
+
+    async def fake_check() -> SdeState:
+        return SdeState.STALE
+
+    async def _drive() -> None:
+        app = _build_app(store, download_sde_fn=fake_download, sde_check_fn=fake_check)
+        async with app.run_test() as pilot:
+            for _ in range(4):
+                await pilot.pause()
+            assert isinstance(app.screen, SdeUpdateScreen)
+            await pilot.click("#sde-skip")
+            await pilot.pause()
+            assert calls == []  # skipping downloads nothing
+            assert isinstance(app.screen, CharacterPickerScreen)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_launch_does_not_prompt_when_sde_current(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def fake_download() -> bool:
+        return True
+
+    async def fake_check() -> SdeState:
+        return SdeState.CURRENT
+
+    async def _drive() -> None:
+        app = _build_app(store, download_sde_fn=fake_download, sde_check_fn=fake_check)
+        async with app.run_test() as pilot:
+            for _ in range(4):
+                await pilot.pause()
+            # A current SDE: no prompt, straight to the picker.
+            assert isinstance(app.screen, CharacterPickerScreen)
+            await pilot.press("q")
 
     asyncio.run(_drive())
 

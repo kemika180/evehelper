@@ -18,7 +18,7 @@ import httpx
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
 from evetrader.data.sde import SdeDatabase, SdeError
-from evetrader.data.sde_download import download_sde
+from evetrader.data.sde_download import SdeState, check_sde_freshness, download_sde
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import (
@@ -134,9 +134,17 @@ def _run_tui(config: Config) -> None:
 
     async def download_sde_fn() -> bool:
         # Blocking download off the event loop; then reload so the next scan sees it.
-        await asyncio.to_thread(download_sde, sde_path(), contact=config.contact)
+        # Returns False on any failure so the launch prompt can report it, not crash.
+        try:
+            await asyncio.to_thread(download_sde, sde_path(), contact=config.contact)
+        except Exception:  # network/IO failure is surfaced in the UI, not fatal
+            return False
         resources.sde = _load_sde()
         return resources.sde is not None
+
+    async def sde_check_fn() -> SdeState:
+        # One cheap HEAD to see if the local SDE is missing or a newer dump exists.
+        return await asyncio.to_thread(check_sde_freshness, sde_path(), contact=config.contact)
 
     EveTraderApp(
         store,
@@ -146,6 +154,7 @@ def _run_tui(config: Config) -> None:
         config.refresh_interval_seconds,
         theme=config.theme,
         download_sde_fn=download_sde_fn,
+        sde_check_fn=sde_check_fn,
     ).run()
 
 

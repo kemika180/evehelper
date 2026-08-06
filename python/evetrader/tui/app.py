@@ -42,6 +42,7 @@ from textual.widgets.tree import TreeNode
 from textual_plotext import PlotextPlot
 
 from evetrader.data.assets import AssetLocation, AssetNode
+from evetrader.data.sde_download import SdeState
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import (
@@ -464,9 +465,11 @@ FetchCharacter = Callable[[], Awaitable[CharacterReport]]
 FetchOpportunities = Callable[[CharacterReport], Awaitable[OpportunityReport]]
 LoginFn = Callable[[], Awaitable[CharacterIdentity]]
 RemoveTokenFn = Callable[[int], None]
-# Download the SDE (in the background) and make it available; True on success. None
-# when the host didn't wire it (e.g. tests) — the download button is hidden then.
+# Download the SDE (in the background) and make it available; True on success.
 DownloadSdeFn = Callable[[], Awaitable[bool]]
+# Check whether the local SDE is missing/stale/current; drives the launch-time prompt.
+# None when the host didn't wire it (e.g. tests) — no prompt is shown then.
+SdeCheckFn = Callable[[], Awaitable[SdeState]]
 
 
 @dataclass
@@ -893,6 +896,82 @@ class MaterialsScreen(ModalScreen[None]):
         return _isk(unit_cost * quantity) if unit_cost is not None else "—"
 
 
+class SdeUpdateScreen(ModalScreen[None]):
+    """Launch-time prompt when the local SDE is missing or a newer dump is published.
+    Offers to download it (blocking, off the event loop) or skip for this session."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [("escape", "skip", "Not now")]
+
+    DEFAULT_CSS = """
+    SdeUpdateScreen { align: center middle; }
+    SdeUpdateScreen #sdebox {
+        width: 66;
+        height: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    SdeUpdateScreen #sdemsg { padding: 0 0 1 0; }
+    SdeUpdateScreen #sdestatus { padding: 1 0 0 0; color: $text-muted; }
+    SdeUpdateScreen #sdebuttons { height: auto; align: right middle; }
+    SdeUpdateScreen Button { margin: 0 0 0 2; }
+    """
+
+    def __init__(self, state: SdeState, download_sde_fn: DownloadSdeFn) -> None:
+        super().__init__()
+        self._state = state
+        self._download_sde_fn = download_sde_fn
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sdebox"):
+            yield Static(self._message(), id="sdemsg")
+            with Horizontal(id="sdebuttons"):
+                yield Button("Not now", id="sde-skip", compact=True)
+                yield Button(
+                    self._download_label(), id="sde-download", variant="primary", compact=True
+                )
+            yield Static("", id="sdestatus")
+
+    def _message(self) -> Text:
+        text = Text()
+        if self._state is SdeState.MISSING:
+            text.append("The EVE static data (SDE) isn't installed.\n", style="bold")
+            text.append(
+                "It powers the Crafting tab and asset ISK values. "
+                "Download it now? (~250 MB, one-time)",
+                style="dim",
+            )
+        else:  # STALE
+            text.append("A newer EVE static data (SDE) dump is available.\n", style="bold")
+            text.append("Update now? (~250 MB)", style="dim")
+        return text
+
+    def _download_label(self) -> str:
+        return "Download" if self._state is SdeState.MISSING else "Update"
+
+    def action_skip(self) -> None:
+        self.dismiss()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "sde-skip":
+            self.dismiss()
+        elif event.button.id == "sde-download":
+            self.run_worker(self._download(), exclusive=True)
+
+    async def _download(self) -> None:
+        for button in self.query(Button):
+            button.disabled = True
+        status = self.query_one("#sdestatus", Static)
+        status.update("Downloading… this can take a minute.")
+        ok = await self._download_sde_fn()
+        if ok:
+            self.dismiss()
+            return
+        status.update("Download failed — check your connection, or continue without it.")
+        self.query_one("#sde-skip", Button).disabled = False
+        self.query_one("#sde-download", Button).disabled = False
+
+
 # Tracked-item verdict -> (label, style) for the Overview watchlist.
 _VERDICT_DISPLAY: dict[str, tuple[str, str]] = {
     "BUY": ("BUY", "bold green"),
@@ -986,20 +1065,13 @@ class TradingScreen(Screen[None]):
         text-style: bold;
     }
     TradingScreen #manufacturing-hint { padding: 0 2; color: $text-muted; }
-    TradingScreen #download-sde { margin: 0 2; }
     TradingScreen #manufacturing-search { margin: 0 1; }
     """
 
-    def __init__(
-        self,
-        feed: RefreshFeed,
-        interval_seconds: int,
-        download_sde_fn: DownloadSdeFn | None = None,
-    ) -> None:
+    def __init__(self, feed: RefreshFeed, interval_seconds: int) -> None:
         super().__init__()
         self._feed = feed
         self._interval = interval_seconds
-        self._download_sde_fn = download_sde_fn
         self._report: OpportunityReport | None = None
         self._character: CharacterReport | None = None
         # Signatures of the data last drawn into each view, so a periodic refresh
@@ -1043,8 +1115,6 @@ class TradingScreen(Screen[None]):
                 yield NavDataTable(id="industry", zebra_stripes=True, cursor_type="row")
             with TabPane("Crafting", id="manufacturing-tab"):
                 yield Static("", id="manufacturing-hint")
-                if self._download_sde_fn is not None:
-                    yield Button("⬇ Download / update SDE", id="download-sde", compact=True)
                 yield Input(placeholder="Search products…", id="manufacturing-search")
                 yield NavDataTable(id="manufacturing", zebra_stripes=True, cursor_type="row")
         yield Footer()
@@ -1368,11 +1438,8 @@ class TradingScreen(Screen[None]):
         that's cheaper than buying it), and the resulting savings. Rows that save by
         self-sourcing are bold; partial rows (a material with no Jita price) are flagged.
         When there's nothing to show, the hint line says why so the tab is never blank."""
-        # Hint + download-button visibility have no cursor, so refresh them every call.
+        # The hint has no cursor, so refresh it every call.
         self.query_one("#manufacturing-hint", Static).update(self._manufacturing_hint(report))
-        if self._download_sde_fn is not None:
-            # The button is only useful before the SDE exists — hide it once it does.
-            self.query_one("#download-sde", Button).display = not report.sde_available
 
         rows = self._sorted_builds(report)
         key = (tuple(rows), self._mfg_query, self._mfg_sort)
@@ -1544,32 +1611,6 @@ class TradingScreen(Screen[None]):
                     )
                 )
                 branch.add_leaf(label, data=skill.skill_id)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "download-sde":
-            self.run_worker(self._download_sde(), exclusive=False)
-
-    async def _download_sde(self) -> None:
-        """Fetch the SDE in the background (a non-ESI static-data download, so it's fine
-        off the cache-driven refresh), then recompute build-vs-buy with it."""
-        if self._download_sde_fn is None:
-            return
-        hint = self.query_one("#manufacturing-hint", Static)
-        button = self.query_one("#download-sde", Button)
-        button.disabled = True
-        hint.update("Downloading the EVE SDE… (~140 MB — this can take a minute)")
-        try:
-            downloaded = await self._download_sde_fn()
-        except Exception as error:  # surface it rather than silently failing
-            hint.update(f"[SDE download failed] {type(error).__name__}: {error}")
-            button.disabled = False
-            return
-        button.disabled = False
-        if downloaded:
-            hint.update("SDE downloaded — recomputing…")
-            await self._refresh()  # re-runs the market phase, now with the SDE
-        else:
-            hint.update("SDE download did not complete.")
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "assetsearch" and self._character is not None:
@@ -1777,6 +1818,7 @@ class CharacterPickerScreen(Screen[None]):
         remove_token_fn: RemoveTokenFn,
         interval_seconds: int,
         download_sde_fn: DownloadSdeFn | None = None,
+        sde_check_fn: SdeCheckFn | None = None,
     ) -> None:
         super().__init__()
         self._store = store
@@ -1785,6 +1827,7 @@ class CharacterPickerScreen(Screen[None]):
         self._remove_token_fn = remove_token_fn
         self._interval = interval_seconds
         self._download_sde_fn = download_sde_fn
+        self._sde_check_fn = sde_check_fn
         self._last_character_id: int | None = None
 
     def compose(self) -> ComposeResult:
@@ -1796,6 +1839,16 @@ class CharacterPickerScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self._reload()
+        # Before the user picks a character, offer to download/update the SDE if it's
+        # missing or a newer dump is published — so Crafting and asset values are ready.
+        if self._sde_check_fn is not None and self._download_sde_fn is not None:
+            self.run_worker(self._prompt_sde_if_needed(), exclusive=False)
+
+    async def _prompt_sde_if_needed(self) -> None:
+        assert self._sde_check_fn is not None and self._download_sde_fn is not None
+        state = await self._sde_check_fn()
+        if state in (SdeState.MISSING, SdeState.STALE):
+            await self.app.push_screen_wait(SdeUpdateScreen(state, self._download_sde_fn))
 
     def _reload(self) -> None:
         option_list = self.query_one("#characters", OptionList)
@@ -1809,9 +1862,7 @@ class CharacterPickerScreen(Screen[None]):
 
     def select_character(self, character_id: int) -> None:
         self._last_character_id = character_id
-        self.app.push_screen(
-            TradingScreen(self._make_feed(character_id), self._interval, self._download_sde_fn)
-        )
+        self.app.push_screen(TradingScreen(self._make_feed(character_id), self._interval))
 
     def action_resume(self) -> None:
         """Esc with a character already open returns to it, rather than sitting here."""
@@ -1862,6 +1913,7 @@ class EveTraderApp(App[None]):
         interval_seconds: int,
         theme: str = "kemika-purple",
         download_sde_fn: DownloadSdeFn | None = None,
+        sde_check_fn: SdeCheckFn | None = None,
     ) -> None:
         super().__init__()
         self._store = store
@@ -1871,6 +1923,7 @@ class EveTraderApp(App[None]):
         self._interval = interval_seconds
         self._theme_name = theme
         self._download_sde_fn = download_sde_fn
+        self._sde_check_fn = sde_check_fn
 
     def on_mount(self) -> None:
         # Register the custom theme, then apply the configured one if it's known.
@@ -1887,4 +1940,5 @@ class EveTraderApp(App[None]):
             self._remove_token_fn,
             self._interval,
             self._download_sde_fn,
+            self._sde_check_fn,
         )
