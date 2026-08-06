@@ -406,7 +406,9 @@ class DepthTree(Tree[TreeData]):
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
         Binding("l", "toggle_node", "Expand", show=False),
+        Binding("right", "toggle_node", "Expand", show=False),
         Binding("h", "cursor_parent", "Parent", show=False),
+        Binding("left", "cursor_parent", "Parent", show=False),
     ]
 
     def render_label(self, node: TreeNode[TreeData], base_style: Style, style: Style) -> Text:
