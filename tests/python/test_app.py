@@ -913,6 +913,38 @@ def _app_with_assets(
     )
 
 
+def test_overview_shows_net_worth_and_places_show_isk_value(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+    report = OpportunityReport(
+        tracked=[], listing_buys=[], listing_sells=[], names={}, history={},
+        builds=[], sde_available=True,
+        location_values={60003760: 1_500_000_000.0},
+        net_worth=2_000_000_000.0,
+    )
+
+    async def _drive() -> None:
+        app = _build_app(store, report)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            networth = str(trading.query_one("#stat-networth", Static).render())
+            assert "2.00b" in networth  # filled in after the market phase
+            # The place carrying the valued assets shows its total.
+            tree = trading.query_one("#assettree", Tree)
+            assert "1.50b" in str(tree.root.children[0].label)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
 def test_ship_contents_group_into_sections_with_slot_names(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))

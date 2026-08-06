@@ -12,6 +12,7 @@ the network) and applied at the display layer.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from evetrader.esi.models import Asset
@@ -90,3 +91,20 @@ def nameable_item_ids(locations: list[AssetLocation]) -> list[int]:
     for location in locations:
         walk(location.items)
     return ids
+
+
+def _node_value(node: AssetNode, prices: Mapping[int, float]) -> float:
+    """ISK value of one item plus everything nested inside it, at the given unit prices.
+    An item with no known price contributes nothing (partial valuation, not an error)."""
+    own = prices.get(node.type_id, 0.0) * node.quantity
+    return own + sum(_node_value(child, prices) for child in node.children)
+
+
+def location_values(
+    locations: list[AssetLocation], prices: Mapping[int, float]
+) -> dict[int, float]:
+    """Total ISK value of the assets at each place, keyed by ``location_id``."""
+    return {
+        location.location_id: sum(_node_value(item, prices) for item in location.items)
+        for location in locations
+    }

@@ -8,14 +8,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import polars as pl
 
 from evetrader.advisor.state import CharacterState
 from evetrader.config import Config, HomeMarket
-from evetrader.data.assets import AssetLocation, build_asset_tree, nameable_item_ids
+from evetrader.data.assets import (
+    AssetLocation,
+    build_asset_tree,
+    location_values,
+    nameable_item_ids,
+)
 from evetrader.data.character import build_character_state
 from evetrader.data.market import best_ask_prices, history_to_frame, orders_frame_from_pages
 from evetrader.data.sde import OreYield, SdeDatabase
@@ -111,6 +116,10 @@ class OpportunityReport:
     # Whether the local SDE was available this run — lets the UI explain an empty
     # Manufacturing tab (needs `evetrader sde`) instead of leaving it blank.
     sde_available: bool
+    # Total ISK value of assets at each place (reference-market asks), keyed by
+    # location_id, and overall net worth (wallet + assets + open-order value).
+    location_values: dict[int, float] = field(default_factory=dict)
+    net_worth: float = 0.0
 
 
 def _utc_now() -> datetime:
@@ -248,18 +257,14 @@ async def _histories(
     return {type_id: days for type_id, days in results if days}
 
 
-async def _reference_ask_prices(
-    client: EsiClient, reference: HomeMarket, type_ids: set[int]
-) -> dict[int, float]:
-    """Lowest sell price at the reference market (Jita) for each wanted type. Fetches
-    only the sell side of the reference region's book (asks) — half the pages."""
-    if not type_ids:
-        return {}
+async def _reference_ask_map(client: EsiClient, reference: HomeMarket) -> dict[int, float]:
+    """Lowest sell price at the reference market (Jita) for every type on its book — the
+    single fetch shared by build-costing and asset valuation. Fetches only the sell side
+    of the reference region's book (asks) — half the pages."""
     pages = await client.get_all_pages(
         f"/markets/{reference.region_id}/orders/", params={"order_type": "sell"}
     )
-    asks = best_ask_prices(orders_frame_from_pages(pages), reference.station_id)
-    return {type_id: asks[type_id] for type_id in type_ids if type_id in asks}
+    return best_ask_prices(orders_frame_from_pages(pages), reference.station_id)
 
 
 def _expand_recipes(
@@ -311,8 +316,8 @@ def _refine_prices(
     return prices
 
 
-async def _build_opportunities(
-    client: EsiClient, config: Config, character: CharacterReport, sde: SdeDatabase
+def _build_opportunities(
+    config: Config, character: CharacterReport, sde: SdeDatabase, ask: dict[int, float]
 ) -> list[BuildOpportunity]:
     """Craft cost for each owned, manufacturable blueprint, with each input priced at the
     cheapest of buying, self-building, or refining ore into it. Per single run; best
@@ -336,10 +341,8 @@ async def _build_opportunities(
     material_types |= {mat.type_id for recipe in recipe_map.values() for mat in recipe.materials}
 
     # Each material that some asteroid ore reprocesses into can be refined instead of
-    # bought; price the whole tree plus those ores from the reference market in one pass.
+    # bought; ore prices come from the same shared reference-market asks.
     ore_sources = sde.ore_sources(material_types)
-    ore_ids = {source.ore_type_id for sources in ore_sources.values() for source in sources}
-    ask = await _reference_ask_prices(client, config.reference_market, material_types | ore_ids)
     refine = _refine_prices(ore_sources, ask, config.refining.efficiency)
 
     fees = character.character.fees  # home-station fees; sales tax is skill-based, broker approx
@@ -483,7 +486,19 @@ async def fetch_opportunities(
         trend_days=config.investment.trend_days,
         max_downtrend=config.investment.max_downtrend,
     )
-    builds = await _build_opportunities(client, config, character, sde) if sde is not None else []
+    # Reference-market (Jita) asks, reused for build-costing and asset valuation. When the
+    # reference region is the home region we already hold its book, so no extra fetch.
+    if config.reference_market.region_id == home.region_id:
+        reference_asks = best_ask_prices(region_orders, config.reference_market.station_id)
+    else:
+        reference_asks = await _reference_ask_map(client, config.reference_market)
+    builds = _build_opportunities(config, character, sde, reference_asks) if sde is not None else []
+
+    # Value the character's holdings at those asks; net worth folds in the wallet and the
+    # ISK tied up in open orders (buy escrow + the would-be proceeds of listed sells).
+    values_by_place = location_values(character.assets, reference_asks)
+    orders_value = sum(order.price * order.volume_remain for order in character.open_orders)
+    net_worth = character.character.wallet_balance + sum(values_by_place.values()) + orders_value
 
     listing_buys = [status for status in listings if status.is_buy]
     listing_sells = [status for status in listings if not status.is_buy]
@@ -508,4 +523,6 @@ async def fetch_opportunities(
         history=retained,
         builds=builds,
         sde_available=sde is not None,
+        location_values=values_by_place,
+        net_worth=net_worth,
     )

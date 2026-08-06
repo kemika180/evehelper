@@ -1093,6 +1093,7 @@ class TradingScreen(Screen[None]):
             with TabPane("Overview", id="overview"):
                 with Horizontal(id="stats"):
                     yield Static(id="stat-wallet", classes="stat")
+                    yield Static(id="stat-networth", classes="stat")
                     yield Static(id="stat-slots", classes="stat")
                     yield Static(id="stat-tax", classes="stat")
                     yield Static(id="stat-broker", classes="stat")
@@ -1314,6 +1315,8 @@ class TradingScreen(Screen[None]):
         self._render_tracked(report)
         self._render_listings(report)
         self._render_builds(report)
+        self._set_tile("#stat-networth", "NET WORTH", f"{_isk(report.net_worth)} ISK", "bold green")
+        self._render_assets(character_report, report.location_values)  # now with ISK values
         buys = sum(1 for status_ in report.tracked if status_.verdict == "BUY")
         sells = sum(1 for status_ in report.tracked if status_.verdict == "SELL")
         updated = character_report.captured_at.astimezone().strftime("%H:%M:%S")
@@ -1330,6 +1333,8 @@ class TradingScreen(Screen[None]):
         self._set_tile(
             "#stat-wallet", "WALLET", f"{_isk(report.character.wallet_balance)} ISK", "bold green"
         )
+        # Net worth needs market prices (phase 2); show a placeholder until they arrive.
+        self._set_tile("#stat-networth", "NET WORTH", "…", "bold green")
         self._set_tile(
             "#stat-slots", "FREE ORDER SLOTS", str(report.character.free_order_slots), "bold cyan"
         )
@@ -1633,15 +1638,22 @@ class TradingScreen(Screen[None]):
         if self._report is not None:
             self._render_builds(self._report)
 
-    def _render_assets(self, report: CharacterReport) -> None:
-        """All assets as a tree of places -> items -> container/ship contents,
-        filtered to the search box.
+    def _render_assets(
+        self, report: CharacterReport, location_values: dict[int, float] | None = None
+    ) -> None:
+        """All assets as a tree of places -> items -> container/ship contents, filtered to
+        the search box. Each place shows its total ISK value once the market phase supplies
+        prices (``location_values``).
 
-        Skipped when neither the assets nor the query changed, so a periodic refresh
-        leaves the tree (and the user's expand/collapse state) alone.
+        Skipped when neither the assets, the query, nor a shown value changed, so a periodic
+        refresh leaves the tree (and the user's expand/collapse state) alone.
         """
+        values = location_values or {}
         query = self._asset_query.strip().lower()
-        key = (_asset_signature(report.assets), query)
+        # Key on the *displayed* value strings, not raw floats, so tiny price drift between
+        # refreshes doesn't rebuild the tree (and reset expansions) every tick.
+        shown = tuple(sorted((place, _isk(value)) for place, value in values.items()))
+        key = (_asset_signature(report.assets), query, shown)
         if key == self._assets_key:
             return
         self._assets_key = key
@@ -1654,10 +1666,23 @@ class TradingScreen(Screen[None]):
                 continue  # nothing here matches the search
             # Places open so their top-level items show; containers/ships stay closed
             # until opened — unless a search needs them open to reveal a match.
-            place = tree.root.add(self._location_label(location.location_id, report), expand=True)
+            place_id = location.location_id
+            label = self._place_label(place_id, report, values.get(place_id))
+            place = tree.root.add(label, expand=True)
             self._add_asset_children(
                 place, location.items, report, query=query, show_all=not query, parent_flag=""
             )
+
+    def _place_label(
+        self, location_id: int, report: CharacterReport, value: float | None
+    ) -> Text | str:
+        """A place's name, with its total ISK value appended once prices are known."""
+        name = self._location_label(location_id, report)
+        if not value:
+            return name
+        label = Text(name)
+        label.append(f"   {_isk(value)} ISK", style="dim")
+        return label
 
     def _add_asset_children(
         self,
