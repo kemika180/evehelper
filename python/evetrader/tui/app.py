@@ -1246,7 +1246,8 @@ class TradingScreen(Screen[None]):
         self._render_builds(report)
         buys = sum(1 for status_ in report.tracked if status_.verdict == "BUY")
         sells = sum(1 for status_ in report.tracked if status_.verdict == "SELL")
-        status.update(f"{buys} to buy · {sells} to sell — updated")
+        updated = character_report.captured_at.astimezone().strftime("%H:%M:%S")
+        status.update(f"{buys} to buy · {sells} to sell · updated {updated}")
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
         content = Text()
