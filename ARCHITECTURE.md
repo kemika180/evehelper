@@ -48,7 +48,7 @@ eve_trading/
 │   └── evetrader/
 │       ├── __init__.py
 │       ├── config.py          # pydantic models: home region/station, capital, risk,
-│       │                      #   fee rates, watchlist (pure data — no I/O)
+│       │                      #   fee rates, trading item list (pure data — no I/O)
 │       ├── configload.py      # load Config from TOML (impure; kept out of the core)
 │       ├── cli.py             # `evetrader` entry point: `login` + run the TUI
 │       ├── session.py         # persistent set of logged-in characters (id + name)
@@ -69,6 +69,7 @@ eve_trading/
 │       │   ├── snapshot.py    # MarketSnapshot: polars frames + region + capture time
 │       │   ├── fees.py        # broker fee + sales tax from skills/standings
 │       │   ├── station_trading.py  # margins, competition/undercut, ISK/hr scoring
+│       │   ├── listings.py    # active-listings overlay: is each own order still best?
 │       │   └── hauling.py     # (milestone 6) cross-region arbitrage
 │       ├── advisor/           # PURE: rank opportunities against character state
 │       │   ├── state.py       # CharacterState (pure hand-off type) + order-slot calc
@@ -149,9 +150,20 @@ advice). Value investing (`market/investment.py`) is the first module. Planned, 
 rough order:
 
 **Near-term (small, high value)**
-- **Active-listings overlay** — show the character's own open market orders inside
-  the buy/sell lists, coloured green if still best price, red if undercut (sell) /
-  overcut (buy).
+- ~~**Active-listings overlay**~~ — DONE. Two overlay tables on the Advisor tab —
+  "YOUR BUY ORDERS" under the BUY signals, "YOUR SELL ORDERS" under the SELL signals —
+  list the character's own open market orders (`GET /characters/{id}/orders/`, already
+  fetched for the order-slot count and previously discarded), each coloured green if it
+  still leads its market (✓ best) or red if beaten (✗ undercut on a sell / overcut on a
+  buy), showing your price vs the best competing price. Tracks orders in **all regions**:
+  the home-region book is reused, and each order in another region prices its competition
+  with a cheap per-`type_id` fetch there (not a whole foreign book), so the error-limit
+  posture is respected. The best/beaten decision is pure — `market/listings.py`
+  (`classify_listings` over the book + a plain `OwnOrder` list; competition excludes the
+  character's own order ids so two of their orders don't beat each other), fed by the
+  pipeline converting the ESI `CharacterOrder` payloads to plain data at the boundary.
+  Beaten orders sort to the top (they need re-pricing). Each order's station is named via
+  the same resolvable/structure-cache path as asset places.
 - ~~**Skill-info popup**~~ — DONE. Select a skill-queue row to see its level, SP
   progress (a bar, interpolated by time for the training skill), timing, and static
   facts — rank, primary/secondary attribute, description — from a bundled skills
@@ -202,6 +214,40 @@ rough order:
     engine (invention needs a probability/expected-value extension). Documented
     simplifications: material formula ignores structure/rig bonuses; the character's
     home-station broker fee is used for the (Jita) sale.
+  - ~~Craft-cost + self-source-vs-buy reframe~~ — DONE (increment 3). The tab (renamed
+    **Crafting**) no longer leads with build-to-sell margin; it answers "what does this
+    cost to craft, and is self-sourcing the materials cheaper than buying them?" Columns
+    are Buy-mats (every material bought at Jita) · Self-source (each input at the cheaper
+    of buying or building it) · Savings, default-sorted by savings; `MaterialsScreen`
+    shows per-material buy vs build with the chosen source marked. The engine gained a
+    pure, depth-capped, cycle-guarded recursion (`build_unit_cost` over a product→recipe
+    map): a material with its own manufacturing blueprint is costed by building it in
+    turn, else bought. `data/sde.py.recipe_for_product` is the reverse (product→blueprint)
+    lookup, and the pipeline expands each owned blueprint into the transitive closure of
+    **owned** sub-component blueprints (`_expand_recipes`, filtered by the character's
+    blueprint types) and prices the whole tree from the reference market's asks — still
+    no new keystroke ESI calls. A sub-component whose blueprint the character doesn't own
+    stays buy-only: self-building it would mean acquiring the blueprint too, a cost this
+    doesn't model. `BuildAnalysis` keeps the
+    old sell/margin fields (the Assets-tab blueprint popup still shows build-vs-buy) but
+    adds `craft_cost`/`savings`. Documented simplifications: sub-builds assume ME 0 (the
+    sub-blueprint's researched ME isn't threaded through); reaction/PI intermediates
+    aren't treated as buildable yet (only manufacturing, activityID 1).
+  - ~~Refining as a third source~~ — DONE (increment 4). A material can now also be
+    obtained by mining-and-refining ore, so each bill line is costed at the cheapest of
+    **buy / build / refine** and `MaterialLine.source` says which (the `MaterialsScreen`
+    gained a Refine column). `data/sde.py.ore_sources` reverse-looks-up the asteroid ores
+    (`invTypeMaterials` ⋈ `invTypes.portionSize` ⋈ `invGroups`, category 25 only — modules/
+    ships that also reprocess into minerals are excluded) that yield each wanted mineral
+    and their per-unit yield; the pipeline prices those ores in the same reference-market
+    pass and `_refine_prices` turns them into a per-mineral unit cost. The refine model is
+    **naive** (`config.refining.efficiency`, a user-owned reprocessing yield like the fee
+    rates): a mineral's refine cost = cheapest ore's ask ÷ (its yield of that mineral ×
+    efficiency), **ignoring the other minerals the ore also produces** — chosen (2026-07-26)
+    over byproduct-credited/value-weighted allocation for simplicity, so an ore is only
+    cheap for the mineral it's densest in and no byproduct prices are needed. Refining
+    also feeds the recursive sub-build costing (`build_unit_cost` threads `refine_prices`),
+    so a component's mineral inputs can be refined too.
 - **PI (planetary interaction)** tracking & assistance. Self-contained (colony setups,
   extractors); its profitability view consumes the same build-vs-buy engine above.
 - **Hauling / regional arbitrage** (Jita ↔ your hub) — **after** crafting/PI, because
@@ -256,6 +302,35 @@ rough order:
   pipeline but kept for a future station-to-station transfer / hauling source; the
   old `advisor/source.py`+`engine.py` (OpportunitySource Protocol / station-trade
   Opportunity) were removed and will be reintroduced when a second source exists.
+- **Trading scope: a fixed set of long-horizon items as a watchlist** (2026-07-26).
+  The broad whole-market discovery scan (`liquid_types` + `scan_candidates`) was
+  retired: the value engine now runs only over `config.trading_type_ids`, which
+  defaults to PLEX, the Skill Extractor, and the Large + Small Skill Injector — the
+  items worth holding and trading across patches. Nothing else scanned. `liquid_types`
+  and the threshold-only `find_opportunities` are kept (still unit-tested) for a future
+  re-widening but are no longer called by the pipeline.
+- **Tracked-item watchlist on the Overview tab** (2026-07-26). With only a handful of
+  tracked items, the old BUY/SELL signal tables (which showed a row *only* when a price
+  crossed a threshold, so mostly sat empty) were replaced by a compact watchlist on the
+  **Overview** tab that always lists all tracked items: Item · Now · Trend · Fair ·
+  Range · Advice, one row each with a BUY / SELL / HOLD verdict and the item's current
+  trend against its window median. The pure `summarize_tracked` → `TrackedStatus`
+  (`market/investment.py`) produces one status per tracked type — including the HOLD
+  majority and a `has_data`-flagged placeholder for a type with no live quote/history —
+  reusing the same channel/threshold logic as `find_opportunities` but never dropping an
+  item. Selecting a row still opens its price-history chart. The **Trading** tab now
+  holds only the own-order overlays (YOUR BUY/SELL ORDERS).
+- **PLEX trades on the global market, not the home station book** (2026-07-26). PLEX
+  (type 44992) has *zero* orders on any regional station order book: it trades on EVE's
+  special region-wide global PLEX market (region **19000001**). The Forge's regional
+  history for PLEX is stale legacy data (reads ~6m while the live global price is ~4.5m),
+  so both orders and history must come from 19000001. `config.special_markets` maps such
+  type ids → a region; the pipeline (`_special_market_book`) fetches each special type's
+  orders + history from that region, **relabels the orders' `location_id` to the home
+  station**, and folds them into the book handed to `summarize_tracked` — so the pure,
+  station-scoped engine prices PLEX uniformly with everything else and never has to know
+  about the global market. Without this PLEX reads "no data". The three skill items
+  (extractor/injectors) are ordinary station-traded items and need no override.
 - **Multi-character**: implemented — the keyring stores a refresh token per
   character id, `session.py` persists the set of logged-in characters (id + name),
   and the TUI opens on a picker (add via SSO login / remove) before the per-

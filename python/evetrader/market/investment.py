@@ -188,3 +188,139 @@ def find_opportunities(
 
     signals.sort(key=lambda signal: signal.expected_profit, reverse=True)
     return signals
+
+
+@dataclass(frozen=True)
+class TrackedStatus:
+    """A snapshot of one watched item for the tracked-item panel: today's price, how it
+    sits in its recent range, which way it's trending, and the BUY / SELL / HOLD verdict.
+
+    Unlike an ``InvestmentSignal``, one is produced for *every* tracked item — including
+    the HOLD majority that crosses no threshold — so the panel always shows the whole
+    watchlist. An item with no usable history or no live quote comes back flagged
+    (``has_data`` False) rather than dropped."""
+
+    type_id: int
+    verdict: str  # "BUY" | "SELL" | "HOLD" | "NODATA"
+    has_data: bool
+    price: float  # today's reference quote: the ask if one rests, else the bid
+    fair_value: float  # window median (the reversion target)
+    channel_position: float  # where `price` sits in the window range: 0 = low, 1 = high
+    trend: float  # (recent short-window average - fair) / fair; positive rising, negative falling
+    held: int  # units held at the station (the SELL side looks at these)
+    note: str
+
+
+def _verdict(
+    *,
+    ask: float | None,
+    bid: float | None,
+    fair: float,
+    low: float,
+    width: float,
+    short_avg: float,
+    held: int,
+    buy_position: float,
+    sell_position: float,
+    max_downtrend: float,
+) -> str:
+    """The same thresholds ``find_opportunities`` applies, collapsed to one verdict so an
+    item crossing neither the buy nor the sell line still reports HOLD."""
+    if held > 0 and bid is not None and bid > fair and (bid - low) / width >= sell_position:
+        return "SELL"
+    # The buy side additionally passes the downtrend guard: the recent average must not
+    # have fallen well below fair value (a structural slide, not a revertible dip).
+    reverting = short_avg >= fair * (1.0 - max_downtrend)
+    if ask is not None and ask < fair and (ask - low) / width <= buy_position and reverting:
+        return "BUY"
+    return "HOLD"
+
+
+def _trend_note(trend: float, window: int) -> str:
+    if abs(trend) < 0.005:
+        return f"flat against its {window}d median"
+    direction = "above" if trend > 0 else "below"
+    return f"{abs(trend):.0%} {direction} its {window}d median"
+
+
+def summarize_tracked(
+    *,
+    type_ids: list[int],
+    orders: pl.DataFrame,
+    history: pl.DataFrame,
+    station_id: int,
+    holdings: dict[int, int],
+    window: int,
+    buy_position: float,
+    sell_position: float,
+    trend_days: int,
+    max_downtrend: float,
+) -> list[TrackedStatus]:
+    """A verdict + price trend for every tracked type, kept in the given order. A type
+    with no usable history or no live quote is flagged (``has_data`` False), not dropped,
+    so the watchlist panel can always show the full set."""
+    book = _channels(history, window, trend_days).join(
+        _current_prices(orders, station_id), on="type_id", how="inner"
+    )
+    rows = {int(row["type_id"]): row for row in book.iter_rows(named=True)}
+
+    statuses: list[TrackedStatus] = []
+    for type_id in type_ids:
+        held = holdings.get(type_id, 0)
+        row = rows.get(type_id)
+        fair = float(row["fair_value"]) if row and row["fair_value"] is not None else 0.0
+        low = float(row["low_band"]) if row and row["low_band"] is not None else 0.0
+        high = float(row["high_band"]) if row and row["high_band"] is not None else 0.0
+        ask = float(row["ask"]) if row and row["ask"] is not None else None
+        bid = float(row["bid"]) if row and row["bid"] is not None else None
+        short_avg = float(row["short_avg"]) if row and row["short_avg"] is not None else fair
+        days = int(row["days"]) if row else 0
+        # Today's reference quote: the resting ask if there is one, else the bid.
+        quote = ask if ask is not None and ask > 0.0 else bid
+        price = quote if quote is not None and quote > 0.0 else 0.0
+
+        if row is None or fair <= 0.0 or high <= low or days < window // 2 or price <= 0.0:
+            statuses.append(
+                TrackedStatus(
+                    type_id=type_id,
+                    verdict="NODATA",
+                    has_data=False,
+                    price=price,
+                    fair_value=fair,
+                    channel_position=0.0,
+                    trend=0.0,
+                    held=held,
+                    note="no recent market data",
+                )
+            )
+            continue
+
+        width = high - low
+        position = max(0.0, min(1.0, (price - low) / width))
+        trend = (short_avg - fair) / fair
+        verdict = _verdict(
+            ask=ask,
+            bid=bid,
+            fair=fair,
+            low=low,
+            width=width,
+            short_avg=short_avg,
+            held=held,
+            buy_position=buy_position,
+            sell_position=sell_position,
+            max_downtrend=max_downtrend,
+        )
+        statuses.append(
+            TrackedStatus(
+                type_id=type_id,
+                verdict=verdict,
+                has_data=True,
+                price=price,
+                fair_value=fair,
+                channel_position=position,
+                trend=trend,
+                held=held,
+                note=_trend_note(trend, window),
+            )
+        )
+    return statuses

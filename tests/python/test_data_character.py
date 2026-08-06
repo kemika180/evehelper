@@ -8,7 +8,7 @@ import pytest
 from evetrader.config import Config, HomeMarket, RiskPreferences
 from evetrader.data.character import build_character_state
 from evetrader.esi.client import EsiClient
-from evetrader.esi.models import CharacterSkills
+from evetrader.esi.models import CharacterOrder, CharacterSkills
 
 _STATION = 60003760
 _OWNER_CORP = 1000035
@@ -89,8 +89,12 @@ def test_build_character_state_computes_fees_and_free_slots() -> None:
         transport = httpx.MockTransport(_handler)
         async with httpx.AsyncClient(transport=transport) as http:
             client = EsiClient(_config(), http)
+            open_orders = [
+                CharacterOrder.model_validate(_character_order(1)),
+                CharacterOrder.model_validate(_character_order(2)),
+            ]
             state = await build_character_state(
-                client, _config(), 42, "tok", _STATION, _SKILLS
+                client, _config(), 42, "tok", _STATION, _SKILLS, open_orders
             )
 
             assert state.wallet_balance == 5_000_000.0

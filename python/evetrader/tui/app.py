@@ -21,7 +21,7 @@ from typing import ClassVar, TypeVar
 from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.binding import BindingType
+from textual.binding import Binding, BindingType
 from textual.color import Color
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
@@ -51,8 +51,9 @@ from evetrader.esi.models import (
     Skill,
     SkillQueueEntry,
 )
-from evetrader.market.investment import InvestmentSignal
-from evetrader.market.production import BuildAnalysis
+from evetrader.market.investment import TrackedStatus
+from evetrader.market.listings import ListingStatus
+from evetrader.market.production import BuildAnalysis, MaterialLine
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
@@ -394,9 +395,19 @@ TreeData = TypeVar("TreeData")
 
 
 class DepthTree(Tree[TreeData]):
-    """A tree that tints each row's full-width background by depth, for readability."""
+    """A tree that tints each row's full-width background by depth, for readability.
+
+    Also accepts vim hjkl motion: j/k mirror the down/up arrows, while l expands (or
+    toggles) the focused node and h steps out to its parent."""
 
     DEFAULT_CSS = "DepthTree { overflow-x: hidden; }"
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("l", "toggle_node", "Expand", show=False),
+        Binding("h", "cursor_parent", "Parent", show=False),
+    ]
 
     def render_label(self, node: TreeNode[TreeData], base_style: Style, style: Style) -> Text:
         label = super().render_label(node, base_style, style)
@@ -413,6 +424,26 @@ class DepthTree(Tree[TreeData]):
         label.pad_right(max(0, self.size.width - label.cell_len))  # fill the row width
         label.stylize(Style(bgcolor=bar.rich_color))  # bg only, keep the fg accents
         return label
+
+
+class NavDataTable(DataTable[object]):
+    """A DataTable that also accepts vim hjkl motion, mirroring the arrow keys."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("h", "cursor_left", "Left", show=False),
+        Binding("l", "cursor_right", "Right", show=False),
+    ]
+
+
+class NavOptionList(OptionList):
+    """An OptionList that also accepts vim j/k motion, mirroring the up/down arrows."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+    ]
 
 
 FetchCharacter = Callable[[], Awaitable[CharacterReport]]
@@ -457,11 +488,19 @@ class PriceHistoryScreen(ModalScreen[None]):
     PriceHistoryScreen #plothint { padding: 0 1; color: $text-muted; }
     """
 
-    def __init__(self, title: str, days: list[MarketHistoryDay], signal: InvestmentSignal) -> None:
+    def __init__(
+        self,
+        title: str,
+        days: list[MarketHistoryDay],
+        *,
+        fair_value: float,
+        current_price: float,
+    ) -> None:
         super().__init__()
         self._title = title
         self._days = sorted(days, key=lambda day: day.date)
-        self._signal = signal
+        self._fair_value = fair_value
+        self._current_price = current_price
 
     def compose(self) -> ComposeResult:
         with Vertical(id="plotbox"):
@@ -480,8 +519,8 @@ class PriceHistoryScreen(ModalScreen[None]):
             return
         averages = [day.average for day in days]
         plt.plot(list(range(count)), averages, color="cyan")
-        plt.hline(self._signal.fair_value, color="magenta")
-        plt.hline(self._signal.current_price, color="yellow")
+        plt.hline(self._fair_value, color="magenta")
+        plt.hline(self._current_price, color="yellow")
 
         # X axis: real dates at ~6 evenly spaced positions instead of 0..N indices.
         ticks = min(6, count)
@@ -494,14 +533,14 @@ class PriceHistoryScreen(ModalScreen[None]):
         )
 
         # Y axis: round, human-readable ISK values.
-        low = min(*averages, self._signal.current_price, self._signal.fair_value)
-        high = max(*averages, self._signal.current_price, self._signal.fair_value)
+        low = min(*averages, self._current_price, self._fair_value)
+        high = max(*averages, self._current_price, self._fair_value)
         y_ticks = _nice_ticks(low, high, 5)
         plt.yticks(y_ticks, [_isk(value) for value in y_ticks])
 
         plt.title(
-            f"{self._title}   ·   now {_isk(self._signal.current_price)}   ·   "
-            f"fair {_isk(self._signal.fair_value)}   ·   last {count} days"
+            f"{self._title}   ·   now {_isk(self._current_price)}   ·   "
+            f"fair {_isk(self._fair_value)}   ·   last {count} days"
         )
 
 
@@ -764,7 +803,7 @@ class IndustryJobScreen(ModalScreen[None]):
 
 class MaterialsScreen(ModalScreen[None]):
     """The bill of materials for one build: each input, its ME-adjusted quantity (per
-    run), unit Jita price, and line cost."""
+    run), and the cost to buy it vs self-build it, with the cheaper source marked."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         ("escape", "dismiss", "Close"),
@@ -775,7 +814,7 @@ class MaterialsScreen(ModalScreen[None]):
     DEFAULT_CSS = """
     MaterialsScreen { align: center middle; }
     MaterialsScreen #matbox {
-        width: 72;
+        width: 82;
         height: auto;
         max-height: 90%;
         overflow-y: auto;
@@ -804,26 +843,87 @@ class MaterialsScreen(ModalScreen[None]):
         analysis = self._build.analysis
         text = Text()
         text.append(f"{self._title}\n", style="bold")
-        text.append(f"ME {self._build.material_efficiency}  ·  materials per run\n", style="dim")
-        text.append(f"build cost  {_isk(analysis.material_cost)}\n", style="cyan")
-        if analysis.missing_material_prices:
-            missing = len(analysis.missing_material_prices)
-            text.append(f"{missing} material(s) not priced at Jita\n", style="yellow")
+        text.append(f"ME {self._build.material_efficiency}  ·  per run\n", style="dim")
+        text.append(f"buy materials  {_isk(analysis.material_cost)}\n", style="dim")
+        text.append(f"self-source    {_isk(analysis.craft_cost)}\n", style="cyan")
+        if not analysis.missing_material_prices and analysis.craft_priced and analysis.savings > 0:
+            fraction = analysis.savings_fraction
+            pct = f" ({fraction:.0%})" if fraction is not None else ""
+            text.append(f"you save       {_isk(analysis.savings)}{pct}\n", style="green")
+        if analysis.craft_missing_prices:
+            missing = len(analysis.craft_missing_prices)
+            text.append(f"{missing} material(s) have no price at Jita\n", style="yellow")
         text.append("\n")
+        header = f"{'Qty':>8}  {'Material':<24} {'Buy':>9} {'Build':>9} {'Refine':>9}  Src"
+        text.append(f"{header}\n", style="bold dim")
         for line in analysis.materials:
-            name = self._names.get(line.type_id, str(line.type_id))
-            if len(name) > 28:
-                name = name[:27] + "…"
-            cost = _isk(line.line_cost) if line.line_cost is not None else "—"
-            row = f"{line.quantity:>10,}  {name:<28} {cost:>10}"
-            text.append(f"{row}\n", style="" if line.line_cost is not None else "dim")
+            self._append_material(text, line)
         return text
+
+    def _append_material(self, text: Text, line: MaterialLine) -> None:
+        """One bill line: quantity, name, the buy/build/refine line-costs, cheapest source."""
+        name = self._names.get(line.type_id, str(line.type_id))
+        if len(name) > 24:
+            name = name[:23] + "…"
+        buy = _isk(line.line_cost) if line.line_cost is not None else "—"
+        build = self._line(line.build_unit_cost, line.quantity)
+        refine = self._line(line.refine_unit_cost, line.quantity)
+        marker = {"buy": "buy", "build": "▶ build", "refine": "▶ refine", "?": "?"}[line.source]
+        style = {"buy": "", "build": "green", "refine": "cyan", "?": "dim"}[line.source]
+        row = f"{line.quantity:>8,}  {name:<24} {buy:>9} {build:>9} {refine:>9}  {marker}"
+        text.append(f"{row}\n", style=style)
+
+    @staticmethod
+    def _line(unit_cost: float | None, quantity: int) -> str:
+        """A per-line ISK cost from a unit cost, or an em dash when that source is n/a."""
+        return _isk(unit_cost * quantity) if unit_cost is not None else "—"
+
+
+# Tracked-item verdict -> (label, style) for the Overview watchlist.
+_VERDICT_DISPLAY: dict[str, tuple[str, str]] = {
+    "BUY": ("BUY", "bold green"),
+    "SELL": ("SELL", "bold yellow"),
+    "HOLD": ("hold", "dim"),
+    "NODATA": ("no data", "dim"),
+}
+
+
+def _trend_cell(status: TrackedStatus) -> Text:
+    """An arrow + magnitude for how the recent price sits against the window median."""
+    if not status.has_data:
+        return Text("—", justify="right", style="dim")
+    trend = status.trend
+    if abs(trend) < 0.005:
+        return Text("→ flat", justify="right", style="dim")
+    if trend > 0:
+        return Text(f"↑ {trend:.0%}", justify="right", style="green")
+    return Text(f"↓ {abs(trend):.0%}", justify="right", style="red")
 
 
 class TradingScreen(Screen[None]):
     """Per-character advisor view: opportunities plus character and skill-queue."""
 
-    BINDINGS: ClassVar[list[BindingType]] = [("escape", "app.pop_screen", "Switch character")]
+    BINDINGS: ClassVar[list[BindingType]] = [
+        ("escape", "app.pop_screen", "Switch character"),
+        Binding("slash", "focus_search", "Search", show=False),
+    ]
+
+    # Pane id -> the scrollable widget to focus when its tab is activated, so the arrow
+    # keys (and hjkl) scroll it straight away without a click or tab-in.
+    _TAB_FOCUS: ClassVar[dict[str, str]] = {
+        "overview": "#tracked",
+        "trading": "#my-buys",
+        "queue": "#skillqueue",
+        "skills": "#skilltree",
+        "assets": "#assettree",
+        "industry-tab": "#industry",
+        "manufacturing-tab": "#manufacturing",
+    }
+    # Tabs whose "/" shortcut jumps to a filter box, by pane id -> that box's selector.
+    _TAB_SEARCH: ClassVar[dict[str, str]] = {
+        "assets": "#assetsearch",
+        "manufacturing-tab": "#manufacturing-search",
+    }
 
     DEFAULT_CSS = """
     TradingScreen #location { padding: 0 2; text-style: bold; color: $accent; }
@@ -847,11 +947,16 @@ class TradingScreen(Screen[None]):
         background: $boost;
     }
     TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
-    TradingScreen #buys, TradingScreen #sells, TradingScreen #skillqueue,
+    TradingScreen #tracked, TradingScreen #skillqueue,
     TradingScreen #skilltree, TradingScreen #assettree, TradingScreen #industry,
     TradingScreen #manufacturing {
         margin: 0 1;
         height: 1fr;
+    }
+    TradingScreen #my-buys, TradingScreen #my-sells {
+        margin: 0 1;
+        height: auto;
+        max-height: 8;
     }
     TradingScreen #assetsearch { margin: 0 1; }
     TradingScreen #manufacturing-hint { padding: 0 2; color: $text-muted; }
@@ -875,44 +980,47 @@ class TradingScreen(Screen[None]):
         # doesn't rebuild it (resetting cursor/scroll/expansions) when unchanged.
         self._skills_key: object | None = None
         self._assets_key: object | None = None
-        self._buys_key: object | None = None
-        self._sells_key: object | None = None
+        self._tracked_key: object | None = None
+        self._listings_key: object | None = None
         self._builds_key: object | None = None
         self._asset_query: str = ""
         self._mfg_query: str = ""
-        self._mfg_sort: tuple[int, bool] = (4, True)  # Manufacturing: margin, descending
+        self._mfg_sort: tuple[int, bool] = (4, True)  # Crafting: self-source savings, descending
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="location")
         yield Static("Fetching market data… (select a row for its price chart)", id="status")
         with TabbedContent():
-            with TabPane("Advisor", id="advisor"):
+            with TabPane("Overview", id="overview"):
                 with Horizontal(id="stats"):
                     yield Static(id="stat-wallet", classes="stat")
                     yield Static(id="stat-slots", classes="stat")
                     yield Static(id="stat-tax", classes="stat")
                     yield Static(id="stat-broker", classes="stat")
                 yield Static("", id="training")
-                yield Static("BUY — trading below normal", classes="section")
-                yield DataTable(id="buys", zebra_stripes=True, cursor_type="row")
-                yield Static("SELL — your holdings above normal", classes="section")
-                yield DataTable(id="sells", zebra_stripes=True, cursor_type="row")
+                yield Static("TRACKED ITEMS — trend vs recent value", classes="section")
+                yield NavDataTable(id="tracked", zebra_stripes=True, cursor_type="row")
+            with TabPane("Trading", id="trading"):
+                yield Static("YOUR BUY ORDERS", classes="section", id="my-buys-section")
+                yield NavDataTable(id="my-buys", zebra_stripes=True, cursor_type="row")
+                yield Static("YOUR SELL ORDERS", classes="section", id="my-sells-section")
+                yield NavDataTable(id="my-sells", zebra_stripes=True, cursor_type="row")
             with TabPane("Skill Queue", id="queue"):
-                yield DataTable(id="skillqueue", zebra_stripes=True, cursor_type="row")
+                yield NavDataTable(id="skillqueue", zebra_stripes=True, cursor_type="row")
             with TabPane("Skills", id="skills"):
                 yield DepthTree[int]("Skills", id="skilltree")
             with TabPane("Assets", id="assets"):
                 yield Input(placeholder="Search items…", id="assetsearch")
                 yield DepthTree[AssetNode]("Assets", id="assettree")
             with TabPane("Industry", id="industry-tab"):
-                yield DataTable(id="industry", zebra_stripes=True, cursor_type="row")
-            with TabPane("Manufacturing", id="manufacturing-tab"):
+                yield NavDataTable(id="industry", zebra_stripes=True, cursor_type="row")
+            with TabPane("Crafting", id="manufacturing-tab"):
                 yield Static("", id="manufacturing-hint")
                 if self._download_sde_fn is not None:
                     yield Button("⬇ Download / update SDE", id="download-sde", compact=True)
                 yield Input(placeholder="Search products…", id="manufacturing-search")
-                yield DataTable(id="manufacturing", zebra_stripes=True, cursor_type="row")
+                yield NavDataTable(id="manufacturing", zebra_stripes=True, cursor_type="row")
         yield Footer()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -925,16 +1033,20 @@ class TradingScreen(Screen[None]):
         if event.data_table.id == "manufacturing":
             self._open_materials(event)
             return
+        if event.data_table.id != "tracked":
+            return  # order-overlay rows (my-buys/my-sells) carry no drill-down
         if self._report is None or event.row_key.value is None:
             return
         type_id = int(event.row_key.value)
         days = self._report.history.get(type_id)
-        signal = next(
-            (s for s in (*self._report.buys, *self._report.sells) if s.type_id == type_id), None
-        )
-        if days and signal is not None:
+        status = next((s for s in self._report.tracked if s.type_id == type_id), None)
+        if days and status is not None and status.has_data:
             name = self._report.names.get(type_id, str(type_id))
-            self.app.push_screen(PriceHistoryScreen(name, days, signal))
+            self.app.push_screen(
+                PriceHistoryScreen(
+                    name, days, fair_value=status.fair_value, current_price=status.price
+                )
+            )
 
     def _open_skill_info(self, event: DataTable.RowSelected) -> None:
         if self._character is None or event.row_key.value is None:
@@ -1027,21 +1139,37 @@ class TradingScreen(Screen[None]):
         return self._character.names.get(skill_id, str(skill_id))
 
     def on_mount(self) -> None:
-        self.query_one("#buys", DataTable).add_columns(
-            "Item", "Now", "Fair", "Range", "Units", "Est. profit", "Note"
+        self.query_one("#tracked", DataTable).add_columns(
+            "Item", "Now", "Trend", "Fair", "Range", "Advice"
         )
-        self.query_one("#sells", DataTable).add_columns(
-            "Item", "Held", "Bid", "Fair", "Range", "Est. gain", "Note"
-        )
+        for order_table in ("#my-buys", "#my-sells"):
+            self.query_one(order_table, DataTable).add_columns(
+                "Item", "Where", "Qty", "Your price", "Best other", "Status"
+            )
         self.query_one("#skillqueue", DataTable).add_columns("Skill", "Time left", "Completion")
         self.query_one("#industry", DataTable).add_columns(
             "Activity", "Item", "Runs", "Time left", "Where"
         )
         self.query_one("#manufacturing", DataTable).add_columns(
-            "Product", "ME", "Materials", "Sell (net)", "Margin", ""
+            "Product", "ME", "Buy mats", "Self-source", "Savings"
         )
         self.run_worker(self._refresh(), exclusive=True)
         self.set_interval(self._interval, self._refresh)
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Give the newly-shown tab's scrollable area focus, so the arrow keys and hjkl
+        scroll it immediately instead of leaving focus on the tab bar."""
+        pane = event.pane
+        target = self._TAB_FOCUS.get(pane.id) if pane is not None and pane.id else None
+        if target is not None:
+            self.query_one(target).focus()
+
+    def action_focus_search(self) -> None:
+        """"/" jumps to the active tab's filter box (Assets / Crafting), if it has one."""
+        active = self.query_one(TabbedContent).active
+        selector = self._TAB_SEARCH.get(active)
+        if selector is not None:
+            self.query_one(selector, Input).focus()
 
     async def _refresh(self) -> None:
         status = self.query_one("#status", Static)
@@ -1069,10 +1197,12 @@ class TradingScreen(Screen[None]):
             status.update(f"[Market scan failed] {type(error).__name__}: {error}")
             return
         self._report = report
-        self._render_buys(report)
-        self._render_sells(report)
+        self._render_tracked(report)
+        self._render_listings(report)
         self._render_builds(report)
-        status.update(f"{len(report.buys)} to buy · {len(report.sells)} to sell — updated")
+        buys = sum(1 for status_ in report.tracked if status_.verdict == "BUY")
+        sells = sum(1 for status_ in report.tracked if status_.verdict == "SELL")
+        status.update(f"{buys} to buy · {sells} to sell — updated")
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
         content = Text()
@@ -1091,44 +1221,63 @@ class TradingScreen(Screen[None]):
         self._set_tile("#stat-tax", "SALES TAX", f"{fees.sales_tax:.2%}", "bold yellow")
         self._set_tile("#stat-broker", "BROKER FEE", f"{fees.broker_fee:.2%}", "bold yellow")
 
-    def _render_buys(self, report: OpportunityReport) -> None:
-        key = tuple(report.buys)  # frozen signals -> compares by value; skip if unchanged
-        if key == self._buys_key:
+    def _render_tracked(self, report: OpportunityReport) -> None:
+        """The Overview watchlist: every tracked item with today's price, its trend
+        against the recent median, where it sits in its range, and a BUY/SELL/HOLD
+        verdict. Selecting a row opens that item's price-history chart."""
+        key = tuple(report.tracked)  # frozen statuses -> compares by value; skip if unchanged
+        if key == self._tracked_key:
             return
-        self._buys_key = key
-        table = self.query_one("#buys", DataTable)
+        self._tracked_key = key
+        table = self.query_one("#tracked", DataTable)
         table.clear()
-        for index, signal in enumerate(report.buys):
-            name = report.names.get(signal.type_id, str(signal.type_id))
+        for status in report.tracked:
+            name = report.names.get(status.type_id, str(status.type_id))
+            label, style = _VERDICT_DISPLAY[status.verdict]
+            now = _isk(status.price) if status.price > 0.0 else "—"
+            fair = _isk(status.fair_value) if status.has_data else "—"
+            band = f"{status.channel_position:.0%}" if status.has_data else "—"
             table.add_row(
-                Text(name, style="bold" if index == 0 else ""),
-                Text(_isk(signal.current_price), justify="right"),
-                Text(_isk(signal.fair_value), justify="right", style="dim"),
-                Text(f"{signal.channel_position:.0%}", justify="right", style="green"),
-                Text(f"{signal.quantity:,}", justify="right"),
-                Text(_isk(signal.expected_profit), justify="right", style="bold green"),
-                Text(signal.reasoning, style="dim"),
-                key=str(signal.type_id),
+                Text(name, style="bold"),
+                Text(now, justify="right"),
+                _trend_cell(status),
+                Text(fair, justify="right", style="dim"),
+                Text(band, justify="right", style="dim"),
+                Text(label, style=style),
+                key=str(status.type_id),
             )
 
-    def _render_sells(self, report: OpportunityReport) -> None:
-        key = tuple(report.sells)
-        if key == self._sells_key:
+    def _render_listings(self, report: OpportunityReport) -> None:
+        # Both overlays share one signature — a periodic refresh with unchanged orders
+        # leaves the cursor/scroll of both tables alone.
+        key = (tuple(report.listing_buys), tuple(report.listing_sells))
+        if key == self._listings_key:
             return
-        self._sells_key = key
-        table = self.query_one("#sells", DataTable)
+        self._listings_key = key
+        self._fill_listings("#my-buys", report.listing_buys, report, "overcut")
+        self._fill_listings("#my-sells", report.listing_sells, report, "undercut")
+
+    def _fill_listings(
+        self, table_id: str, statuses: list[ListingStatus], report: OpportunityReport, beaten: str
+    ) -> None:
+        table = self.query_one(table_id, DataTable)
         table.clear()
-        for signal in report.sells:
-            name = report.names.get(signal.type_id, str(signal.type_id))
+        for status in statuses:
+            name = report.names.get(status.type_id, str(status.type_id))
+            where = str(status.location_id)
+            if self._character is not None:
+                where = self._character.names.get(status.location_id, where)
+            best = _isk(status.best_competing) if status.best_competing is not None else "—"
+            style = "green" if status.is_best else "red"
+            label = "✓ best" if status.is_best else f"✗ {beaten}"
             table.add_row(
                 Text(name),
-                Text(f"{signal.quantity:,}", justify="right"),
-                Text(_isk(signal.current_price), justify="right"),
-                Text(_isk(signal.fair_value), justify="right", style="dim"),
-                Text(f"{signal.channel_position:.0%}", justify="right", style="yellow"),
-                Text(_isk(signal.expected_profit), justify="right", style="bold yellow"),
-                Text(signal.reasoning, style="dim"),
-                key=str(signal.type_id),
+                Text(where, style="dim"),
+                Text(f"{status.volume_remain:,}", justify="right"),
+                Text(_isk(status.price), justify="right"),
+                Text(best, justify="right", style="dim"),
+                Text(label, style=style),
+                key=str(status.order_id),
             )
 
     def _sorted_builds(self, report: OpportunityReport) -> list[tuple[BuildOpportunity, int]]:
@@ -1163,17 +1312,17 @@ class TradingScreen(Screen[None]):
         elif column == 2:
             rows.sort(key=lambda row: row[0].analysis.material_cost, reverse=reverse)
         elif column == 3:
-            rows.sort(key=lambda row: row[0].analysis.net_product_value, reverse=reverse)
-        elif column == 4:
-            rows.sort(key=lambda row: row[0].analysis.margin, reverse=reverse)
+            rows.sort(key=lambda row: row[0].analysis.craft_cost, reverse=reverse)
         else:
-            rows.sort(key=lambda row: row[0].analysis.verdict, reverse=reverse)
+            rows.sort(key=lambda row: row[0].analysis.savings, reverse=reverse)
         return rows
 
     def _render_builds(self, report: OpportunityReport) -> None:
-        """Owned blueprints, filtered/sorted, ranked by Jita build margin (per run);
-        BUILD rows in green, partial rows (a material with no Jita price) flagged. When
-        there's nothing to show, the hint line says why so the tab is never blank."""
+        """Owned blueprints, filtered/sorted, showing the per-run cost to craft: buying
+        every material vs self-sourcing each at its cheapest (build a sub-component where
+        that's cheaper than buying it), and the resulting savings. Rows that save by
+        self-sourcing are bold; partial rows (a material with no Jita price) are flagged.
+        When there's nothing to show, the hint line says why so the tab is never blank."""
         # Hint + download-button visibility have no cursor, so refresh them every call.
         self.query_one("#manufacturing-hint", Static).update(self._manufacturing_hint(report))
         if self._download_sde_fn is not None:
@@ -1190,52 +1339,57 @@ class TradingScreen(Screen[None]):
         for build, copies in rows:
             analysis = build.analysis
             name = report.names.get(build.product_type_id, str(build.product_type_id))
-            if not analysis.product_priced:
-                # Product not sold at Jita — shown, but its value/margin is unknown.
-                verdict, verdict_style = "no price", "yellow"
-                sell_cell = Text("—", justify="right", style="dim")
-                margin_cell = Text("—", justify="right", style="dim")
+            buy_partial = bool(analysis.missing_material_prices)
+            craft_partial = not analysis.craft_priced
+
+            buy_cell = Text(
+                _isk(analysis.material_cost),
+                justify="right",
+                style="yellow" if buy_partial else "dim",
+            )
+            craft_cell = Text(
+                _isk(analysis.craft_cost), justify="right", style="yellow" if craft_partial else ""
+            )
+            worthwhile = False
+            if buy_partial or craft_partial:
+                savings_cell = Text("partial", justify="right", style="yellow")
+            elif analysis.savings > 0:
+                worthwhile = True
+                fraction = analysis.savings_fraction
+                label = _isk(analysis.savings)
+                if fraction is not None:
+                    label += f" ({fraction:.0%})"
+                savings_cell = Text(label, justify="right", style="green")
             else:
-                positive = analysis.margin > 0
-                margin_style = "green" if positive else "yellow"
-                sell_cell = Text(_isk(analysis.net_product_value), justify="right", style="dim")
-                margin_cell = Text(
-                    f"{'+' if positive else ''}{_isk(analysis.margin)}",
-                    justify="right",
-                    style=margin_style,
-                )
-                if analysis.missing_material_prices:
-                    verdict, verdict_style = "partial", "yellow"
-                else:
-                    verdict = analysis.verdict
-                    verdict_style = "bold green" if verdict == "BUILD" else "dim"
-            product = Text(name, style="bold" if verdict == "BUILD" else "")
+                savings_cell = Text("—", justify="right", style="dim")
+
+            product = Text(name, style="bold" if worthwhile else "")
             if copies > 1:
                 product.append(f"  ×{copies}", style="cyan")  # noqa: RUF001 (copies owned)
             table.add_row(
                 product,
                 Text(f"ME {build.material_efficiency}", justify="right", style="dim"),
-                Text(_isk(analysis.material_cost), justify="right"),
-                sell_cell,
-                margin_cell,
-                Text(verdict, style=verdict_style),
+                buy_cell,
+                craft_cell,
+                savings_cell,
                 key=str(build.blueprint_item_id),
             )
 
     def _manufacturing_hint(self, report: OpportunityReport) -> Text:
         if report.builds:
             return Text(
-                f"{len(report.builds)} blueprint(s) ranked by Jita build margin, per run."
+                f"{len(report.builds)} blueprint(s): per-run craft cost — buy all "
+                "materials vs self-source each at its cheapest."
             )
         if not report.sde_available:
             hint = Text()
-            hint.append("Build-vs-buy needs the EVE SDE. Download it once:  ", style="yellow")
+            hint.append("Crafting cost needs the EVE SDE. Download it once:  ", style="yellow")
             hint.append("uv run evetrader sde", style="bold")
             return hint
         owns_blueprints = self._character is not None and bool(self._character.blueprints)
         if not owns_blueprints:
-            return Text("No blueprints owned — this tab ranks blueprints you hold.")
-        return Text("No owned blueprint is manufacturable and priced at Jita.")
+            return Text("No blueprints owned — this tab costs the blueprints you hold.")
+        return Text("No owned blueprint is manufacturable from the SDE.")
 
     def _render_training(self, report: CharacterReport) -> None:
         """The skill actually training now, on the main tab."""
@@ -1542,7 +1696,7 @@ class CharacterPickerScreen(Screen[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Select a character  ·  [a] add  ·  [d] remove", id="hint")
-        yield OptionList(id="characters")
+        yield NavOptionList(id="characters")
         yield Static("", id="picker_status")
         yield Footer()
 

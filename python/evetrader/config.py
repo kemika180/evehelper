@@ -45,6 +45,18 @@ class HomeMarket(BaseModel):
     label: str | None = None
 
 
+class SpecialMarket(BaseModel):
+    """A type that trades on a special region-wide market instead of the home station
+    order book. PLEX is the case that matters: it trades on EVE's global PLEX market
+    (region 19000001), which has no single station — so it's priced region-wide from
+    there, not from any station's order book. Without this the home-station scan finds
+    no PLEX orders and PLEX reads as "no data"."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    region_id: int = Field(gt=0)
+
+
 class InvestmentParams(BaseModel):
     """Mean-reversion tuning: the history window and how extreme a price must be."""
 
@@ -64,6 +76,22 @@ class InvestmentParams(BaseModel):
     # Skip a buy when the short-window average sits more than this fraction below the
     # fair value — the price is trending down, not dipping, so it won't revert.
     max_downtrend: float = Field(default=0.10, ge=0.0, le=1.0)
+
+
+class RefiningParams(BaseModel):
+    """Reprocessing model for the craft-cost self-source comparison.
+
+    Like ``FeeRates``, ``efficiency`` is a user-owned input, not a code constant: the
+    effective yield is the station's base rate times reprocessing skills, implants, and
+    structure/rig bonuses, so it varies per character and location. A wrong value skews
+    every refine-vs-buy call. Roughly 0.5 at a raw NPC station with no skills, up to
+    ~0.9 with maxed skills in a good structure; the default is a middling trained value
+    and should be CONFIRMED against the live game.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    efficiency: float = Field(default=0.70, gt=0.0, le=1.0)
 
 
 class RiskPreferences(BaseModel):
@@ -103,12 +131,16 @@ class Config(BaseModel):
     )
     # Total ISK available to allocate across all suggested orders.
     total_capital_isk: float = Field(gt=0.0)
-    # Type ids to always analyse for station trading (in addition to discovery).
-    watchlist_type_ids: tuple[int, ...] = ()
-    # Discovery: scan the whole station order book and analyse the this-many
-    # best-spread items (0 = watchlist only). The full region fetch is slow the
-    # first time, then cached.
-    scan_candidates: int = Field(default=50, ge=0)
+    # The fixed set of items the value/trading scan considers — long-horizon stores of
+    # value, not a broad market sweep. Defaults to PLEX, the Skill Extractor, and the
+    # Large and Small Skill Injector: the items worth holding and trading across patches.
+    trading_type_ids: tuple[int, ...] = (44_992, 40_519, 40_520, 45_635)
+    # Tracked types that trade on a special region-wide market rather than the home
+    # station book, keyed by type_id. PLEX (44992) trades on EVE's global market
+    # (region 19000001), not any regional station order book, so it's priced from there.
+    special_markets: dict[int, SpecialMarket] = Field(
+        default_factory=lambda: {44_992: SpecialMarket(region_id=19_000_001)}
+    )
     # How often the TUI re-runs the pipeline; the client cache gates real fetches, and
     # renders skip when their data is unchanged, so this can be relaxed. Market orders
     # cache ~5 min and assets ~1h, so a few minutes keeps advice fresh without churn.
@@ -118,6 +150,7 @@ class Config(BaseModel):
     risk: RiskPreferences
     fees: FeeRates = Field(default_factory=FeeRates)
     investment: InvestmentParams = Field(default_factory=InvestmentParams)
+    refining: RefiningParams = Field(default_factory=RefiningParams)
 
     def home_for(self, character_name: str) -> HomeMarket:
         return self.homes.get(character_name, self.default_home)

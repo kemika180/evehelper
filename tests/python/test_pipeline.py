@@ -7,14 +7,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
-
-from evetrader.config import Config, HomeMarket, InvestmentParams, RiskPreferences
+from evetrader.config import Config, HomeMarket, InvestmentParams, RiskPreferences, SpecialMarket
 from evetrader.data.sde import SdeDatabase
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient
-from evetrader.pipeline import fetch_character, fetch_opportunities
+from evetrader.data.sde import OreYield
+from evetrader.pipeline import _expand_recipes, _refine_prices, fetch_character, fetch_opportunities
 
 _STATION = 60003760
 _REGION = 10000002
@@ -25,6 +25,9 @@ _UNDERVALUED = 34  # a cheap buy candidate
 _HELD_DEAR = 35  # held, and currently dear
 _STRUCTURE = 1_035_660_376_235  # a player structure the character can dock at
 _STRUCT_SYSTEM = 30004759
+_PLEX = 44992  # trades on the global market, not the home station book
+_PLEX_REGION = 19000001  # EVE's global PLEX market region
+_PLEX_LOCATION = 60008494  # a global-market location, away from the home station
 
 
 def _config() -> Config:
@@ -33,7 +36,7 @@ def _config() -> Config:
         contact="c@e.com",
         default_home=HomeMarket(region_id=_REGION, station_id=_STATION),
         total_capital_isk=1_000_000_000.0,
-        scan_candidates=50,
+        trading_type_ids=(_UNDERVALUED, _HELD_DEAR),
         risk=RiskPreferences(
             min_margin=0.05, min_daily_isk_volume=0.0, max_capital_per_order_isk=100_000_000.0
         ),
@@ -72,6 +75,12 @@ def _order(order_id: int, type_id: int, *, is_buy: bool, price: float) -> dict[s
     }
 
 
+def _plex_order(order_id: int, *, is_buy: bool, price: float) -> dict[str, object]:
+    order = _order(order_id, _PLEX, is_buy=is_buy, price=price)
+    order["location_id"] = _PLEX_LOCATION  # global market, not the home station
+    return order
+
+
 def _channel_history() -> list[dict[str, object]]:
     # 4 days with a median ~1000 and a 900-1100 low/high channel.
     return [
@@ -98,12 +107,18 @@ def _handler(request: httpx.Request) -> httpx.Response:
     if "/markets/" in path and path.endswith("/history/"):
         return httpx.Response(200, json=_channel_history(), headers=exp)
     if "/markets/" in path and path.endswith("/orders/"):
-        orders = [
-            _order(1, _UNDERVALUED, is_buy=False, price=700.0),  # cheap ask
-            _order(2, _UNDERVALUED, is_buy=True, price=600.0),
-            _order(3, _HELD_DEAR, is_buy=True, price=1300.0),  # dear bid
-            _order(4, _HELD_DEAR, is_buy=False, price=1400.0),
-        ]
+        if f"/markets/{_PLEX_REGION}/" in path:
+            orders = [
+                _plex_order(10, is_buy=False, price=700.0),  # cheap ask on the global market
+                _plex_order(11, is_buy=True, price=600.0),
+            ]
+        else:
+            orders = [
+                _order(1, _UNDERVALUED, is_buy=False, price=700.0),  # cheap ask
+                _order(2, _UNDERVALUED, is_buy=True, price=600.0),
+                _order(3, _HELD_DEAR, is_buy=True, price=1300.0),  # dear bid
+                _order(4, _HELD_DEAR, is_buy=False, price=1400.0),
+            ]
         return httpx.Response(200, json=orders, headers={**exp, "X-Pages": "1"})
     if path.endswith("/assets/"):
         return httpx.Response(
@@ -237,8 +252,67 @@ def _make_recipe_sde(path: Path) -> None:
     )
     conn.execute("INSERT INTO industryActivityProducts VALUES (?, 1, ?, 1)", (_UNDERVALUED, _HELD_DEAR))
     conn.execute("INSERT INTO industryActivityMaterials VALUES (?, 1, ?, 1)", (_UNDERVALUED, _UNDERVALUED))
+    _add_reprocessing_tables(conn)
     conn.commit()
     conn.close()
+
+
+def _add_reprocessing_tables(conn: sqlite3.Connection) -> None:
+    """The reprocessing/category tables a real SDE always carries (empty here — no ore
+    refines into the toy minerals, so `ore_sources` returns nothing)."""
+    conn.execute("CREATE TABLE invTypeMaterials (typeID INT, materialTypeID INT, quantity INT)")
+    conn.execute("CREATE TABLE invTypes (typeID INT, groupID INT, portionSize INT)")
+    conn.execute("CREATE TABLE invGroups (groupID INT, categoryID INT)")
+
+
+def _make_nested_sde(path: Path) -> None:
+    """product 100 <- (bp 101) 2x component 200 ; component 200 <- (bp 201) 5x mineral 300."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE industryActivityProducts "
+        "(typeID INT, activityID INT, productTypeID INT, quantity INT)"
+    )
+    conn.execute(
+        "CREATE TABLE industryActivityMaterials "
+        "(typeID INT, activityID INT, materialTypeID INT, quantity INT)"
+    )
+    conn.executemany(
+        "INSERT INTO industryActivityProducts VALUES (?, 1, ?, 1)", [(101, 100), (201, 200)]
+    )
+    conn.executemany(
+        "INSERT INTO industryActivityMaterials VALUES (?, 1, ?, ?)",
+        [(101, 200, 2), (201, 300, 5)],
+    )
+    _add_reprocessing_tables(conn)
+    conn.commit()
+    conn.close()
+
+
+def test_refine_prices_picks_the_cheapest_ore_and_applies_efficiency() -> None:
+    # Mineral 300 comes from two ores: a dense one (2 units/ore) and a sparse one (1).
+    ore_sources = {
+        300: [OreYield(ore_type_id=900, units_per_ore=2.0), OreYield(ore_type_id=901, units_per_ore=1.0)],
+        301: [OreYield(ore_type_id=902, units_per_ore=4.0)],  # ore not on the market
+    }
+    ask = {900: 100.0, 901: 40.0, 903: 5.0}  # 902 (for mineral 301) has no ask
+    prices = _refine_prices(ore_sources, ask, efficiency=0.5)
+    # 900: 100 / (2 * 0.5) = 100 ; 901: 40 / (1 * 0.5) = 80 -> cheapest is 80.
+    assert prices[300] == 80.0
+    # 301's only ore isn't priced, so it can't be refined.
+    assert 301 not in prices
+
+
+def test_expand_recipes_only_follows_owned_sub_blueprints(tmp_path: Path) -> None:
+    path = tmp_path / "nested.sqlite"
+    _make_nested_sde(path)
+    sde = SdeDatabase(path)
+    top = sde.manufacturing_recipe(101)
+    assert top is not None
+    # Owning both blueprints -> the sub-component (200) is expanded and self-costable.
+    assert set(_expand_recipes(sde, [top], {101, 201})) == {100, 200}
+    # Owning only the top blueprint -> 200 is left to be bought (no owned BP to build it).
+    assert set(_expand_recipes(sde, [top], {101})) == {100}
+    sde.close()
 
 
 def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
@@ -272,10 +346,16 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             report = await fetch_opportunities(
                 client, _config(), character, home, name_cache, sde
             )
-            assert [s.type_id for s in report.buys] == [_UNDERVALUED]
-            assert [(s.type_id, s.quantity) for s in report.sells] == [(_HELD_DEAR, 10)]
+            # One verdict per tracked item, in config order; the undervalued item reads
+            # BUY, the held-and-dear one SELL.
+            assert [s.type_id for s in report.tracked] == [_UNDERVALUED, _HELD_DEAR]
+            verdicts = {s.type_id: s.verdict for s in report.tracked}
+            assert verdicts[_UNDERVALUED] == "BUY"
+            assert verdicts[_HELD_DEAR] == "SELL"
+            held = {s.type_id: s.held for s in report.tracked}
+            assert held[_HELD_DEAR] == 10  # sellable holdings at the home station
             assert report.names[_UNDERVALUED] == "Tritanium"
-            # History for signalled items is retained for plotting.
+            # History for tracked items is retained for plotting.
             assert _UNDERVALUED in report.history and len(report.history[_UNDERVALUED]) == 4
 
             # Build-vs-buy: the owned blueprint's product is priced at Jita and ranked.
@@ -287,5 +367,45 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             assert build.analysis.verdict == "BUILD"
             assert report.names[_HELD_DEAR] == "Pyerite"  # product name resolved
             sde.close()
+
+    asyncio.run(go())
+
+
+def test_pipeline_prices_plex_from_the_global_market(tmp_path: Path) -> None:
+    config = Config(
+        esi_client_id="cid",
+        contact="c@e.com",
+        default_home=HomeMarket(region_id=_REGION, station_id=_STATION),
+        total_capital_isk=1_000_000_000.0,
+        trading_type_ids=(_PLEX,),
+        special_markets={_PLEX: SpecialMarket(region_id=_PLEX_REGION)},
+        risk=RiskPreferences(
+            min_margin=0.05, min_daily_isk_volume=0.0, max_capital_per_order_isk=100_000_000.0
+        ),
+        investment=InvestmentParams(window_days=4, buy_below_position=0.3, sell_above_position=0.7),
+    )
+
+    async def go() -> None:
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(transport=transport) as http:
+            client = EsiClient(config, http)
+            authenticator = Authenticator(config, http, _FakeStore())
+            name_cache = NameCache(tmp_path / "names.json", client)
+            structure_cache = StructureCache(client)
+            now = lambda: datetime(2020, 1, 1, tzinfo=UTC)  # noqa: E731
+
+            home = config.default_home
+            character = await fetch_character(
+                client, authenticator, config, 42, home, name_cache, structure_cache, now=now
+            )
+            report = await fetch_opportunities(client, config, character, home, name_cache)
+
+            # PLEX has no orders on the home station book; priced from its global market
+            # region it still comes through with a live quote and a verdict, not "no data".
+            assert [s.type_id for s in report.tracked] == [_PLEX]
+            plex = report.tracked[0]
+            assert plex.has_data
+            assert plex.price == 700.0  # the global-market ask, relabelled to the home station
+            assert plex.verdict == "BUY"
 
     asyncio.run(go())

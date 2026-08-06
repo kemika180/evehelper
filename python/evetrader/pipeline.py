@@ -18,7 +18,7 @@ from evetrader.config import Config, HomeMarket
 from evetrader.data.assets import AssetLocation, build_asset_tree, nameable_item_ids
 from evetrader.data.character import build_character_state
 from evetrader.data.market import best_ask_prices, history_to_frame, orders_frame_from_pages
-from evetrader.data.sde import SdeDatabase
+from evetrader.data.sde import OreYield, SdeDatabase
 from evetrader.data.skills import SkillReference, load_skills
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
@@ -30,18 +30,21 @@ from evetrader.esi.endpoints import (
     fetch_blueprints,
     fetch_industry_jobs,
     fetch_market_history,
+    fetch_open_orders,
     fetch_skillqueue,
     fetch_skills,
 )
 from evetrader.esi.models import (
     Blueprint,
+    CharacterOrder,
     IndustryJob,
     MarketHistoryDay,
     Skill,
     SkillQueueEntry,
 )
-from evetrader.market.investment import InvestmentSignal, find_opportunities, liquid_types
-from evetrader.market.production import BuildAnalysis, analyze_build
+from evetrader.market.investment import TrackedStatus, summarize_tracked
+from evetrader.market.listings import ListingStatus, OwnOrder, classify_listings
+from evetrader.market.production import BuildAnalysis, Recipe, analyze_build
 
 # Bounded concurrency for the per-type history fetches.
 _MAX_CONCURRENT_HISTORY = 8
@@ -69,6 +72,8 @@ class CharacterReport:
     blueprints: dict[int, Blueprint]
     # Running/ready industry jobs (manufacturing, research, copying, invention, …).
     industry_jobs: list[IndustryJob]
+    # The character's open market orders (all regions), for the active-listings overlay.
+    open_orders: list[CharacterOrder]
 
 
 @dataclass(frozen=True)
@@ -86,10 +91,13 @@ class BuildOpportunity:
 
 @dataclass(frozen=True)
 class OpportunityReport:
-    """Slow phase: value suggestions split into buys and sells of holdings."""
+    """Slow phase: the tracked-item watchlist plus the own-order overlays."""
 
-    buys: list[InvestmentSignal]
-    sells: list[InvestmentSignal]
+    # One verdict + trend per tracked item (config.trading_type_ids), in config order.
+    tracked: list[TrackedStatus]
+    # The character's own open orders, classified best/beaten, split by side.
+    listing_buys: list[ListingStatus]
+    listing_sells: list[ListingStatus]
     names: dict[int, str]
     # Daily history for the signalled types, retained so a selected row can be
     # plotted without a fresh (keystroke-triggered) ESI call.
@@ -131,8 +139,9 @@ async def fetch_character(
     """Wallet, skills, standings, fees, skill queue, and inventory — the quick fetches."""
     token = await authenticator.access_token(character_id)
     skills = await fetch_skills(client, character_id, token)
+    open_orders = await fetch_open_orders(client, character_id, token)
     character = await build_character_state(
-        client, config, character_id, token, home.station_id, skills
+        client, config, character_id, token, home.station_id, skills, open_orders
     )
     skill_queue = await fetch_skillqueue(client, character_id, token)
 
@@ -161,10 +170,15 @@ async def fetch_character(
             if named.name and named.name != "None":
                 asset_names[named.item_id] = named.name
 
-    # Places to name: asset locations plus each industry job's facility. Player
-    # structures don't resolve via /universe/names; look them up individually (needs
-    # docking access) — except the home, which a config label already names.
-    place_ids = {loc.location_id for loc in asset_tree} | {job.facility_id for job in industry_jobs}
+    # Places to name: asset locations, each industry job's facility, and every station
+    # the character has an open order at (the overlay shows where). Player structures
+    # don't resolve via /universe/names; look them up individually (needs docking
+    # access) — except the home, which a config label already names.
+    place_ids = (
+        {loc.location_id for loc in asset_tree}
+        | {job.facility_id for job in industry_jobs}
+        | {order.location_id for order in open_orders}
+    )
     structure_ids = [
         place_id
         for place_id in place_ids
@@ -201,6 +215,7 @@ async def fetch_character(
         asset_names,
         blueprints,
         industry_jobs,
+        open_orders,
     )
 
 
@@ -235,11 +250,61 @@ async def _reference_ask_prices(
     return {type_id: asks[type_id] for type_id in type_ids if type_id in asks}
 
 
+def _expand_recipes(
+    sde: SdeDatabase, seed: list[Recipe], owned_blueprint_types: set[int]
+) -> dict[int, Recipe]:
+    """Product-id → recipe for the seed recipes and every sub-material the character can
+    *actually* build — i.e. one it owns the blueprint for — as a transitive closure, so
+    a build's inputs can be self-costed.
+
+    A sub-component whose blueprint the character doesn't own is left out: self-building
+    it would mean acquiring the blueprint too (a cost this doesn't model), so it's costed
+    by buying instead. Materials with no manufacturing recipe are likewise absent.
+    Cycle-safe via a visited set; the engine additionally depth-caps the cost recursion."""
+    recipes: dict[int, Recipe] = {recipe.product_type_id: recipe for recipe in seed}
+    visited: set[int] = set(recipes)
+    frontier = [material.type_id for recipe in seed for material in recipe.materials]
+    while frontier:
+        type_id = frontier.pop()
+        if type_id in visited:
+            continue
+        visited.add(type_id)
+        sub = sde.recipe_for_product(type_id)
+        if sub is None or sub.blueprint_type_id not in owned_blueprint_types:
+            continue
+        recipes[type_id] = sub
+        frontier.extend(material.type_id for material in sub.materials)
+    return recipes
+
+
+def _refine_prices(
+    ore_sources: dict[int, list[OreYield]], ask: dict[int, float], efficiency: float
+) -> dict[int, float]:
+    """Unit cost of obtaining each mineral by mining-and-refining, cheapest ore wins.
+
+    Naive model (a documented simplification): a mineral's refine cost is the ore's ask
+    divided by how much of that mineral one unit of ore yields after efficiency —
+    ignoring the *other* minerals the same ore also produces. So an ore is only cheap for
+    the mineral it's densest in, which keeps refining honest without needing byproduct
+    prices."""
+    prices: dict[int, float] = {}
+    for mineral_id, sources in ore_sources.items():
+        costs = [
+            ask[source.ore_type_id] / (source.units_per_ore * efficiency)
+            for source in sources
+            if source.ore_type_id in ask and source.units_per_ore > 0
+        ]
+        if costs:
+            prices[mineral_id] = min(costs)
+    return prices
+
+
 async def _build_opportunities(
     client: EsiClient, config: Config, character: CharacterReport, sde: SdeDatabase
 ) -> list[BuildOpportunity]:
-    """Build-vs-buy for each owned, manufacturable blueprint, priced at the reference
-    market. Per single run; ranked by margin (best first)."""
+    """Craft cost for each owned, manufacturable blueprint, with each input priced at the
+    cheapest of buying, self-building, or refining ore into it. Per single run; best
+    self-source savings first."""
     recipes = [
         (item_id, blueprint, recipe)
         for item_id, blueprint in character.blueprints.items()
@@ -248,24 +313,36 @@ async def _build_opportunities(
     if not recipes:
         return []
 
-    wanted = {recipe.product_type_id for _, _, recipe in recipes}
-    wanted |= {material.type_id for _, _, recipe in recipes for material in recipe.materials}
-    ask = await _reference_ask_prices(client, config.reference_market, wanted)
+    # Expand into every sub-component the character owns a blueprint for. Sub-components
+    # without an owned blueprint stay buy-only (self-building them would mean acquiring a
+    # blueprint too).
+    owned_blueprint_types = {bp.type_id for bp in character.blueprints.values()}
+    recipe_map = _expand_recipes(
+        sde, [recipe for _, _, recipe in recipes], owned_blueprint_types
+    )
+    material_types = {product_id for product_id in recipe_map}
+    material_types |= {mat.type_id for recipe in recipe_map.values() for mat in recipe.materials}
+
+    # Each material that some asteroid ore reprocesses into can be refined instead of
+    # bought; price the whole tree plus those ores from the reference market in one pass.
+    ore_sources = sde.ore_sources(material_types)
+    ore_ids = {source.ore_type_id for sources in ore_sources.values() for source in sources}
+    ask = await _reference_ask_prices(client, config.reference_market, material_types | ore_ids)
+    refine = _refine_prices(ore_sources, ask, config.refining.efficiency)
 
     fees = character.character.fees  # home-station fees; sales tax is skill-based, broker approx
     builds: list[BuildOpportunity] = []
     for item_id, blueprint, recipe in recipes:
-        # A product with no Jita sell order (a thin market — e.g. a Black Ops hull) is
-        # kept as an unvalued row, not dropped, so every manufacturable blueprint shows.
         product_price = ask.get(recipe.product_type_id)
-        material_prices = {m.type_id: ask[m.type_id] for m in recipe.materials if m.type_id in ask}
         analysis = analyze_build(
             recipe,
             material_efficiency=blueprint.material_efficiency,
-            material_prices=material_prices,
+            material_prices=ask,
             product_price=product_price,
             sales_tax=fees.sales_tax,
             broker_fee=fees.broker_fee,
+            recipes=recipe_map,
+            refine_prices=refine,
         )
         builds.append(
             BuildOpportunity(
@@ -276,8 +353,85 @@ async def _build_opportunities(
                 analysis=analysis,
             )
         )
-    builds.sort(key=lambda build: build.analysis.margin, reverse=True)
+    builds.sort(key=lambda build: build.analysis.savings, reverse=True)
     return builds
+
+
+async def _classify_own_listings(
+    client: EsiClient,
+    home: HomeMarket,
+    region_orders: pl.DataFrame,
+    open_orders: list[CharacterOrder],
+) -> list[ListingStatus]:
+    """Decide, for each open order, whether it still leads its market. Reuses the
+    already-fetched home-region book; for orders in other regions, fetches just that
+    order's type there (a few pages), not the whole foreign book."""
+    if not open_orders:
+        return []
+    own = [
+        OwnOrder(
+            order_id=order.order_id,
+            type_id=order.type_id,
+            location_id=order.location_id,
+            is_buy=order.is_buy_order,
+            price=order.price,
+            volume_remain=order.volume_remain,
+        )
+        for order in open_orders
+    ]
+    home_types = {order.type_id for order in open_orders if order.region_id == home.region_id}
+    book = region_orders.filter(pl.col("type_id").is_in(list(home_types)))
+    foreign_pairs = sorted(
+        {
+            (order.region_id, order.type_id)
+            for order in open_orders
+            if order.region_id != home.region_id
+        }
+    )
+    for region_id, type_id in foreign_pairs:
+        pages = await client.get_all_pages(
+            f"/markets/{region_id}/orders/", params={"order_type": "all", "type_id": type_id}
+        )
+        book = pl.concat([book, orders_frame_from_pages(pages)])
+    return classify_listings(book, own)
+
+
+async def _special_market_book(
+    client: EsiClient,
+    config: Config,
+    home: HomeMarket,
+    history: dict[int, list[MarketHistoryDay]],
+) -> pl.DataFrame:
+    """Orders for tracked types that trade on a special region-wide market (PLEX on EVE's
+    global market), priced from their own region and relabelled to the home station so the
+    station-scoped engine treats them like any other item. Their history is fetched from
+    the same region and merged into ``history`` in place — the home region's book holds no
+    such orders and, for PLEX, only stale legacy history.
+
+    Returns an empty frame when nothing is configured, so the caller can skip the concat.
+    """
+    by_region: dict[int, list[int]] = {}
+    for type_id in config.trading_type_ids:
+        source = config.special_markets.get(type_id)
+        if source is not None:
+            by_region.setdefault(source.region_id, []).append(type_id)
+
+    frames: list[pl.DataFrame] = []
+    for region_id, type_ids in sorted(by_region.items()):
+        history.update(await _histories(client, region_id, sorted(type_ids)))
+        for type_id in type_ids:
+            pages = await client.get_all_pages(
+                f"/markets/{region_id}/orders/",
+                params={"order_type": "all", "type_id": type_id},
+            )
+            frame = orders_frame_from_pages(pages)
+            if frame.height:
+                # The global market has no single station; relabel to the home station so
+                # summarize_tracked's station filter picks these orders up.
+                frames.append(
+                    frame.with_columns(pl.lit(home.station_id).cast(pl.Int64).alias("location_id"))
+                )
+    return pl.concat(frames) if frames else pl.DataFrame()
 
 
 async def fetch_opportunities(
@@ -292,48 +446,52 @@ async def fetch_opportunities(
     pages = await client.get_all_pages(
         f"/markets/{home.region_id}/orders/", params={"order_type": "all"}
     )
-    orders = orders_frame_from_pages(pages).filter(pl.col("location_id") == home.station_id)
+    region_orders = orders_frame_from_pages(pages)
+    orders = region_orders.filter(pl.col("location_id") == home.station_id)
+    listings = await _classify_own_listings(client, home, region_orders, character.open_orders)
 
-    # Only pull history for liquid candidates and holdings that actually trade here —
-    # fetching non-market types would 400 and burn the error-limit budget.
-    traded = set(orders["type_id"].to_list())
-    candidates = liquid_types(orders, home.station_id, config.scan_candidates)
-    sellable = [type_id for type_id in character.holdings if type_id in traded]
-    history = await _histories(client, home.region_id, list({*candidates, *sellable}))
+    # The scan covers a fixed set of long-horizon items rather than a broad market sweep
+    # — one watchlist verdict each. Most trade on the home station book; a few (PLEX) sit
+    # on a special region-wide market, fetched separately and folded in with `location_id`
+    # relabelled to the home station so the engine prices every item uniformly.
+    normal_types = [t for t in config.trading_type_ids if t not in config.special_markets]
+    history = await _histories(client, home.region_id, sorted(normal_types))
+    special_book = await _special_market_book(client, config, home, history)
+    tracked_orders = pl.concat([orders, special_book]) if special_book.height else orders
 
-    signals = find_opportunities(
-        orders=orders,
+    tracked = summarize_tracked(
+        type_ids=list(config.trading_type_ids),
+        orders=tracked_orders,
         history=history_to_frame(history),
         station_id=home.station_id,
         holdings=character.holdings,
-        fees=character.character.fees,
         window=config.investment.window_days,
         buy_position=config.investment.buy_below_position,
         sell_position=config.investment.sell_above_position,
         trend_days=config.investment.trend_days,
         max_downtrend=config.investment.max_downtrend,
-        min_daily_isk_volume=config.risk.min_daily_isk_volume,
-        max_capital_per_item=config.risk.max_capital_per_order_isk,
     )
     builds = await _build_opportunities(client, config, character, sde) if sde is not None else []
 
-    buys = [signal for signal in signals if signal.action == "BUY"]
-    sells = [signal for signal in signals if signal.action == "SELL"]
-    name_ids = [signal.type_id for signal in signals]
+    listing_buys = [status for status in listings if status.is_buy]
+    listing_sells = [status for status in listings if not status.is_buy]
+    name_ids = [status.type_id for status in tracked]
+    name_ids += [status.type_id for status in listings]
     name_ids += [build.product_type_id for build in builds]
     # Material type ids too, so a build's bill-of-materials view can name each input.
     name_ids += [line.type_id for build in builds for line in build.analysis.materials]
     names = await name_cache.resolve(name_ids)
-    signalled = {signal.type_id for signal in signals}
+    tracked_ids = {status.type_id for status in tracked}
     window = config.investment.window_days
     retained = {
         type_id: sorted(history[type_id], key=lambda day: day.date)[-window:]
-        for type_id in signalled
+        for type_id in tracked_ids
         if type_id in history
     }
     return OpportunityReport(
-        buys=buys,
-        sells=sells,
+        tracked=tracked,
+        listing_buys=listing_buys,
+        listing_sells=listing_sells,
         names=names,
         history=retained,
         builds=builds,

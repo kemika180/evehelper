@@ -20,7 +20,8 @@ from evetrader.esi.models import (
     SkillQueueEntry,
 )
 from evetrader.market.fees import EffectiveFees
-from evetrader.market.investment import InvestmentSignal
+from evetrader.market.investment import TrackedStatus
+from evetrader.market.listings import ListingStatus
 from evetrader.market.production import BuildAnalysis, MaterialLine
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
@@ -238,6 +239,7 @@ def _character_report() -> CharacterReport:
                 end_date=datetime(2019, 12, 20, tzinfo=UTC),
             ),
         ],
+        open_orders=[],
     )
 
 
@@ -270,18 +272,26 @@ def _asset_tree() -> list[AssetLocation]:
     ]
 
 
-def _signal(type_id: int, action: str, current: float, fair: float, position: float) -> InvestmentSignal:
-    return InvestmentSignal(
+def _tracked(
+    type_id: int,
+    verdict: str,
+    price: float,
+    fair: float,
+    position: float,
+    *,
+    trend: float = 0.0,
+    held: int = 0,
+) -> TrackedStatus:
+    return TrackedStatus(
         type_id=type_id,
-        action=action,
-        current_price=current,
+        verdict=verdict,
+        has_data=True,
+        price=price,
         fair_value=fair,
-        low_band=fair * 0.8,
-        high_band=fair * 1.2,
         channel_position=position,
-        quantity=100,
-        expected_profit=1_000_000.0,
-        reasoning="test",
+        trend=trend,
+        held=held,
+        note="test",
     )
 
 
@@ -303,8 +313,17 @@ def _history_days() -> list[MarketHistoryDay]:
 
 def _opportunity_report() -> OpportunityReport:
     return OpportunityReport(
-        buys=[_signal(34, "BUY", current=700.0, fair=1000.0, position=0.05)],
-        sells=[_signal(35, "SELL", current=1300.0, fair=1000.0, position=0.95)],
+        tracked=[
+            _tracked(34, "BUY", price=700.0, fair=1000.0, position=0.05, trend=-0.03),
+            _tracked(35, "SELL", price=1300.0, fair=1000.0, position=0.95, trend=0.08, held=500),
+        ],
+        listing_buys=[],
+        listing_sells=[
+            ListingStatus(
+                order_id=5001, type_id=35, location_id=60003760, is_buy=False,
+                price=1300.0, volume_remain=200, best_competing=1290.0, is_best=False,
+            )
+        ],
         names={34: "Tritanium", 35: "Pyerite", 587: "Rifter"},
         history={34: _history_days(), 35: _history_days()},
         builds=[
@@ -319,6 +338,7 @@ def _opportunity_report() -> OpportunityReport:
                     product_value=1_850_000.0,
                     net_product_value=1_800_000.0,
                     missing_material_prices=(),
+                    craft_cost=900_000.0,  # self-sourcing saves 300k (25%)
                 ),
             )
         ],
@@ -331,7 +351,8 @@ def _build(
     bp_type: int,
     product: int,
     me: int,
-    margin: float,
+    material_cost: float,
+    craft_cost: float,
     materials: tuple[MaterialLine, ...] = (),
 ) -> BuildOpportunity:
     return BuildOpportunity(
@@ -341,28 +362,31 @@ def _build(
         material_efficiency=me,
         analysis=BuildAnalysis(
             runs=1,
-            material_cost=1_000_000.0,
-            product_value=1_000_000.0 + margin,
-            net_product_value=1_000_000.0 + margin,
+            material_cost=material_cost,
+            product_value=0.0,
+            net_product_value=0.0,
             missing_material_prices=(),
             materials=materials,
+            craft_cost=craft_cost,
         ),
     )
 
 
 def _manufacturing_report() -> OpportunityReport:
     return OpportunityReport(
-        buys=[],
-        sells=[],
+        tracked=[],
+        listing_buys=[],
+        listing_sells=[],
         names={587: "Rifter", 588: "Breacher", 34: "Tritanium", 35: "Pyerite"},
         history={},
         builds=[
             _build(
-                13, 900, 587, 10, 600_000.0,
+                13, 900, 587, 10, 1_000_000.0, 600_000.0,
                 materials=(MaterialLine(34, 90, 5.0), MaterialLine(35, 45, 10.0)),
             ),
-            _build(14, 900, 587, 10, 600_000.0),  # a second identical copy -> collapses
-            _build(15, 901, 588, 2, 100_000.0),
+            # A second identical copy -> collapses. Higher savings than the Breacher.
+            _build(14, 900, 587, 10, 1_000_000.0, 600_000.0),
+            _build(15, 901, 588, 2, 200_000.0, 180_000.0),
         ],
         sde_available=True,
     )
@@ -432,8 +456,19 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
                 await pilot.pause()
 
             trading = app.screen  # top of the stack
-            assert trading.query_one("#buys", DataTable).row_count == 1
-            assert trading.query_one("#sells", DataTable).row_count == 1
+            # The Overview watchlist lists every tracked item with its verdict.
+            tracked = trading.query_one("#tracked", DataTable)
+            assert tracked.row_count == 2
+            buy_row = " ".join(str(cell) for cell in tracked.get_row_at(0))
+            assert "Tritanium" in buy_row and "BUY" in buy_row
+            sell_row = " ".join(str(cell) for cell in tracked.get_row_at(1))
+            assert "Pyerite" in sell_row and "SELL" in sell_row
+            # Active-listings overlay: the fixture has one undercut sell order, no buys.
+            assert trading.query_one("#my-buys", DataTable).row_count == 0
+            my_sells = trading.query_one("#my-sells", DataTable)
+            assert my_sells.row_count == 1
+            listing_row = " ".join(str(cell) for cell in my_sells.get_row_at(0))
+            assert "Pyerite" in listing_row and "undercut" in listing_row
             wallet_text = str(trading.query_one("#stat-wallet", Static).render())
             assert "WALLET" in wallet_text and "5.00m" in wallet_text
             # The station shows its resolved name in the location row, not the id.
@@ -498,8 +533,8 @@ def test_selecting_a_buy_row_opens_the_price_chart(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            buys = trading.query_one("#buys", DataTable)
-            buys.focus()
+            tracked = trading.query_one("#tracked", DataTable)
+            tracked.focus()
             await pilot.pause()
             await pilot.press("enter")  # select the highlighted row
             await pilot.pause()
@@ -803,6 +838,7 @@ def _app_with_assets(store: CharacterStore, locations: list[AssetLocation], name
         {},
         base.blueprints,
         base.industry_jobs,
+        base.open_orders,
     )
 
     async def character() -> CharacterReport:
@@ -899,6 +935,7 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
         {},
         base.blueprints,
         base.industry_jobs,
+        base.open_orders,
     )
 
     async def _drive() -> None:
@@ -1041,7 +1078,7 @@ def test_manufacturing_tab_ranks_owned_blueprints(tmp_path: Path) -> None:
             assert table.row_count == 1
             row = table.get_row_at(0)
             assert "Rifter" in str(row[0])  # product name
-            assert "BUILD" in str(row[5])  # profitable -> BUILD
+            assert "25%" in str(row[4])  # self-sourcing saves 300k of 1.2m
             await pilot.press("q")
 
     asyncio.run(_drive())
@@ -1051,7 +1088,8 @@ def test_manufacturing_tab_explains_a_missing_sde(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
     empty = OpportunityReport(
-        buys=[], sells=[], names={}, history={}, builds=[], sde_available=False
+        tracked=[], listing_buys=[], listing_sells=[], names={}, history={},
+        builds=[], sde_available=False
     )
 
     async def _drive() -> None:
@@ -1100,7 +1138,7 @@ def test_manufacturing_dedupes_counts_searches_and_sorts(tmp_path: Path) -> None
 
             # Two identical Rifter copies collapse to one row that shows the count.
             assert table.row_count == 2
-            assert "Rifter" in str(table.get_row_at(0)[0])  # highest margin, default sort
+            assert "Rifter" in str(table.get_row_at(0)[0])  # highest savings, default sort
             assert "×2" in str(table.get_row_at(0)[0])  # two copies owned
             assert "Breacher" in str(table.get_row_at(1)[0])
             assert "×" not in str(table.get_row_at(1)[0])  # a single copy shows no count
@@ -1230,7 +1268,8 @@ def test_manufacturing_download_button_invokes_the_downloader(tmp_path: Path) ->
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
     empty = OpportunityReport(
-        buys=[], sells=[], names={}, history={}, builds=[], sde_available=False
+        tracked=[], listing_buys=[], listing_sells=[], names={}, history={},
+        builds=[], sde_available=False
     )
     calls: list[bool] = []
 
@@ -1297,5 +1336,99 @@ def test_industry_tab_lists_jobs_and_opens_detail(tmp_path: Path) -> None:
             assert "Rifter" in body and "Manufacturing" in body
             assert "In progress" in body
             await pilot.press("escape")
+
+    asyncio.run(_drive())
+
+
+def test_activating_a_tab_focuses_its_scrollable_area(tmp_path: Path) -> None:
+    """Switching tabs should hand focus to that tab's table/tree, so the arrow keys and
+    hjkl scroll it straight away rather than leaving focus on the tab bar."""
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            # The default tab (Overview) auto-focuses its watchlist table.
+            assert app.focused is trading.query_one("#tracked", DataTable)
+
+            for tab, widget_id in (
+                ("assets", "#assettree"),
+                ("queue", "#skillqueue"),
+                ("industry-tab", "#industry"),
+            ):
+                trading.query_one(TabbedContent).active = tab
+                await pilot.pause()
+                assert app.focused is trading.query_one(widget_id)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_vim_keys_move_the_table_cursor(tmp_path: Path) -> None:
+    """j/k mirror the down/up arrows on the data tables."""
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            table = trading.query_one("#tracked", DataTable)
+            table.focus()
+            await pilot.pause()
+            assert table.cursor_row == 0
+            await pilot.press("j")  # down
+            await pilot.pause()
+            assert table.cursor_row == 1
+            await pilot.press("k")  # back up
+            await pilot.pause()
+            assert table.cursor_row == 0
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_slash_focuses_the_asset_search_box(tmp_path: Path) -> None:
+    """On the Assets tab, "/" jumps from the tree to the search box."""
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "assets"
+            await pilot.pause()
+            assert app.focused is trading.query_one("#assettree", Tree)
+
+            await pilot.press("slash")
+            await pilot.pause()
+            assert app.focused is trading.query_one("#assetsearch", Input)
+            await pilot.press("q")
 
     asyncio.run(_drive())

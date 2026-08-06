@@ -14,12 +14,25 @@ Manufacturing is the only activity read today; reactions/invention and cargo vol
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 
 from evetrader.market.production import Recipe, RecipeMaterial
 
 # industryActivity activityID for manufacturing (the SDE's stable activity codes).
 _MANUFACTURING = 1
+# invCategories categoryID for asteroid ore — the only reprocessing sources we treat as
+# "refine" (modules/ships also reprocess into minerals, but that's salvage, not mining).
+_ASTEROID_CATEGORY = 25
+
+
+@dataclass(frozen=True)
+class OreYield:
+    """One ore that reprocesses into a wanted mineral, and how much of that mineral a
+    single unit of the ore yields before efficiency (``reprocess quantity / portionSize``)."""
+
+    ore_type_id: int
+    units_per_ore: float
 
 
 class SdeError(Exception):
@@ -59,3 +72,43 @@ class SdeDatabase:
             product_quantity=int(product[1]),
             materials=tuple(RecipeMaterial(int(row[0]), int(row[1])) for row in materials),
         )
+
+    def recipe_for_product(self, product_type_id: int) -> Recipe | None:
+        """The manufacturing recipe that yields ``product_type_id``, or None if nothing
+        manufactures it. The reverse of :meth:`manufacturing_recipe` (which is keyed by
+        blueprint) — used to ask "can I build this material myself?" when costing a
+        build's inputs. If several blueprints make the same product, the first wins."""
+        row = self._conn.execute(
+            "SELECT typeID FROM industryActivityProducts "
+            "WHERE productTypeID = ? AND activityID = ? ORDER BY typeID LIMIT 1",
+            (product_type_id, _MANUFACTURING),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.manufacturing_recipe(int(row[0]))
+
+    def ore_sources(self, mineral_type_ids: set[int]) -> dict[int, list[OreYield]]:
+        """For each wanted mineral, the asteroid ores that reprocess into it and the
+        per-unit yield of that mineral. Ores/items outside the asteroid category (modules,
+        ships) are excluded — only mining-and-refining counts as "refine" here. Minerals
+        no ore produces are simply absent from the result."""
+        if not mineral_type_ids:
+            return {}
+        placeholders = ",".join("?" * len(mineral_type_ids))
+        rows = self._conn.execute(
+            "SELECT m.materialTypeID, m.typeID, m.quantity, t.portionSize "
+            "FROM invTypeMaterials m "
+            "JOIN invTypes t ON t.typeID = m.typeID "
+            "JOIN invGroups g ON g.groupID = t.groupID "
+            f"WHERE m.materialTypeID IN ({placeholders}) "
+            "AND g.categoryID = ? AND t.portionSize > 0",
+            (*sorted(mineral_type_ids), _ASTEROID_CATEGORY),
+        ).fetchall()
+        sources: dict[int, list[OreYield]] = {}
+        for mineral_id, ore_id, quantity, portion in rows:
+            if int(portion) <= 0:
+                continue
+            sources.setdefault(int(mineral_id), []).append(
+                OreYield(ore_type_id=int(ore_id), units_per_ore=int(quantity) / int(portion))
+            )
+        return sources
