@@ -906,6 +906,11 @@ class TradingScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         ("escape", "app.pop_screen", "Switch character"),
         Binding("slash", "focus_search", "Search", show=False),
+        # Shift+h/l (and Shift+arrows) cycle tabs from anywhere. Non-priority so a
+        # focused Input still gets them for typing/selection; the tables/tree don't
+        # bind these (they use bare h/l and arrows), so the keys bubble up here.
+        Binding("H,shift+left", "prev_tab", "Prev tab", show=False),
+        Binding("L,shift+right", "next_tab", "Next tab", show=False),
     ]
 
     # Pane id -> the scrollable widget to focus when its tab is activated, so the arrow
@@ -1170,6 +1175,24 @@ class TradingScreen(Screen[None]):
         selector = self._TAB_SEARCH.get(active)
         if selector is not None:
             self.query_one(selector, Input).focus()
+
+    def action_prev_tab(self) -> None:
+        self._cycle_tab(-1)
+
+    def action_next_tab(self) -> None:
+        self._cycle_tab(1)
+
+    def _cycle_tab(self, step: int) -> None:
+        """Move the active tab by `step`, wrapping around the tab strip."""
+        tabbed = self.query_one(TabbedContent)
+        pane_ids = [pane.id for pane in tabbed.query(TabPane) if pane.id is not None]
+        if not pane_ids:
+            return
+        try:
+            index = pane_ids.index(tabbed.active)
+        except ValueError:
+            return
+        tabbed.active = pane_ids[(index + step) % len(pane_ids)]
 
     async def _refresh(self) -> None:
         status = self.query_one("#status", Static)

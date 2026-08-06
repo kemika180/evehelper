@@ -518,6 +518,49 @@ def test_escape_on_picker_resumes_the_last_character(tmp_path: Path) -> None:
     asyncio.run(_drive())
 
 
+def test_shift_hl_and_shift_arrows_cycle_tabs_from_a_focused_table(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            tabbed = trading.query_one(TabbedContent)
+            # Opening a tab moves focus onto its inner table (not the tab strip), so
+            # this exercises the "tab bar isn't selected" path.
+            assert tabbed.active == "overview"
+            assert app.focused is not None and app.focused.id == "tracked"
+
+            await pilot.press("L")  # Shift+l -> next tab
+            await pilot.pause()
+            assert tabbed.active == "trading"
+
+            await pilot.press("H")  # Shift+h -> previous tab
+            await pilot.pause()
+            assert tabbed.active == "overview"
+
+            await pilot.press("shift+left")  # wraps to the last tab
+            await pilot.pause()
+            assert tabbed.active == "manufacturing-tab"
+
+            await pilot.press("shift+right")  # wraps back to the first
+            await pilot.pause()
+            assert tabbed.active == "overview"
+
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
 def test_selecting_a_buy_row_opens_the_price_chart(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
