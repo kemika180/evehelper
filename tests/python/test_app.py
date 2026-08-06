@@ -866,7 +866,12 @@ def test_asset_search_filters_to_matching_items(tmp_path: Path) -> None:
     asyncio.run(_drive())
 
 
-def _app_with_assets(store: CharacterStore, locations: list[AssetLocation], names: dict[int, str]):
+def _app_with_assets(
+    store: CharacterStore,
+    locations: list[AssetLocation],
+    names: dict[int, str],
+    charge_types: frozenset[int] = frozenset(),
+):
     base = _character_report()
     report = CharacterReport(
         base.captured_at,
@@ -882,6 +887,7 @@ def _app_with_assets(store: CharacterStore, locations: list[AssetLocation], name
         base.blueprints,
         base.industry_jobs,
         base.open_orders,
+        charge_types,
     )
 
     async def character() -> CharacterReport:
@@ -946,6 +952,92 @@ def test_ship_contents_group_into_sections_with_slot_names(tmp_path: Path) -> No
                 for t in fit_items
             )
             assert any(t.startswith("Low Slot") and "Plate" in t for t in fit_items)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_charge_loaded_in_weapon_is_not_labelled_a_fitting(tmp_path: Path) -> None:
+    # ESI gives a loaded charge the same slot flag as the weapon holding it. It nests
+    # under the weapon, so it must list as loose ammo — not a "High Slot" fitting.
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    weapon = AssetNode(
+        3,
+        2929,  # 250mm Railgun
+        1,
+        "HiSlot0",
+        True,
+        (AssetNode(4, 36, 1000, "HiSlot0", False, ()),),  # antimatter charges loaded in it
+    )
+    ship = AssetNode(2, 24696, 1, "Hangar", True, (weapon,))
+    names = {24696: "Harbinger", 2929: "Railgun", 36: "Antimatter Charge"}
+    app = _app_with_assets(store, [AssetLocation(60003760, (ship,))], names)
+
+    async def _drive() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+            tree = app.screen.query_one("#assettree", Tree)
+            ship_node = tree.root.children[0].children[0]
+            weapon_node = ship_node.children[0].children[0]  # Fit -> the railgun
+            assert "Railgun" in str(weapon_node.label)
+            charge_labels = [str(node.label) for node in weapon_node.children]
+            # The charge lists directly under the weapon, with no slot heading or label.
+            assert any("Antimatter Charge" in t for t in charge_labels)
+            assert not any("Slot" in t for t in charge_labels)
+            assert not any("Fit" in str(node.label) for node in weapon_node.children)
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_loaded_crystal_nests_under_its_weapon_not_as_a_fitting(tmp_path: Path) -> None:
+    # Turret crystals/ammo arrive as ship-level assets sharing their weapon's slot flag.
+    # With SDE category info they must nest under the module in that slot, not show as a
+    # "High Slot" fitting of their own.
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    ship = AssetNode(
+        2,
+        24696,
+        1,
+        "Hangar",
+        True,
+        (
+            AssetNode(3, 3520, 1, "HiSlot0", True, ()),  # a laser (module)
+            AssetNode(4, 12820, 1, "HiSlot0", True, ()),  # a Gleam crystal, same slot
+        ),
+    )
+    names = {24696: "Harbinger", 3520: "Focused Beam Laser", 12820: "Gleam S"}
+    app = _app_with_assets(
+        store, [AssetLocation(60003760, (ship,))], names, charge_types=frozenset({12820})
+    )
+
+    async def _drive() -> None:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+            tree = app.screen.query_one("#assettree", Tree)
+            ship_node = tree.root.children[0].children[0]
+            fit = ship_node.children[0]
+            assert str(fit.label).startswith("Fit")
+            fit_rows = [str(node.label) for node in fit.children]
+            # Only the laser sits in Fit — one row, labelled once with its slot.
+            assert len(fit.children) == 1
+            assert any("High Slot" in t and "Laser" in t for t in fit_rows)
+            assert not any("Gleam" in t for t in fit_rows)  # crystal is not a fitting row
+            # The crystal nests under the laser, with no slot label of its own.
+            laser = fit.children[0]
+            charge_rows = [str(node.label) for node in laser.children]
+            assert any("Gleam S" in t for t in charge_rows)
+            assert not any("Slot" in t for t in charge_rows)
             await pilot.press("q")
 
     asyncio.run(_drive())

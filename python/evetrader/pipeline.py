@@ -74,6 +74,9 @@ class CharacterReport:
     industry_jobs: list[IndustryJob]
     # The character's open market orders (all regions), for the active-listings overlay.
     open_orders: list[CharacterOrder]
+    # Asset type ids that are ammunition/charges (SDE category 8), so the asset view can
+    # tell loaded ammo apart from the module holding it. Empty when the SDE isn't installed.
+    charge_type_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -133,6 +136,7 @@ async def fetch_character(
     home: HomeMarket,
     name_cache: NameCache,
     structure_cache: StructureCache,
+    sde: SdeDatabase | None = None,
     *,
     now: Callable[[], datetime] = _utc_now,
 ) -> CharacterReport:
@@ -153,6 +157,13 @@ async def fetch_character(
         if asset.location_id == home.station_id:
             holdings[asset.type_id] = holdings.get(asset.type_id, 0) + asset.quantity
     asset_tree = build_asset_tree(assets)
+    # Loaded ammo/crystals share their weapon's slot flag; flag which asset types are
+    # charges so the browser can nest them under the module instead of mislabelling them.
+    charge_types = (
+        sde.charge_type_ids({asset.type_id for asset in assets})
+        if sde is not None
+        else frozenset()
+    )
 
     # Blueprint research is per-item (ME/TE/runs differ between two copies of one
     # type), so key it by item_id to match a selected asset row in the browser.
@@ -216,6 +227,7 @@ async def fetch_character(
         blueprints,
         industry_jobs,
         open_orders,
+        charge_types,
     )
 
 

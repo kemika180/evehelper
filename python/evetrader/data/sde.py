@@ -24,6 +24,8 @@ _MANUFACTURING = 1
 # invCategories categoryID for asteroid ore — the only reprocessing sources we treat as
 # "refine" (modules/ships also reprocess into minerals, but that's salvage, not mining).
 _ASTEROID_CATEGORY = 25
+# invCategories categoryID for ammunition/charges (turret crystals, missiles, scripts…).
+_CHARGE_CATEGORY = 8
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,21 @@ class SdeDatabase:
         if row is None:
             return None
         return self.manufacturing_recipe(int(row[0]))
+
+    def charge_type_ids(self, type_ids: set[int]) -> frozenset[int]:
+        """Which of these types are ammunition/charges (category 8). ESI gives a loaded
+        charge the same slot flag as the weapon holding it, so the asset view needs this
+        to tell loaded ammo apart from the module itself."""
+        if not type_ids:
+            return frozenset()
+        placeholders = ",".join("?" * len(type_ids))
+        rows = self._conn.execute(
+            "SELECT t.typeID FROM invTypes t "
+            "JOIN invGroups g ON g.groupID = t.groupID "
+            f"WHERE t.typeID IN ({placeholders}) AND g.categoryID = ?",
+            (*sorted(type_ids), _CHARGE_CATEGORY),
+        ).fetchall()
+        return frozenset(int(row[0]) for row in rows)
 
     def ore_sources(self, mineral_type_ids: set[int]) -> dict[int, list[OreYield]]:
         """For each wanted mineral, the asteroid ores that reprocess into it and the

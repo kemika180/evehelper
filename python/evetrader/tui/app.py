@@ -351,15 +351,19 @@ def _humanize_flag(flag: str) -> str:
     return "".join(out)
 
 
-def _asset_section(flag: str) -> str | None:
+def _asset_section(flag: str, *, allow_fit: bool = True) -> str | None:
     """The ship/container compartment a flag belongs to (a group heading), or None for
-    items that just sit loose in a hangar."""
+    items that just sit loose in a hangar.
+
+    ``allow_fit`` is False when the parent is itself a fitted module: ESI gives a
+    loaded charge the same slot flag as the weapon holding it, so a slot flag one
+    level down means "loaded ammo", not a fitting — list it loose, not under "Fit"."""
     if flag == "Cargo":
         return "Cargo"
     if flag.startswith("FighterTube"):
         return "Fighter Bay"
     if flag.startswith(_SLOT_PREFIXES):
-        return "Fit"
+        return "Fit" if allow_fit else None
     if flag in _LOOSE_FLAGS:
         return None
     if flag.endswith(("Bay", "Hold", "Hangar")):
@@ -1609,7 +1613,9 @@ class TradingScreen(Screen[None]):
             # Places open so their top-level items show; containers/ships stay closed
             # until opened — unless a search needs them open to reveal a match.
             place = tree.root.add(self._location_label(location.location_id, report), expand=True)
-            self._add_asset_children(place, location.items, report, query=query, show_all=not query)
+            self._add_asset_children(
+                place, location.items, report, query=query, show_all=not query, parent_flag=""
+            )
 
     def _add_asset_children(
         self,
@@ -1619,17 +1625,44 @@ class TradingScreen(Screen[None]):
         *,
         query: str,
         show_all: bool,
+        parent_flag: str,
     ) -> None:
         """Render a node's contents, grouping ship/container compartments (Fit, Cargo,
         Drone Bay…) under headings; loose items list directly."""
-        visible = (
-            list(children)
-            if show_all
-            else [c for c in children if self._asset_matches(c, report, query)]
-        )
+        # Fittings only exist directly inside a ship; a slot-flagged item inside a module
+        # (parent already in a slot) is loaded ammo, not a fitting.
+        allow_fit = not parent_flag.startswith(_SLOT_PREFIXES)
+        # A loaded charge is a ship-level asset carrying its weapon's slot flag. Pull these
+        # out and nest each under the module in the same slot, so a crystal shows under its
+        # laser instead of as its own bogus "High Slot" fitting.
+        # NB: ESI only returns *persistent* loaded charges this way — frequency/mining
+        # crystals, scripts, scan probes. Consumable ammo loaded into a weapon (missiles,
+        # hybrid/projectile charges) is NOT in the assets payload at all; only the spare
+        # stack in cargo is. So a missile launcher legitimately shows no loaded ammo here —
+        # it's a data gap, not a bug, and we can't tell a loaded launcher from an empty one.
+        loaded: dict[str, list[AssetNode]] = defaultdict(list)
+        fittings: list[AssetNode] = []
+        for child in children:
+            if (
+                allow_fit
+                and child.location_flag.startswith(_SLOT_PREFIXES)
+                and child.type_id in report.charge_type_ids
+            ):
+                loaded[child.location_flag].append(child)
+            else:
+                fittings.append(child)
+
+        def matches(item: AssetNode) -> bool:
+            # Keep a module visible when its loaded ammo matches, so the nested ammo stays
+            # reachable by search.
+            return self._asset_matches(item, report, query) or any(
+                self._asset_matches(c, report, query) for c in loaded.get(item.location_flag, ())
+            )
+
+        visible = fittings if show_all else [c for c in fittings if matches(c)]
         sections: dict[str | None, list[AssetNode]] = defaultdict(list)
         for child in visible:
-            sections[_asset_section(child.location_flag)].append(child)
+            sections[_asset_section(child.location_flag, allow_fit=allow_fit)].append(child)
 
         def by_name(item: AssetNode) -> str:
             return self._asset_label_name(item, report)
@@ -1649,7 +1682,13 @@ class TradingScreen(Screen[None]):
                 items.sort(key=by_name)
             for child in items:
                 self._add_asset_node(
-                    node, child, report, query=query, show_all=show_all, section=section
+                    node,
+                    child,
+                    report,
+                    query=query,
+                    show_all=show_all,
+                    section=section,
+                    loaded=tuple(loaded.get(child.location_flag, ())),
                 )
 
     def _add_asset_node(
@@ -1661,9 +1700,11 @@ class TradingScreen(Screen[None]):
         query: str,
         show_all: bool,
         section: str | None,
+        loaded: tuple[AssetNode, ...] = (),
     ) -> None:
         name = report.names.get(item.type_id, str(item.type_id))
         custom = report.asset_names.get(item.item_id)
+        expandable = bool(item.children) or bool(loaded)
         label = Text()
         if section == "Fit":  # fitted module: slot name first, then the item, no number
             label.append(f"{_slot_label(item.location_flag)}   ", style="cyan")
@@ -1672,7 +1713,7 @@ class TradingScreen(Screen[None]):
             label.append(custom, style="bold")
             label.append(f"  {name}", style="dim")
         else:
-            label.append(name, style="bold" if item.children else "")
+            label.append(name, style="bold" if expandable else "")
         if item.quantity > 1:
             label.append(f"  ×{item.quantity:,}", style="cyan")  # noqa: RUF001 (multiplier)
         # Blueprints are the only items with a detail popup; tag them (BPO/BPC) so it's
@@ -1680,13 +1721,25 @@ class TradingScreen(Screen[None]):
         blueprint = report.blueprints.get(item.item_id) if not item.children else None
         if blueprint is not None:
             label.append(f"  {'BPO' if blueprint.runs == -1 else 'BPC'}", style="magenta")
-        if not item.children:
+        if not expandable:
             parent.add_leaf(label, data=item if blueprint is not None else None)
             return
         node = parent.add(label, expand=bool(query))
+        # Loaded ammo/crystals nest under their module, listed like loose items.
+        for charge in sorted(loaded, key=lambda c: self._asset_label_name(c, report)):
+            self._add_asset_node(node, charge, report, query=query, show_all=True, section=None)
+        if not item.children:
+            return
         # A container/ship matched by name reveals everything inside it.
         child_show_all = show_all or (bool(query) and query in name.lower())
-        self._add_asset_children(node, item.children, report, query=query, show_all=child_show_all)
+        self._add_asset_children(
+            node,
+            item.children,
+            report,
+            query=query,
+            show_all=child_show_all,
+            parent_flag=item.location_flag,
+        )
 
     def _asset_matches(self, item: AssetNode, report: CharacterReport, query: str) -> bool:
         """Whether this item, its assigned name, or anything nested inside it matches."""

@@ -115,6 +115,7 @@ def _run_tui(config: Config) -> None:
                 home,
                 resources.name_cache,
                 structure_cache,
+                resources.sde,
             )
 
         async def opportunities(report: CharacterReport) -> OpportunityReport:
