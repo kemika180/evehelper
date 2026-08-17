@@ -152,6 +152,9 @@ class Skill(_EsiModel):
     skill_id: int
     active_skill_level: int
     trained_skill_level: int
+    # Skill points accumulated in this skill — lets a training-time estimate start from
+    # the character's actual progress through the current level, not just its floor.
+    skillpoints_in_skill: int = 0
 
 
 class CharacterSkills(_EsiModel):
@@ -159,6 +162,18 @@ class CharacterSkills(_EsiModel):
 
     skills: list[Skill]
     total_sp: int
+
+
+class CharacterAttributes(_EsiModel):
+    """GET /characters/{id}/attributes/ — the five learning attributes (post-remap,
+    excluding implant bonuses, which this endpoint doesn't expose). They set the SP/min
+    training rate: ``primary + secondary / 2``."""
+
+    charisma: int
+    intelligence: int
+    memory: int
+    perception: int
+    willpower: int
 
 
 class Standing(_EsiModel):

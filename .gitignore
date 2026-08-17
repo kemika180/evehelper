@@ -13,3 +13,6 @@ dist/
 /data/
 *.token
 .env
+
+# Exported crafting recipes (written to the working dir by the Crafting popup)
+*-recipe.md

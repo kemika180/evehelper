@@ -28,7 +28,12 @@ volumes are well within polars/numpy's reach.
   - Honour cache headers — every response carries `Expires` and usually an
     `ETag`. Never re-fetch before `Expires`; use conditional (`If-None-Match`)
     requests. Assets cache ~1h, market orders ~5min, most reference data much
-    longer.
+    longer. The response cache is **persisted between sessions** (`esi/client.py`,
+    pickled to `<data dir>/esi_cache.pickle`, loaded on construct, saved on exit):
+    a relaunch reuses entries still fresh per their `Expires` (no fetch) and
+    revalidates the rest with `If-None-Match` (cheap 304, no re-download), so a
+    quick restart doesn't re-pull everything. A corrupt/old cache degrades to a
+    cold start, never a crash.
   - Honour the error-limit budget (`X-Esi-Error-Limit-Remain` / `-Reset`
     headers): back off before it hits zero.
   - Set a descriptive `User-Agent` with contact info, per ESI guidelines.
@@ -55,7 +60,7 @@ eve_trading/
 │       ├── pipeline.py        # composition root: fetch -> build inputs -> run advisor
 │       ├── esi/               # ALL network I/O lives here
 │       │   ├── auth.py        # OAuth2 SSO (PKCE, native-app flow); token store + refresh
-│       │   ├── client.py      # async HTTP; ETag/Expires cache; error-limit backoff; paging
+│       │   ├── client.py      # async HTTP; ETag/Expires cache (persisted between sessions); error-limit backoff; paging
 │       │   ├── endpoints.py   # typed per-endpoint fetches (bytes in -> pydantic out)
 │       │   └── models.py      # pydantic models for ESI payloads (the I/O boundary)
 │       ├── data/              # ingestion: ESI/SDE -> normalized plain data
@@ -248,6 +253,64 @@ rough order:
     cheap for the mineral it's densest in and no byproduct prices are needed. Refining
     also feeds the recursive sub-build costing (`build_unit_cost` threads `refine_prices`),
     so a component's mineral inputs can be refined too.
+  - ~~Self-source recipe + quick-train tips~~ — DONE (increment 5). The Crafting tab lists owned,
+    manufacturable blueprints **alphabetically** (Product · ME, no ISK — costs are in the popup) and
+    a row opens a self-source recipe that answers *"how do I make this myself, and is it worth my
+    time?"* The mining side carries **no ISK on purpose**: a refined mineral's real cost is time,
+    travel and risk, not a market price, and quoting the ore's Jita price ÷ yield was misleading. So
+    the popup reads like a good industry calculator, then goes further. Sections: (a) **materials
+    required** — the recipe's direct materials with **Jita buy price** and **volume** each, a
+    buy-all + total-volume line, and how each is self-sourced (mine / build / buy); (b) **to
+    self-source** — the recipe **expands through *every* manufacturable component**, owned blueprint
+    or not (`_expand_all_recipes`), so the whole tree is visible at once: the **byproduct-aware mining
+    plan** (ore · units · **m³ to haul** · rough **location** highsec→moon) and the sub-components to
+    **build**, aggregated by product and ordered dependencies-first, each with its material inputs
+    (`BuildStep`/`BuildInput`, one material per line with quantity + volume — not a wall); (c) **skills
+    to build this** — the manufacturing skills every blueprint in the tree requires
+    (`sde.manufacturing_skills`, deduped to the highest level any needs), each with the character's
+    current level and the **time to train** the gap (plus a **total training time**); (d) **blueprints
+    needed** — each component whose blueprint the character doesn't own (materials tagged `build*`),
+    priced as an **estimated copy-job cost** (EIV × `config.industry.copy_cost_index` × runs) — a proxy
+    for the BPC's contract price, since BPCs aren't market-sold and scraping public contracts would
+    violate the ESI posture; every priced list carries a total;
+    (e) **buy or produce** — items with no manufacturing recipe, each tagged how it could otherwise be
+    made: `reaction` (`sde.reaction_products`, activityID 11) or `pi` (`sde.pi_products`,
+    `planetSchematicsTypeMap`) — those chains aren't modelled yet, so they're a soft buy, not hard;
+    (f) **recommended skills** (reprocessing quick-wins); and (g) **export to Markdown**
+    (`e` writes `<product>-recipe.md`). Pure `market/production.py`: `analyze_build` costs only
+    buy-vs-sell (the asset browser's blueprint popup still uses its margin); `build_source_tree` →
+    cycle-guarded, depth-capped `SourceNode` (build / mine / buy — the ore is *not* chosen here);
+    `collect_needs` → `RecipeNeeds`; `plan_ore_mining` → `MineLine`s; and the assembled
+    `SelfSourcePlan` (`RequiredMaterial`s, `MineLine`s, `BuildStep`s, `BuyItem`s) is built in the
+    pipeline (prices/volumes from `data/market` asks + `sde.volumes`). The **byproduct model**:
+    minerals are gathered **rarest-first** (`refining.mineral_commonness`, Tritanium common →
+    Morphite rare) — mining a rare mineral's ore also yields the common minerals, so those are
+    credited *before* dedicated common-mineral ore is planned (you mine only the shortfall Veldspar
+    the other ores' byproducts didn't already cover). `recipe_markdown` is a pure TUI-layer formatter.
+    **Refining is skill-based** (for ore *quantity*, not cost): `market/refining.reprocessing_yield`
+    multiplies a config **base station rate** by Reprocessing (+3%/lvl), Reprocessing Efficiency
+    (+2%/lvl) and the ore-specific processing skill (+2%/lvl, read per-ore from SDE attribute 790).
+    **Ore selection** returns base ores only (`sde.ore_sources` excludes compressed/batch/graded
+    (`0-Grade`/`II`..`IV-Grade`)/`Isotope`; the pipeline collapses same-family quality prefixes like
+    Brimful/Glistening by name suffix) and offers a few options per mineral (`_MAX_REFINE_OPTIONS`),
+    **ordered by accessibility**: each ore has a rank+location from its reprocessing skill
+    (`ORE_SOURCE_INFO`, Simple→highsec … Abyssal/moon), sorted by distance from the **home-security
+    band** (`sde.station_security` → `security_target_rank`) then by least ore to mine — so a highsec
+    character sees Veldspar/Scordite/Plagioclase first, a null character its local ores. Moon and
+    abyssal ores are shown (tagged), not excluded — the player decides. Sub-builds are **skill-gated**
+    (`_expand_recipes` + `sde.manufacturing_skills`), so an owned-but-skill-locked component stays a
+    buy. **Quick-train tips** (pure `market/training.py`, ≤ `config.training.quick_horizon_hours`,
+    default 3h) are ISK-free too: a reprocessing skill shows *"~X% less ore to mine"* at the **highest
+    level reachable within the horizon** (`training.max_level_within` — from scratch that's often
+    several levels, e.g. 0→3 in a couple of hours), and a manufacturing skill one level short shows
+    *"unlocks building <component>"*. Training time comes from the character's attributes
+    (`GET /characters/{id}/attributes/`, existing `esi-skills.read_skills.v1` scope) and the skill's
+    rank via EVE's SP curve. Documented simplifications: structure/rig/implant reprocessing bonuses
+    aren't modelled (fold into the config base rate); implant training bonuses aren't (attributes
+    endpoint omits them), so time estimates run slightly long; sub-builds assume ME 0; the naive
+    densest-mineral ore credit from increment 4 carries over. NOTE: `config.refining.efficiency` was
+    renamed to `refining.base_rate`, meaning changed from *total effective yield* (~0.70) to the *base
+    station rate* skills multiply on (~0.50) — a config migration for existing users.
 - **PI (planetary interaction)** tracking & assistance. Self-contained (colony setups,
   extractors); its profitability view consumes the same build-vs-buy engine above.
 - **Hauling / regional arbitrage** (Jita ↔ your hub) — **after** crafting/PI, because
@@ -347,7 +410,9 @@ rough order:
   `esi-characters.read_standings.v1`, and `esi-universe.read_structures.v1` (added
   2026-07-21 to name player structures in the asset browser). `esi-characters.read_blueprints.v1`
   is now consumed too — the asset browser's item-detail popup reads blueprint ME/TE and
-  runs. Also **pre-provisioned** (2026-07-21) so upcoming modules need no further
+  runs. `GET /characters/{id}/attributes/` is also consumed now (under the already-granted
+  `esi-skills.read_skills.v1` scope, no re-login) — the Crafting quick-train tips estimate
+  training time from the character's learning attributes. Also **pre-provisioned** (2026-07-21) so upcoming modules need no further
   re-login, though nothing requests them yet: `esi-industry.read_character_jobs.v1`
   (crafting), `esi-planets.manage_planets.v1` (PI), `esi-industry.read_character_mining.v1`,
   `esi-contracts.read_character_contracts.v1` (hauling), `esi-markets.structure_markets.v1`

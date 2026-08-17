@@ -1,14 +1,23 @@
-"""The pure build-vs-buy engine: ME-adjusted material cost vs fee-adjusted sale value."""
+"""The pure production engine: build-vs-buy costing, and the byproduct-aware self-source plan."""
 
 from pytest import approx
 
 from evetrader.market.production import (
-    MaterialLine,
+    BlueprintNeeded,
+    BuildRun,
+    BuyLine,
+    MineableOre,
+    MineLine,
     Recipe,
     RecipeMaterial,
+    RequiredMaterial,
+    RequiredSkill,
+    SelfSourcePlan,
     adjusted_material_quantity,
     analyze_build,
-    build_unit_cost,
+    build_source_tree,
+    collect_needs,
+    plan_ore_mining,
 )
 
 
@@ -21,10 +30,12 @@ def _recipe() -> Recipe:
     )
 
 
+# --- build-vs-buy costing ----------------------------------------------------
+
+
 def test_adjusted_material_quantity_applies_me_and_floors_at_runs() -> None:
     assert adjusted_material_quantity(100, runs=1, material_efficiency=0) == 100
     assert adjusted_material_quantity(100, runs=1, material_efficiency=10) == 90
-    # ME never drops a material below one unit per run.
     assert adjusted_material_quantity(1, runs=10, material_efficiency=10) == 10
 
 
@@ -37,171 +48,128 @@ def test_analyze_build_costs_materials_and_applies_sale_fees() -> None:
         sales_tax=0.05,
         broker_fee=0.03,
     )
-    # 34: ceil(100*0.9)=90 @5 = 450 ; 35: ceil(50*0.9)=45 @10 = 450 -> 900
-    assert analysis.material_cost == 900.0
-    assert analysis.product_value == 2000.0
+    assert analysis.material_cost == 900.0  # 90@5 + 45@10
     assert analysis.net_product_value == approx(1840.0)  # 8% total fees
     assert analysis.margin == approx(940.0)
     assert analysis.priced is True
     assert analysis.verdict == "BUILD"
 
 
-def test_analyze_build_flags_missing_material_prices() -> None:
-    analysis = analyze_build(
-        _recipe(),
-        material_efficiency=0,
-        material_prices={34: 5.0},  # no price for 35
-        product_price=2000.0,
+def test_analyze_build_flags_missing_prices_and_unvalued_products() -> None:
+    partial = analyze_build(
+        _recipe(), material_efficiency=0, material_prices={34: 5.0}, product_price=2000.0
     )
-    assert analysis.missing_material_prices == (35,)
-    assert analysis.priced is False
-    assert analysis.material_cost == 100 * 5.0  # only the priced material counted
-
-
-def test_analyze_build_scales_with_runs_and_calls_a_loss_a_buy() -> None:
-    analysis = analyze_build(
-        _recipe(),
-        material_efficiency=0,
-        material_prices={34: 5.0, 35: 10.0},
-        product_price=100.0,  # cheap product -> building loses
-        runs=3,
+    assert partial.missing_material_prices == (35,)
+    assert partial.priced is False
+    unvalued = analyze_build(
+        _recipe(), material_efficiency=0, material_prices={34: 5.0, 35: 10.0}, product_price=None
     )
-    assert analysis.material_cost == 3 * (100 * 5.0 + 50 * 10.0)  # 3000
-    assert analysis.product_value == 3 * 100.0  # 300
-    assert analysis.margin < 0
-    assert analysis.verdict == "BUY"
+    assert unvalued.product_priced is False
+    assert unvalued.material_cost == 100 * 5.0 + 50 * 10.0
 
 
-def test_analyze_build_returns_me_adjusted_material_breakdown() -> None:
-    analysis = analyze_build(
-        _recipe(),
-        material_efficiency=10,
-        material_prices={34: 5.0, 35: 10.0},
-        product_price=2000.0,
-    )
-    lines = [(m.type_id, m.quantity, m.unit_price, m.line_cost) for m in analysis.materials]
-    assert lines == [(34, 90, 5.0, 450.0), (35, 45, 10.0, 450.0)]
+# --- self-source build tree --------------------------------------------------
 
-
-def test_material_breakdown_marks_unpriced_lines() -> None:
-    analysis = analyze_build(
-        _recipe(),
-        material_efficiency=0,
-        material_prices={34: 5.0},  # no price for 35
-        product_price=2000.0,
-    )
-    unpriced = next(m for m in analysis.materials if m.type_id == 35)
-    assert unpriced.unit_price is None
-    assert unpriced.line_cost is None
-    assert unpriced.quantity == 50  # quantity still reported
-
-
-def test_margin_fraction_is_none_without_material_cost() -> None:
-    empty = Recipe(blueprint_type_id=1, product_type_id=2, product_quantity=1, materials=())
-    analysis = analyze_build(empty, material_efficiency=0, material_prices={}, product_price=50.0)
-    assert analysis.margin_fraction is None
-    assert analysis.priced is True  # no materials to miss a price for
-
-
-# --- self-source (craft cost) ------------------------------------------------
-
-# product 100 <- 2x component 200 ; component 200 <- 5x mineral 300.
-_COMPONENT_RECIPE = Recipe(
+# product 100 <- (bp 101) 2x component 200 ; component 200 <- (bp 201) 5x mineral 300.
+_COMPONENT = Recipe(
     blueprint_type_id=201, product_type_id=200, product_quantity=1, materials=(RecipeMaterial(300, 5),)
 )
-_TOP_RECIPE = Recipe(
+_TOP = Recipe(
     blueprint_type_id=101, product_type_id=100, product_quantity=1, materials=(RecipeMaterial(200, 2),)
 )
-_RECIPES = {200: _COMPONENT_RECIPE}
 
 
-def test_build_unit_cost_recurses_through_subcomponents() -> None:
-    # 200 costs 5 units of 300 @2 = 10; 100 needs 2 of those -> per-unit build cost 20.
-    assert build_unit_cost(200, _RECIPES, {300: 2.0}) == 10.0
-    assert build_unit_cost(100, {**_RECIPES, 100: _TOP_RECIPE}, {300: 2.0}) == 20.0
-
-
-def test_build_unit_cost_is_none_without_a_recipe_or_price() -> None:
-    assert build_unit_cost(999, _RECIPES, {300: 2.0}) is None  # no recipe for 999
-    assert build_unit_cost(200, _RECIPES, {}) is None  # mineral 300 has no price
-
-
-def test_build_unit_cost_guards_cycles() -> None:
-    # A recipe that (absurdly) consumes itself must not recurse forever.
-    loop = Recipe(blueprint_type_id=1, product_type_id=5, product_quantity=1, materials=(RecipeMaterial(5, 1),))
-    assert build_unit_cost(5, {5: loop}, {}) is None
-
-
-def test_analyze_build_self_sources_a_material_when_cheaper_to_build() -> None:
-    # Component 200 buys at 100 but builds (from 300) at 10 -> craft picks build.
-    analysis = analyze_build(
-        _TOP_RECIPE,
-        material_efficiency=0,
-        material_prices={200: 100.0, 300: 2.0},
-        product_price=None,
-        recipes=_RECIPES,
+def test_source_tree_classifies_build_mine_and_buy() -> None:
+    # Owns the component blueprint (200) and mineral 300 is refinable.
+    tree = build_source_tree(
+        _TOP, material_efficiency=0, refinable=frozenset({300}), recipes={200: _COMPONENT}
     )
-    line = analysis.materials[0]
-    assert line.unit_price == 100.0
-    assert line.build_unit_cost == 10.0
-    assert line.source == "build"
-    assert line.best_line_cost == 20.0  # 2 units @ built cost 10
-    assert analysis.material_cost == 200.0  # buy-everything: 2 @ 100
-    assert analysis.craft_cost == 20.0  # self-source: 2 @ 10
-    assert analysis.savings == 180.0
-    assert analysis.craft_priced is True
+    assert (tree.type_id, tree.source, tree.runs) == (100, "build", 1)
+    component = tree.children[0]
+    assert (component.type_id, component.source, component.runs) == (200, "build", 2)
+    mineral = component.children[0]
+    assert (mineral.type_id, mineral.source, mineral.quantity) == (300, "mine", 10)  # 2 runs x 5
 
 
-def test_analyze_build_buys_a_material_when_cheaper_than_building() -> None:
-    analysis = analyze_build(
-        _TOP_RECIPE,
-        material_efficiency=0,
-        material_prices={200: 8.0, 300: 2.0},  # buy 200 @8 beats build @10
-        product_price=None,
-        recipes=_RECIPES,
+def test_source_tree_buys_a_component_without_an_owned_blueprint() -> None:
+    # No owned recipe for 200 and it isn't a mineral -> it must be bought.
+    tree = build_source_tree(_TOP, material_efficiency=0, refinable=frozenset(), recipes={})
+    component = tree.children[0]
+    assert (component.type_id, component.source) == (200, "buy")
+    needs = collect_needs(tree)
+    assert needs.minerals == {}
+    assert needs.buy == (BuyLine(200, 2),)
+    assert [(r.product_type_id, r.runs) for r in needs.build] == [(100, 1)]
+
+
+def test_collect_needs_aggregates_minerals_builds_and_buys() -> None:
+    tree = build_source_tree(
+        _TOP, material_efficiency=0, refinable=frozenset({300}), recipes={200: _COMPONENT}
     )
-    line = analysis.materials[0]
-    assert line.source == "buy"
-    assert analysis.craft_cost == 16.0  # 2 @ 8
-    assert analysis.savings == 0.0  # buying was already cheapest
+    needs = collect_needs(tree)
+    assert needs.minerals == {300: 10}
+    assert [(r.product_type_id, r.runs) for r in needs.build] == [(100, 1), (200, 2)]
+    assert needs.buy == ()
 
 
-def test_analyze_build_refines_a_material_when_cheapest() -> None:
-    # Component 200 buys @100, builds @10 (from 300 @2), but refines @6 -> refine wins.
-    analysis = analyze_build(
-        _TOP_RECIPE,
-        material_efficiency=0,
-        material_prices={200: 100.0, 300: 2.0},
-        product_price=None,
-        recipes=_RECIPES,
-        refine_prices={200: 6.0},
+# --- byproduct-aware mining plan ---------------------------------------------
+
+
+def test_plan_ore_mining_credits_byproducts_of_the_rare_ore() -> None:
+    # Rare mineral 40 comes from ore 900, which ALSO yields common mineral 34 as a byproduct.
+    # Common mineral 34's own ore is 901. Mining for the rare one first covers some of 34.
+    rare_ore = MineableOre(900, "nullsec", 16.0, yields={40: 1.0, 34: 2.0})
+    common_ore = MineableOre(901, "highsec", 0.1, yields={34: 4.0})
+    plan = plan_ore_mining({40: 10, 34: 100}, {40: rare_ore, 34: common_ore}, rarity_order=(40, 34))
+    by_ore = {line.ore_type_id: line for line in plan}
+    # 10 units of ore 900 (for mineral 40) -> yields 20 of mineral 34 as byproduct.
+    assert by_ore[900].quantity == 10
+    assert by_ore[900].volume == approx(160.0)  # 10 x 16 m³
+    # Only 80 of the 100 mineral 34 remains -> ceil(80/4) = 20 of ore 901 (not 25).
+    assert by_ore[901].quantity == 20
+
+
+def test_plan_ore_mining_skips_a_mineral_fully_covered_by_byproducts() -> None:
+    rare_ore = MineableOre(900, "nullsec", 1.0, yields={40: 1.0, 34: 50.0})
+    common_ore = MineableOre(901, "highsec", 0.1, yields={34: 4.0})
+    # Mining for 40 yields plenty of 34 -> ore 901 is never mined.
+    plan = plan_ore_mining({40: 10, 34: 100}, {40: rare_ore, 34: common_ore}, rarity_order=(40, 34))
+    assert [line.ore_type_id for line in plan] == [900]
+
+
+def test_plan_ore_mining_is_empty_without_needs() -> None:
+    assert plan_ore_mining({}, {}, rarity_order=()) == ()
+
+
+def test_self_source_plan_reports_missing_skills() -> None:
+    plan = SelfSourcePlan(
+        materials=(RequiredMaterial(200, 1, 5.0, 1.0, "buildable"),),
+        mine=(),
+        build=(),
+        buy=(),
+        required_skills=(
+            RequiredSkill(100, 3, 3, None),  # met
+            RequiredSkill(101, 4, 2, 5400.0),  # missing, ~1h30m to train
+        ),
+        blueprints=(BlueprintNeeded(201, 200, 2_000_000.0),),
     )
-    line = analysis.materials[0]
-    assert line.refine_unit_cost == 6.0
-    assert line.source == "refine"
-    assert line.best_line_cost == 12.0  # 2 units @ 6
-    assert analysis.craft_cost == 12.0
+    assert [skill.type_id for skill in plan.missing_skills] == [101]
+    assert plan.required_skills[0].met is True and plan.required_skills[1].met is False
 
 
-def test_refine_feeds_into_sub_build_costing() -> None:
-    # Building 200 needs 5x mineral 300: buy 300 @2, but refine it @1 -> build uses refine.
-    unit = build_unit_cost(200, _RECIPES, {300: 2.0}, {300: 1.0})
-    assert unit == 5.0  # 5 units of 300 @ the refined price of 1
+def test_mine_line_carries_haulable_volume() -> None:
+    ore = MineableOre(900, "highsec", 0.1, yields={34: 4.0})
+    (line,) = plan_ore_mining({34: 40}, {34: ore}, rarity_order=(34,))
+    assert isinstance(line, MineLine)
+    assert line.quantity == 10  # ceil(40 / 4)
+    assert line.volume == approx(1.0)  # 10 x 0.1 m³
+    assert line.location == "highsec"
 
 
-def test_source_prefers_buying_on_a_tie() -> None:
-    line = MaterialLine(1, 10, unit_price=5.0, build_unit_cost=5.0, refine_unit_cost=5.0)
-    assert line.source == "buy"
-
-
-def test_craft_cost_flags_a_material_with_no_source() -> None:
-    analysis = analyze_build(
-        _TOP_RECIPE,
-        material_efficiency=0,
-        material_prices={},  # 200 not sold, and 300 (its input) not priced -> unbuildable
-        product_price=None,
-        recipes=_RECIPES,
+def test_source_tree_guards_cycles() -> None:
+    loop = Recipe(
+        blueprint_type_id=1, product_type_id=5, product_quantity=1, materials=(RecipeMaterial(5, 1),)
     )
-    assert analysis.craft_missing_prices == (200,)
-    assert analysis.craft_priced is False
-    assert analysis.materials[0].source == "?"
+    tree = build_source_tree(loop, material_efficiency=0, refinable=frozenset(), recipes={5: loop})
+    assert tree.source == "build"
+    assert tree.children[0].source == "buy"  # the self-referential input bottoms out

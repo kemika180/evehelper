@@ -19,8 +19,12 @@ from pathlib import Path
 
 from evetrader.market.production import Recipe, RecipeMaterial
 
-# industryActivity activityID for manufacturing (the SDE's stable activity codes).
+# industryActivity activityIDs (the SDE's stable activity codes).
 _MANUFACTURING = 1
+_REACTION = 11
+# dgmTypeAttributes attributeID naming an ore's reprocessing skill (the tiered "… Ore
+# Processing" skill governing its yield). Read per ore rather than hardcoding a mapping.
+_REPROCESSING_SKILL_ATTR = 790
 # invCategories categoryID for asteroid ore — the only reprocessing sources we treat as
 # "refine" (modules/ships also reprocess into minerals, but that's salvage, not mining).
 _ASTEROID_CATEGORY = 25
@@ -31,10 +35,15 @@ _CHARGE_CATEGORY = 8
 @dataclass(frozen=True)
 class OreYield:
     """One ore that reprocesses into a wanted mineral, and how much of that mineral a
-    single unit of the ore yields before efficiency (``reprocess quantity / portionSize``)."""
+    single unit of the ore yields before efficiency (``reprocess quantity / portionSize``).
+    ``name`` carries the ore's SDE name so the refine model can collapse same-family
+    variants (e.g. drop "Brimful Zeolites" when plain "Zeolites" is also available), and
+    ``volume`` the ore's m³ per unit (for the hauling / trips estimate)."""
 
     ore_type_id: int
     units_per_ore: float
+    name: str = ""
+    volume: float = 0.0
 
 
 class SdeError(Exception):
@@ -104,28 +113,119 @@ class SdeDatabase:
         ).fetchall()
         return frozenset(int(row[0]) for row in rows)
 
+    def manufacturing_skills(self, blueprint_type_id: int) -> list[tuple[int, int]]:
+        """The (skill type id, required level) pairs a blueprint's manufacturing job
+        needs — used to tell whether the character can actually build it, and which skill
+        (and level) would unlock the build if not. Empty when the blueprint has no
+        manufacturing skill requirements or isn't in the SDE."""
+        rows = self._conn.execute(
+            "SELECT skillID, level FROM industryActivitySkills "
+            "WHERE typeID = ? AND activityID = ? ORDER BY skillID",
+            (blueprint_type_id, _MANUFACTURING),
+        ).fetchall()
+        return [(int(skill_id), int(level)) for skill_id, level in rows]
+
+    def reaction_products(self, type_ids: set[int]) -> frozenset[int]:
+        """Which of these types are produced by a reaction (industryActivity activityID 11) —
+        so the recipe can note a bought material is reaction-makeable rather than pure buy."""
+        if not type_ids:
+            return frozenset()
+        placeholders = ",".join("?" * len(type_ids))
+        rows = self._conn.execute(
+            "SELECT productTypeID FROM industryActivityProducts "
+            f"WHERE activityID = ? AND productTypeID IN ({placeholders})",
+            (_REACTION, *sorted(type_ids)),
+        ).fetchall()
+        return frozenset(int(row[0]) for row in rows)
+
+    def pi_products(self, type_ids: set[int]) -> frozenset[int]:
+        """Which of these types are planetary-industry outputs (a ``planetSchematicsTypeMap``
+        row with ``isInput = 0``) — so the recipe can note a bought material is PI-makeable."""
+        if not type_ids:
+            return frozenset()
+        placeholders = ",".join("?" * len(type_ids))
+        rows = self._conn.execute(
+            "SELECT typeID FROM planetSchematicsTypeMap "
+            f"WHERE isInput = 0 AND typeID IN ({placeholders})",
+            tuple(sorted(type_ids)),
+        ).fetchall()
+        return frozenset(int(row[0]) for row in rows)
+
+    def volumes(self, type_ids: set[int]) -> dict[int, float]:
+        """Packaged m³ per unit for each type (from ``invTypes.volume``) — for the materials'
+        volume and the mining haul estimate. Types absent from the SDE are simply omitted."""
+        if not type_ids:
+            return {}
+        placeholders = ",".join("?" * len(type_ids))
+        rows = self._conn.execute(
+            f"SELECT typeID, volume FROM invTypes WHERE typeID IN ({placeholders})",
+            tuple(sorted(type_ids)),
+        ).fetchall()
+        return {int(type_id): float(volume) for type_id, volume in rows if volume is not None}
+
+    def station_security(self, station_id: int) -> float | None:
+        """The security status of an NPC station's solar system, or None if the station
+        isn't in the SDE (a player structure, which the SDE doesn't carry). Lets the refine
+        model bias ore options toward what's mineable at the character's home security."""
+        row = self._conn.execute(
+            "SELECT s.security FROM staStations st "
+            "JOIN mapSolarSystems s ON s.solarSystemID = st.solarSystemID "
+            "WHERE st.stationID = ?",
+            (station_id,),
+        ).fetchone()
+        return float(row[0]) if row is not None and row[0] is not None else None
+
+    def ore_reprocessing_skills(self, ore_type_ids: set[int]) -> dict[int, int]:
+        """For each ore, the reprocessing skill type id that governs its yield (SDE
+        attribute 790). Ores without the attribute are simply absent. Lets the refine
+        model raise yield by the character's actual ore-specific processing level."""
+        if not ore_type_ids:
+            return {}
+        placeholders = ",".join("?" * len(ore_type_ids))
+        rows = self._conn.execute(
+            "SELECT typeID, COALESCE(valueInt, valueFloat) FROM dgmTypeAttributes "
+            f"WHERE attributeID = ? AND typeID IN ({placeholders})",
+            (_REPROCESSING_SKILL_ATTR, *sorted(ore_type_ids)),
+        ).fetchall()
+        return {int(ore_id): int(skill_id) for ore_id, skill_id in rows if skill_id is not None}
+
     def ore_sources(self, mineral_type_ids: set[int]) -> dict[int, list[OreYield]]:
-        """For each wanted mineral, the asteroid ores that reprocess into it and the
+        """For each wanted mineral, the **base** asteroid ores that reprocess into it and the
         per-unit yield of that mineral. Ores/items outside the asteroid category (modules,
-        ships) are excluded — only mining-and-refining counts as "refine" here. Minerals
-        no ore produces are simply absent from the result."""
+        ships) are excluded — only mining-and-refining counts as "refine" here.
+
+        Only **base** ores are returned (moon ores included, tagged by location downstream so
+        the player can judge accessibility): the compressed / batch-compressed forms and the
+        graded variants (``… II-Grade`` … ``IV-Grade`` and the newbie-area ``0-Grade``) and ice
+        ``Isotope`` forms are filtered out, since higher grades are rare and the base rock is
+        what a miner actually finds. Same-name quality *prefixes* (Brimful, Glistening, …) can't
+        be told apart in SQL and are collapsed downstream by name. Minerals no ore produces are
+        simply absent from the result."""
         if not mineral_type_ids:
             return {}
         placeholders = ",".join("?" * len(mineral_type_ids))
         rows = self._conn.execute(
-            "SELECT m.materialTypeID, m.typeID, m.quantity, t.portionSize "
+            "SELECT m.materialTypeID, m.typeID, m.quantity, t.portionSize, t.typeName, t.volume "
             "FROM invTypeMaterials m "
             "JOIN invTypes t ON t.typeID = m.typeID "
             "JOIN invGroups g ON g.groupID = t.groupID "
             f"WHERE m.materialTypeID IN ({placeholders}) "
-            "AND g.categoryID = ? AND t.portionSize > 0",
+            "AND g.categoryID = ? AND t.portionSize > 0 "
+            "AND t.typeName NOT LIKE '%Compressed%' "
+            "AND t.typeName NOT LIKE '%-Grade%' "
+            "AND t.typeName NOT LIKE '%Isotope%'",
             (*sorted(mineral_type_ids), _ASTEROID_CATEGORY),
         ).fetchall()
         sources: dict[int, list[OreYield]] = {}
-        for mineral_id, ore_id, quantity, portion in rows:
+        for mineral_id, ore_id, quantity, portion, name, volume in rows:
             if int(portion) <= 0:
                 continue
             sources.setdefault(int(mineral_id), []).append(
-                OreYield(ore_type_id=int(ore_id), units_per_ore=int(quantity) / int(portion))
+                OreYield(
+                    ore_type_id=int(ore_id),
+                    units_per_ore=int(quantity) / int(portion),
+                    name=str(name),
+                    volume=float(volume) if volume is not None else 0.0,
+                )
             )
         return sources

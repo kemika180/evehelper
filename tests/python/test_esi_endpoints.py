@@ -20,6 +20,7 @@ from evetrader.esi.endpoints import (
     fetch_market_orders,
     fetch_open_orders,
     fetch_skillqueue,
+    fetch_attributes,
     fetch_skills,
     fetch_standings,
     fetch_station,
@@ -240,6 +241,30 @@ def test_fetch_skills_authenticates_and_parses() -> None:
     async def body(client: EsiClient, _: dict[str, str | None]) -> None:
         skills = await fetch_skills(client, 42, token="tok")
         assert skills.skills[0].skill_id == 16622
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_fetch_attributes_authenticates_and_parses() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/attributes/")
+        assert request.headers.get("Authorization") == "Bearer tok"
+        return httpx.Response(
+            200,
+            json={
+                "charisma": 19,
+                "intelligence": 27,
+                "memory": 21,
+                "perception": 20,
+                "willpower": 24,
+            },
+            headers={"Expires": _FUTURE},
+        )
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        attributes = await fetch_attributes(client, 42, token="tok")
+        assert attributes.intelligence == 27
+        assert attributes.memory == 21
 
     _run(body, httpx.MockTransport(handler))
 

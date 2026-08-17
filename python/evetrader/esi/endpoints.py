@@ -17,6 +17,7 @@ from evetrader.esi.models import (
     Asset,
     AssetName,
     Blueprint,
+    CharacterAttributes,
     CharacterOrder,
     CharacterSkills,
     Corporation,
@@ -114,6 +115,13 @@ async def fetch_market_history(
 async def fetch_skills(client: EsiClient, character_id: int, token: str) -> CharacterSkills:
     body = await client.get(f"/characters/{character_id}/skills/", token=token)
     return CharacterSkills.model_validate_json(body)
+
+
+async def fetch_attributes(
+    client: EsiClient, character_id: int, token: str
+) -> CharacterAttributes:
+    body = await client.get(f"/characters/{character_id}/attributes/", token=token)
+    return CharacterAttributes.model_validate_json(body)
 
 
 async def fetch_standings(client: EsiClient, character_id: int, token: str) -> list[Standing]:

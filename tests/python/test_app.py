@@ -5,6 +5,7 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from rich.text import Text
 from textual.widgets import DataTable, Input, OptionList, Static, TabbedContent, Tree
 
@@ -14,6 +15,7 @@ from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import (
     Blueprint,
+    CharacterAttributes,
     IndustryJob,
     MarketHistoryDay,
     Skill,
@@ -22,7 +24,19 @@ from evetrader.esi.models import (
 from evetrader.market.fees import EffectiveFees
 from evetrader.market.investment import TrackedStatus
 from evetrader.market.listings import ListingStatus
-from evetrader.market.production import BuildAnalysis, MaterialLine
+from evetrader.market.production import (
+    BlueprintNeeded,
+    BuildAnalysis,
+    BuildInput,
+    BuildStep,
+    BuyItem,
+    MineLine,
+    RequiredMaterial,
+    RequiredSkill,
+    SelfSourcePlan,
+    SourceNode,
+)
+from evetrader.market.training import TrainingTip
 from evetrader.data.sde_download import SdeState
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
@@ -190,6 +204,9 @@ def _character_report() -> CharacterReport:
             Skill(skill_id=16622, active_skill_level=5, trained_skill_level=5),  # Accounting
             Skill(skill_id=3443, active_skill_level=3, trained_skill_level=3),  # Trade
         ],
+        attributes=CharacterAttributes(
+            charisma=20, intelligence=20, memory=20, perception=20, willpower=20
+        ),
         holdings={34: 500},
         names={
             16622: "Accounting",
@@ -341,7 +358,6 @@ def _opportunity_report() -> OpportunityReport:
                     product_value=1_850_000.0,
                     net_product_value=1_800_000.0,
                     missing_material_prices=(),
-                    craft_cost=900_000.0,  # self-sourcing saves 300k (25%)
                 ),
             )
         ],
@@ -355,8 +371,9 @@ def _build(
     product: int,
     me: int,
     material_cost: float,
-    craft_cost: float,
-    materials: tuple[MaterialLine, ...] = (),
+    tree: SourceNode | None = None,
+    plan: SelfSourcePlan | None = None,
+    training_tips: tuple[TrainingTip, ...] = (),
 ) -> BuildOpportunity:
     return BuildOpportunity(
         blueprint_item_id=item_id,
@@ -369,9 +386,10 @@ def _build(
             product_value=0.0,
             net_product_value=0.0,
             missing_material_prices=(),
-            materials=materials,
-            craft_cost=craft_cost,
         ),
+        tree=tree,
+        plan=plan,
+        training_tips=training_tips,
     )
 
 
@@ -380,16 +398,50 @@ def _manufacturing_report() -> OpportunityReport:
         tracked=[],
         listing_buys=[],
         listing_sells=[],
-        names={587: "Rifter", 588: "Breacher", 34: "Tritanium", 35: "Pyerite"},
+        names={
+            587: "Rifter",
+            588: "Breacher",
+            34: "Tritanium",
+            35: "Pyerite",
+            555: "Datacore",
+            777: "Capital Part",
+            776: "Capital Part Blueprint",
+            999: "Power Core",
+            1230: "Veldspar",
+            3380: "Industry",
+            3389: "Reprocessing Efficiency",
+        },
         history={},
         builds=[
             _build(
-                13, 900, 587, 10, 1_000_000.0, 600_000.0,
-                materials=(MaterialLine(34, 90, 5.0), MaterialLine(35, 45, 10.0)),
+                13, 900, 587, 10, 1_000_000.0,
+                # Rifter: Tritanium mined, a sub-built Power Core (from Pyerite), a bought Datacore.
+                tree=SourceNode(
+                    587, 1, "build", runs=1,
+                    children=(
+                        SourceNode(34, 90, "mine"),
+                        SourceNode(999, 3, "build", runs=3, children=(SourceNode(35, 45, "mine"),)),
+                    ),
+                ),
+                plan=SelfSourcePlan(
+                    materials=(
+                        RequiredMaterial(34, 90, 5.0, 0.01, "refine"),
+                        RequiredMaterial(999, 3, None, 50.0, "build"),
+                        RequiredMaterial(777, 1, 5_000_000.0, 100.0, "buildable"),
+                        RequiredMaterial(555, 2, 600_000.0, 0.1, "buy"),
+                    ),
+                    mine=(MineLine(1230, 120, 12.0, "highsec"),),
+                    build=(BuildStep(999, 3, 3, (BuildInput(35, 45, 4.5),)),),
+                    buy=(BuyItem(555, 2, 600_000.0, 0.1, "reaction"),),
+                    # Industry III required, character has 0, ~1h30m to train.
+                    required_skills=(RequiredSkill(3380, 3, 0, 5400.0),),
+                    blueprints=(BlueprintNeeded(776, 777, 2_000_000.0),),  # Capital Part Blueprint
+                ),
+                training_tips=(TrainingTip(3389, 0, 3, 7800.0, "refine", ore_reduction=0.06),),
             ),
-            # A second identical copy -> collapses. Higher savings than the Breacher.
-            _build(14, 900, 587, 10, 1_000_000.0, 600_000.0),
-            _build(15, 901, 588, 2, 200_000.0, 180_000.0),
+            # A second identical copy -> collapses to one row with a count.
+            _build(14, 900, 587, 10, 1_000_000.0),
+            _build(15, 901, 588, 2, 200_000.0),
         ],
         sde_available=True,
     )
@@ -883,6 +935,7 @@ def _app_with_assets(
         base.character,
         base.skill_queue,
         base.skills,
+        base.attributes,
         base.holdings,
         {**base.names, **names},
         base.station_name,
@@ -1099,6 +1152,7 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
         base.character,
         base.skill_queue,
         base.skills,
+        base.attributes,
         base.holdings,
         {**base.names, 24696: "Harbinger", 17363: "Container"},
         base.station_name,
@@ -1250,7 +1304,7 @@ def test_manufacturing_tab_ranks_owned_blueprints(tmp_path: Path) -> None:
             assert table.row_count == 1
             row = table.get_row_at(0)
             assert "Rifter" in str(row[0])  # product name
-            assert "25%" in str(row[4])  # self-sourcing saves 300k of 1.2m
+            assert "ME 10" in str(row[1])  # just product + ME, no ISK on the tab
             await pilot.press("q")
 
     asyncio.run(_drive())
@@ -1308,12 +1362,13 @@ def test_manufacturing_dedupes_counts_searches_and_sorts(tmp_path: Path) -> None
             await pilot.pause()
             table = trading.query_one("#manufacturing", DataTable)
 
-            # Two identical Rifter copies collapse to one row that shows the count.
+            # Two identical Rifter copies collapse to one row that shows the count; rows are
+            # alphabetical, so Breacher leads.
             assert table.row_count == 2
-            assert "Rifter" in str(table.get_row_at(0)[0])  # highest savings, default sort
-            assert "×2" in str(table.get_row_at(0)[0])  # two copies owned
-            assert "Breacher" in str(table.get_row_at(1)[0])
-            assert "×" not in str(table.get_row_at(1)[0])  # a single copy shows no count
+            assert "Breacher" in str(table.get_row_at(0)[0])
+            assert "×" not in str(table.get_row_at(0)[0])  # a single copy shows no count
+            assert "Rifter" in str(table.get_row_at(1)[0])
+            assert "×2" in str(table.get_row_at(1)[0])  # two copies owned
 
             # Search filters by product name.
             trading.query_one("#manufacturing-search", Input).value = "brea"
@@ -1323,28 +1378,15 @@ def test_manufacturing_dedupes_counts_searches_and_sorts(tmp_path: Path) -> None
             trading.query_one("#manufacturing-search", Input).value = ""
             await pilot.pause()
             assert table.row_count == 2
-
-            # Sorting: click the ME header (column 1) — numeric, so descending first.
-            keys = list(table.columns.keys())
-            trading.on_data_table_header_selected(
-                DataTable.HeaderSelected(table, keys[1], 1, table.columns[keys[1]].label)
-            )
-            await pilot.pause()
-            assert trading._mfg_sort == (1, True)
-            assert "Rifter" in str(table.get_row_at(0)[0])  # ME 10 before ME 2
-            # Click again to reverse.
-            trading.on_data_table_header_selected(
-                DataTable.HeaderSelected(table, keys[1], 1, table.columns[keys[1]].label)
-            )
-            await pilot.pause()
-            assert trading._mfg_sort == (1, False)
-            assert "Breacher" in str(table.get_row_at(0)[0])  # ME 2 first
             await pilot.press("q")
 
     asyncio.run(_drive())
 
 
-def test_manufacturing_row_opens_material_breakdown(tmp_path: Path) -> None:
+def test_manufacturing_row_opens_material_breakdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)  # the Markdown export writes to the working directory
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
 
@@ -1363,7 +1405,8 @@ def test_manufacturing_row_opens_material_breakdown(tmp_path: Path) -> None:
             trading.query_one(TabbedContent).active = "manufacturing-tab"
             await pilot.pause()
             table = trading.query_one("#manufacturing", DataTable)
-            table.focus()  # default sort puts the Rifter (with materials) at row 0
+            table.focus()
+            table.move_cursor(row=1)  # the Rifter row (alphabetical: Breacher, Rifter)
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
@@ -1371,7 +1414,30 @@ def test_manufacturing_row_opens_material_breakdown(tmp_path: Path) -> None:
             assert isinstance(app.screen, MaterialsScreen)
             body = str(app.screen.query_one("#matbody", Static).render())
             assert "Rifter" in body
-            assert "Tritanium" in body and "Pyerite" in body  # the required materials
+            assert "materials required" in body  # the recipe table leads
+            assert "Tritanium" in body  # a direct material
+            assert "Buy @ Jita" in body and "Volume" in body  # material buy price + volume columns
+            assert "to self-source" in body
+            assert "Veldspar" in body and "highsec" in body  # the ore to mine and its location
+            assert "Power Core" in body  # the sub-component build step
+            assert "skills to build this" in body and "Industry" in body  # required skills
+            assert "have 0" in body and "train ~" in body  # a missing skill + its training time
+            assert "blueprints needed" in body and "Capital Part Blueprint" in body
+            assert "buy or produce" in body and "Datacore" in body  # the buy list
+            assert "buy or react" in body  # a reaction-makeable item tagged, not a hard buy
+            assert "train to help" in body and "Reprocessing Efficiency" in body  # a skill tip
+            assert "L0→3" in body  # multi-level reach within the horizon
+
+            # Export writes a Markdown file with the detail.
+            await pilot.press("e")
+            await pilot.pause()
+            exported = tmp_path / "rifter-recipe.md"
+            assert exported.exists()
+            markdown = exported.read_text(encoding="utf-8")
+            assert "## Materials required" in markdown
+            assert "## Skills to build this" in markdown
+            assert "## Blueprints needed" in markdown
+            assert "## To self-source — mine & refine" in markdown
             await pilot.press("escape")
 
     asyncio.run(_drive())

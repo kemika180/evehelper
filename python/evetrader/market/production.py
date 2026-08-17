@@ -1,13 +1,17 @@
-"""Build-vs-buy production engine. PURE — no I/O.
+"""Build-vs-buy and self-source recipe engine. PURE — no I/O.
 
-Given a recipe (a product and the materials it needs) plus a price for each type, it
-decides whether *building* an item beats *buying* it. Deterministic and unit-tested on
-fixtures — the recipe and prices are handed in by the impure layer (``data/sde.py``
-for recipes, the market snapshot for prices), never fetched here.
+Two deterministic jobs, given (recipe, prices, ore sources) handed in by the impure layer:
 
-The ``Recipe`` shape is deliberately activity-agnostic: manufacturing is the first
-consumer, but reactions and planetary interaction produce an output from a set of
-inputs too, so they can feed their own recipes through the same engine later.
+1. ``analyze_build`` — the build-vs-buy verdict: the cost to *buy* a blueprint's materials
+   vs the fee-adjusted sale value of its product (the asset browser's blueprint popup).
+2. ``build_source_tree`` / ``flatten_plan`` — the **self-source recipe**: how to make an
+   item yourself, expanding each material into a sub-build or the ore to mine. This side is
+   **cost-free by design** — mining's real cost is time, travel and risk, not a market price
+   — so it says only *what* to gather, roughly *where* (highsec/lowsec/null/abyssal/moon),
+   and how much volume it is (to judge hauling trips), leaving the worth-it call to the player.
+
+The ``Recipe`` shape is activity-agnostic: manufacturing is the first consumer, but reactions
+and planetary interaction fit the same shape later.
 """
 
 from __future__ import annotations
@@ -38,53 +42,19 @@ class Recipe:
     materials: tuple[RecipeMaterial, ...]
 
 
-def _cheapest(*options: float | None) -> float | None:
-    """The smallest of the priced options, or None when none is priced."""
-    present = [option for option in options if option is not None]
-    return min(present) if present else None
-
-
 @dataclass(frozen=True)
 class MaterialLine:
     """One input of a build: the material, its ME-adjusted quantity for the analyzed run
-    count, and the per-unit cost of each way to obtain it — buying it at the reference
-    market, self-building it, or mining-and-refining ore into it (each None when that
-    source doesn't apply or can't be priced)."""
+    count, and its unit buy price at the reference market (None when it isn't priced)."""
 
     type_id: int
     quantity: int
     unit_price: float | None
-    build_unit_cost: float | None = None
-    refine_unit_cost: float | None = None
 
     @property
     def line_cost(self) -> float | None:
         """Cost to buy this line outright: quantity times unit price, or None."""
         return self.quantity * self.unit_price if self.unit_price is not None else None
-
-    @property
-    def best_unit_cost(self) -> float | None:
-        """The cheapest of buying, self-building, and refining, or None if unpriced."""
-        return _cheapest(self.unit_price, self.build_unit_cost, self.refine_unit_cost)
-
-    @property
-    def best_line_cost(self) -> float | None:
-        """Cost to acquire this line at its cheapest source, or None if unpriceable."""
-        best = self.best_unit_cost
-        return self.quantity * best if best is not None else None
-
-    @property
-    def source(self) -> str:
-        """The cheapest source: 'buy', 'build', 'refine', or '?' (unpriceable). Ties
-        prefer buying (no production effort), then building, then refining."""
-        best = self.best_unit_cost
-        if best is None:
-            return "?"
-        if self.unit_price is not None and self.unit_price <= best:
-            return "buy"
-        if self.build_unit_cost is not None and self.build_unit_cost <= best:
-            return "build"
-        return "refine"
 
 
 @dataclass(frozen=True)
@@ -103,11 +73,6 @@ class BuildAnalysis:
     product_priced: bool = True
     # The per-material breakdown (the bill of materials), for a build's detail view.
     materials: tuple[MaterialLine, ...] = ()
-    # Cost to CRAFT: each material taken at its cheapest source (buy vs self-build).
-    craft_cost: float = 0.0
-    # Materials with no source price at all (neither buyable nor buildable) — leaves
-    # `craft_cost` partial, the crafting analogue of `missing_material_prices`.
-    craft_missing_prices: tuple[int, ...] = ()
 
     @property
     def margin(self) -> float:
@@ -119,25 +84,6 @@ class BuildAnalysis:
         """Margin as a fraction of material cost (return on the build), or None when
         there's nothing to divide by."""
         return self.margin / self.material_cost if self.material_cost > 0 else None
-
-    @property
-    def savings(self) -> float:
-        """How much self-sourcing the materials saves over buying them all outright —
-        the buy-everything cost minus the cheapest-source craft cost."""
-        return self.material_cost - self.craft_cost
-
-    @property
-    def savings_fraction(self) -> float | None:
-        """Savings as a fraction of the buy-everything cost, or None with nothing to
-        divide by."""
-        return self.savings / self.material_cost if self.material_cost > 0 else None
-
-    @property
-    def craft_priced(self) -> bool:
-        """Whether every material had at least one source price, so ``craft_cost`` is
-        complete. The savings comparison is only trustworthy when this and no material
-        was missing a *buy* price (``missing_material_prices`` empty)."""
-        return not self.craft_missing_prices
 
     @property
     def priced(self) -> bool:
@@ -162,63 +108,6 @@ def adjusted_material_quantity(base_quantity: int, runs: int, material_efficienc
     return max(runs, math.ceil(round(reduced, 2)))
 
 
-# Cap on how deep the self-build recursion follows a chain of sub-components before it
-# gives up and prices a material by buying — a safety bound, not a real-tree limit.
-_MAX_BUILD_DEPTH = 5
-
-
-def build_unit_cost(
-    product_type_id: int,
-    recipes: Mapping[int, Recipe],
-    material_prices: Mapping[int, float],
-    refine_prices: Mapping[int, float] | None = None,
-) -> float | None:
-    """Per-unit cost to manufacture ``product_type_id`` from its cheapest-sourced
-    inputs, or None if it has no recipe here or any input can't be priced. Pure.
-
-    ``recipes`` maps a product type id to the recipe that makes it (the transitive
-    closure the caller has resolved — typically only components the character can build).
-    Each input is costed at the cheapest of buying it, self-building it, or refining ore
-    into it (``refine_prices``); sub-builds assume ME 0 (the sub-blueprint's researched
-    ME isn't threaded through here), a conservative estimate. Recursion is cycle-guarded
-    and depth-capped."""
-    return _build_unit_cost(
-        product_type_id,
-        recipes,
-        material_prices,
-        refine_prices or {},
-        _MAX_BUILD_DEPTH,
-        frozenset(),
-    )
-
-
-def _build_unit_cost(
-    product_type_id: int,
-    recipes: Mapping[int, Recipe],
-    material_prices: Mapping[int, float],
-    refine_prices: Mapping[int, float],
-    depth: int,
-    stack: frozenset[int],
-) -> float | None:
-    recipe = recipes.get(product_type_id)
-    if recipe is None or depth <= 0 or product_type_id in stack or recipe.product_quantity <= 0:
-        return None
-    inner = stack | {product_type_id}
-    total = 0.0
-    for material in recipe.materials:
-        quantity = adjusted_material_quantity(material.quantity, 1, 0)  # sub-builds at ME 0
-        buy = material_prices.get(material.type_id)
-        refine = refine_prices.get(material.type_id)
-        build = _build_unit_cost(
-            material.type_id, recipes, material_prices, refine_prices, depth - 1, inner
-        )
-        unit = _cheapest(buy, build, refine)
-        if unit is None:
-            return None  # an input can't be sourced -> this build cost is unknown
-        total += quantity * unit
-    return total / recipe.product_quantity
-
-
 def analyze_build(
     recipe: Recipe,
     *,
@@ -228,43 +117,26 @@ def analyze_build(
     sales_tax: float = 0.0,
     broker_fee: float = 0.0,
     runs: int = 1,
-    recipes: Mapping[int, Recipe] | None = None,
-    refine_prices: Mapping[int, float] | None = None,
 ) -> BuildAnalysis:
-    """Cost a build two ways — buying every material, and crafting each at its cheapest
-    source — and (if the product is priced) compare it to buying the product. Pure.
+    """Cost a build by buying every material, and (if the product is priced) compare it to
+    selling the product. Pure.
 
-    ``material_prices`` is the unit buy cost per material type; ``product_price`` the
-    unit sale value of the output (``None`` if it isn't sold at the reference market —
-    the build is still returned, just unvalued). ``recipes`` (product id -> recipe) lets
-    each material be self-built when that's cheaper than buying it, and ``refine_prices``
-    (mineral id -> unit cost of refining ore into it) lets it be mined-and-refined; omit
-    both for a plain buy-only costing. Sale fees (``sales_tax`` + ``broker_fee``) apply to
-    the product side. Prices, recipes and fees are policy handed in by the caller — the
-    engine is just arithmetic, so it stays deterministic and reusable."""
-    recipe_map = recipes or {}
-    refine_map = refine_prices or {}
+    ``material_prices`` is the unit buy cost per material type; ``product_price`` the unit
+    sale value of the output (``None`` if it isn't sold at the reference market — the build
+    is still returned, just unvalued). Sale fees (``sales_tax`` + ``broker_fee``) apply to
+    the product side. Self-sourcing (build/mine) is a separate, cost-free concern — see
+    ``build_source_tree`` — so it isn't costed here."""
     material_cost = 0.0
-    craft_cost = 0.0
     missing: list[int] = []
-    craft_missing: list[int] = []
     lines: list[MaterialLine] = []
     for material in recipe.materials:
         quantity = adjusted_material_quantity(material.quantity, runs, material_efficiency)
         price = material_prices.get(material.type_id)
-        build = build_unit_cost(material.type_id, recipe_map, material_prices, refine_map)
-        refine = refine_map.get(material.type_id)
-        line = MaterialLine(material.type_id, quantity, price, build, refine)
-        lines.append(line)
+        lines.append(MaterialLine(material.type_id, quantity, price))
         if price is None:
             missing.append(material.type_id)
         else:
             material_cost += quantity * price
-        best = line.best_line_cost
-        if best is None:
-            craft_missing.append(material.type_id)
-        else:
-            craft_cost += best
     materials = tuple(lines)
 
     if product_price is None:
@@ -276,8 +148,6 @@ def analyze_build(
             missing_material_prices=tuple(missing),
             product_priced=False,
             materials=materials,
-            craft_cost=craft_cost,
-            craft_missing_prices=tuple(craft_missing),
         )
     product_value = recipe.product_quantity * runs * product_price
     net_product_value = product_value * (1 - sales_tax - broker_fee)
@@ -288,6 +158,365 @@ def analyze_build(
         net_product_value=net_product_value,
         missing_material_prices=tuple(missing),
         materials=materials,
-        craft_cost=craft_cost,
-        craft_missing_prices=tuple(craft_missing),
     )
+
+
+# --- self-source recipe tree (cost-free) -------------------------------------
+# How to make an item yourself: each material is either built (its own sub-recipe), mined
+# (refined from ore), or bought. No ISK — the self-source cost is time/travel/risk, not a
+# price — just *what* to gather, *where*, and how much volume. `flatten_plan` rolls the tree
+# up into a mining + building + buying to-do list.
+
+
+@dataclass(frozen=True)
+class OreSource:
+    """One ore a mineral can be refined from: the ore, how many units to mine per unit of
+    the mineral (after the character's reprocessing yield), its rough location band
+    (highsec/lowsec/nullsec/abyssal/moon), and the per-unit volume (m³, for hauling)."""
+
+    ore_type_id: int
+    ore_units_per_unit: float
+    location: str
+    unit_volume: float
+
+    def ore_units_for(self, mineral_quantity: int) -> int:
+        """Whole units of ore to mine for ``mineral_quantity`` units of the mineral."""
+        return math.ceil(mineral_quantity * self.ore_units_per_unit)
+
+
+# Cap on how deep the self-build recursion follows a chain of sub-components — a safety
+# bound, not a real-tree limit.
+_MAX_BUILD_DEPTH = 5
+
+
+@dataclass(frozen=True)
+class SourceNode:
+    """One node of a self-source recipe tree. ``source`` is how this type is obtained:
+    ``build`` (children are its sub-materials, ``runs`` blueprint runs), ``mine`` (a mineral
+    refined from ore — the ore itself comes from the byproduct-aware mining plan, not the
+    tree), ``buy`` (a leaf), or ``?``. ``quantity`` is the units of this type supplied."""
+
+    type_id: int
+    quantity: int
+    source: str
+    runs: int = 0
+    children: tuple[SourceNode, ...] = ()
+
+
+def build_source_tree(
+    recipe: Recipe,
+    *,
+    material_efficiency: int,
+    refinable: frozenset[int],
+    recipes: Mapping[int, Recipe],
+    runs: int = 1,
+) -> SourceNode:
+    """The self-source build tree for ``runs`` runs of ``recipe`` — the top build node and
+    every input classified build / mine / buy (``refinable`` is the set of minerals an ore
+    refines into). Pure; cycle-guarded and depth-capped, applying the top blueprint's ME while
+    sub-builds assume ME 0 (a conservative estimate). The ore *behind* each mined mineral is
+    decided holistically by ``plan_ore_mining``, not here, so byproducts can be credited."""
+    return _build_node(
+        recipe.product_type_id,
+        recipe.product_quantity * runs,
+        recipe,
+        material_efficiency,
+        refinable,
+        recipes,
+        _MAX_BUILD_DEPTH,
+        frozenset(),
+    )
+
+
+def _build_node(
+    type_id: int,
+    quantity: int,
+    recipe: Recipe,
+    material_efficiency: int,
+    refinable: frozenset[int],
+    recipes: Mapping[int, Recipe],
+    depth: int,
+    stack: frozenset[int],
+) -> SourceNode:
+    """A ``build`` node making ``quantity`` units of ``type_id`` and its material children."""
+    runs_needed = max(1, math.ceil(quantity / recipe.product_quantity))
+    inner = stack | {type_id}
+    children = tuple(
+        _material_node(
+            material.type_id,
+            adjusted_material_quantity(material.quantity, runs_needed, material_efficiency),
+            refinable,
+            recipes,
+            depth - 1,
+            inner,
+        )
+        for material in recipe.materials
+    )
+    return SourceNode(type_id, quantity, "build", runs=runs_needed, children=children)
+
+
+def _material_node(
+    type_id: int,
+    quantity: int,
+    refinable: frozenset[int],
+    recipes: Mapping[int, Recipe],
+    depth: int,
+    stack: frozenset[int],
+) -> SourceNode:
+    """One material: built if it has an (owned, in-scope) sub-recipe, else mined if an ore
+    refines into it, else bought."""
+    recipe = recipes.get(type_id)
+    if recipe is not None and depth > 0 and type_id not in stack and recipe.product_quantity > 0:
+        return _build_node(type_id, quantity, recipe, 0, refinable, recipes, depth, stack)
+    if type_id in refinable:
+        return SourceNode(type_id, quantity, "mine")
+    return SourceNode(type_id, quantity, "buy")
+
+
+@dataclass(frozen=True)
+class BuildRun:
+    """A sub-build to run to self-source the product: which product, and how many runs."""
+
+    product_type_id: int
+    runs: int
+
+
+@dataclass(frozen=True)
+class BuyLine:
+    """A material that must be bought (nothing mines or builds it): the type and quantity."""
+
+    type_id: int
+    quantity: int
+
+
+@dataclass(frozen=True)
+class RecipeNeeds:
+    """What a self-source build needs at the raw level: total units of each mineral to
+    refine, sub-builds to run, and materials to buy."""
+
+    minerals: dict[int, int]
+    build: tuple[BuildRun, ...]
+    buy: tuple[BuyLine, ...]
+
+
+def collect_needs(tree: SourceNode) -> RecipeNeeds:
+    """Walk a build tree into raw requirements: mineral units to refine, sub-blueprint runs,
+    and buy quantities. The ore to mine for the minerals is decided later (byproduct-aware)."""
+    minerals: dict[int, int] = {}
+    builds: list[BuildRun] = []
+    buys: dict[int, int] = {}
+
+    def walk(node: SourceNode) -> None:
+        if node.source == "build":
+            builds.append(BuildRun(node.type_id, node.runs))
+            for child in node.children:
+                walk(child)
+        elif node.source == "mine":
+            minerals[node.type_id] = minerals.get(node.type_id, 0) + node.quantity
+        elif node.source == "buy":
+            buys[node.type_id] = buys.get(node.type_id, 0) + node.quantity
+
+    walk(tree)
+    return RecipeNeeds(
+        minerals,
+        tuple(builds),
+        tuple(BuyLine(type_id, qty) for type_id, qty in sorted(buys.items())),
+    )
+
+
+@dataclass(frozen=True)
+class MineableOre:
+    """The ore to mine for a mineral: which ore, where, its m³ per unit, and how much of each
+    mineral one unit yields after the character's reprocessing (its full composition — the
+    source of the byproducts)."""
+
+    ore_type_id: int
+    location: str
+    unit_volume: float
+    yields: Mapping[int, float]  # mineral id -> units per ore unit, after reprocessing
+
+
+@dataclass(frozen=True)
+class MineLine:
+    """One ore to mine: the ore, total units, total volume (m³), and rough location."""
+
+    ore_type_id: int
+    quantity: int
+    volume: float
+    location: str
+
+
+def plan_ore_mining(
+    needs: Mapping[int, int],
+    chosen: Mapping[int, MineableOre],
+    rarity_order: tuple[int, ...],
+) -> tuple[MineLine, ...]:
+    """The ore-mining plan that satisfies every mineral need, crediting byproducts. Pure.
+
+    Minerals are handled in ``rarity_order`` (least-commonly-refined first): mining the ore for
+    a rare mineral also yields the common minerals, so those are credited *before* we decide to
+    mine for them — you top up the common minerals only for whatever the byproducts didn't
+    already cover. ``chosen`` maps a mineral to the ore to mine for it."""
+    remaining: dict[int, float] = {mineral: float(units) for mineral, units in needs.items()}
+    mined: dict[int, int] = {}
+    ore: dict[int, MineableOre] = {}
+    for mineral in rarity_order:
+        if remaining.get(mineral, 0) <= 0:
+            continue
+        source = chosen.get(mineral)
+        per_ore = source.yields.get(mineral, 0.0) if source is not None else 0.0
+        if source is None or per_ore <= 0:
+            continue
+        units = math.ceil(remaining[mineral] / per_ore)
+        mined[source.ore_type_id] = mined.get(source.ore_type_id, 0) + units
+        ore[source.ore_type_id] = source
+        for yielded, per in source.yields.items():
+            if yielded in remaining and per > 0:
+                remaining[yielded] -= units * per
+    lines = [
+        MineLine(ore_id, units, units * ore[ore_id].unit_volume, ore[ore_id].location)
+        for ore_id, units in mined.items()
+    ]
+    return tuple(sorted(lines, key=lambda line: (line.location, line.ore_type_id)))
+
+
+@dataclass(frozen=True)
+class RequiredMaterial:
+    """One direct material of a blueprint (the recipe line): the type, ME-adjusted quantity,
+    its Jita buy price and volume, and how it's self-sourced — ``refine`` (mine ore), ``build``
+    (a sub-blueprint you own), ``buildable`` (manufacturable, but you'd need to acquire its
+    blueprint) or ``buy`` (nothing makes it)."""
+
+    type_id: int
+    quantity: int
+    buy_unit_price: float | None
+    unit_volume: float
+    source: str
+
+    @property
+    def buy_cost(self) -> float | None:
+        return self.quantity * self.buy_unit_price if self.buy_unit_price is not None else None
+
+    @property
+    def volume(self) -> float:
+        return self.quantity * self.unit_volume
+
+
+@dataclass(frozen=True)
+class BuildInput:
+    """One material a build step consumes: the type, total quantity, and total volume (m³)."""
+
+    type_id: int
+    quantity: int
+    volume: float
+
+
+@dataclass(frozen=True)
+class BuildStep:
+    """A sub-component to build to self-source the product, aggregated across the whole tree:
+    the product, total units and blueprint runs, and its material inputs (each with volume) so
+    the recipe shows *how* to build it — one material per line, not a wall."""
+
+    product_type_id: int
+    quantity: int
+    runs: int
+    inputs: tuple[BuildInput, ...]
+
+
+@dataclass(frozen=True)
+class BuyItem:
+    """A material the tool doesn't self-source: type, quantity, Jita price, volume. ``method``
+    hints how it could be made if you don't buy it — ``buy`` (nothing makes it), ``reaction`` (a
+    reaction output) or ``pi`` (planetary industry) — those chains just aren't modelled yet."""
+
+    type_id: int
+    quantity: int
+    buy_unit_price: float | None
+    unit_volume: float
+    method: str = "buy"
+
+    @property
+    def buy_cost(self) -> float | None:
+        return self.quantity * self.buy_unit_price if self.buy_unit_price is not None else None
+
+
+@dataclass(frozen=True)
+class RequiredSkill:
+    """A manufacturing skill needed to build the item (or one of its components): the skill,
+    the highest level any of those blueprints requires, the character's current level, and the
+    time to train up to it (``None`` if already met or the rate is unknown)."""
+
+    type_id: int
+    level: int
+    current_level: int
+    train_seconds: float | None
+
+    @property
+    def met(self) -> bool:
+        return self.current_level >= self.level
+
+
+@dataclass(frozen=True)
+class BlueprintNeeded:
+    """A blueprint the character would have to acquire to self-build a component: the blueprint
+    type, the component it manufactures, and an estimate of the **copy-job cost** to make the BPC
+    yourself (EIV x copying cost index x runs) — a proxy for the BPC's contract price, since BPCs
+    aren't on the market. ``copy_cost`` is None when the inputs couldn't be priced."""
+
+    blueprint_type_id: int
+    product_type_id: int
+    copy_cost: float | None
+
+
+@dataclass(frozen=True)
+class SelfSourcePlan:
+    """Everything the crafting popup shows for one build: the recipe's direct materials (with
+    buy price + volume + how each is self-sourced), the skills the blueprint requires, and — to
+    self-source them — the ore to mine (byproduct-aware), the sub-components to build, the
+    blueprints you'd need to acquire, and the items to buy."""
+
+    materials: tuple[RequiredMaterial, ...]
+    mine: tuple[MineLine, ...]
+    build: tuple[BuildStep, ...]
+    buy: tuple[BuyItem, ...]
+    required_skills: tuple[RequiredSkill, ...] = ()
+    blueprints: tuple[BlueprintNeeded, ...] = ()
+
+    @property
+    def missing_skills(self) -> tuple[RequiredSkill, ...]:
+        """The required skills the character doesn't yet meet."""
+        return tuple(skill for skill in self.required_skills if not skill.met)
+
+    @property
+    def total_training_seconds(self) -> float:
+        """Total time to train every not-yet-met skill (skills train one at a time)."""
+        return sum(skill.train_seconds or 0.0 for skill in self.missing_skills)
+
+    @property
+    def total_buy_cost_items(self) -> float | None:
+        """Cost to buy every buy-list item at Jita. None if none is priced."""
+        priced = [item.buy_cost for item in self.buy if item.buy_cost is not None]
+        return sum(priced) if priced else None
+
+    @property
+    def total_blueprint_cost(self) -> float | None:
+        """Estimated total copy-job cost for every needed blueprint. None if none is priced."""
+        priced = [bp.copy_cost for bp in self.blueprints if bp.copy_cost is not None]
+        return sum(priced) if priced else None
+
+    @property
+    def total_buy_cost(self) -> float | None:
+        """Cost to buy every direct material at Jita — None if any isn't priced."""
+        if any(material.buy_cost is None for material in self.materials):
+            return None
+        return sum(material.buy_cost or 0.0 for material in self.materials)
+
+    @property
+    def total_material_volume(self) -> float:
+        """Total m³ of the finished materials (packaged) — for hauling the bought version."""
+        return sum(material.volume for material in self.materials)
+
+    @property
+    def total_mine_volume(self) -> float:
+        """Total m³ of ore to haul if self-sourced."""
+        return sum(line.volume for line in self.mine)

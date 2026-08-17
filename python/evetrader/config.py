@@ -81,17 +81,42 @@ class InvestmentParams(BaseModel):
 class RefiningParams(BaseModel):
     """Reprocessing model for the craft-cost self-source comparison.
 
-    Like ``FeeRates``, ``efficiency`` is a user-owned input, not a code constant: the
-    effective yield is the station's base rate times reprocessing skills, implants, and
-    structure/rig bonuses, so it varies per character and location. A wrong value skews
-    every refine-vs-buy call. Roughly 0.5 at a raw NPC station with no skills, up to
-    ~0.9 with maxed skills in a good structure; the default is a middling trained value
-    and should be CONFIRMED against the live game.
+    ``base_rate`` is the station/structure's *base* reprocessing yield — the part the
+    character's reprocessing skills multiply on top of (``market/refining.py`` applies the
+    skill bonuses per ore from live skill levels). Like ``FeeRates`` it's a user-owned
+    input, not a code constant: ~0.50 at a raw NPC station, higher in an upgraded
+    structure (rig/implant bonuses this tool can't detect fold in here too). It should be
+    CONFIRMED against the live game. (Before skill-based refining this field was the *total*
+    effective yield, ~0.70; it is now just the base, so with skills untrained refine costs
+    read higher until the skills are entered.)
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    efficiency: float = Field(default=0.70, gt=0.0, le=1.0)
+    base_rate: float = Field(default=0.50, gt=0.0, le=1.0)
+
+
+class TrainingParams(BaseModel):
+    """Policy for the Crafting tab's quick-train tips — which skill level-ups to surface as
+    cheap wins for lowering a build's self-source cost."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Only suggest a skill level that trains within this many hours (the "trained quickly"
+    # cutoff); tips are ranked by ISK saved on the craft.
+    quick_horizon_hours: float = Field(default=3.0, gt=0.0)
+
+
+class IndustryParams(BaseModel):
+    """Industry-job cost inputs. Like ``FeeRates`` these are user-owned, game/location-dependent
+    values to confirm against the live game, not code constants."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # System *copying* cost index — used to estimate a component BPC's copy-job cost
+    # (EIV x index x runs). Varies per system (a few percent); the default is a typical highsec
+    # value and should be CONFIRMED against `GET /industry/systems/` for your home system.
+    copy_cost_index: float = Field(default=0.02, ge=0.0)
 
 
 class RiskPreferences(BaseModel):
@@ -151,6 +176,8 @@ class Config(BaseModel):
     fees: FeeRates = Field(default_factory=FeeRates)
     investment: InvestmentParams = Field(default_factory=InvestmentParams)
     refining: RefiningParams = Field(default_factory=RefiningParams)
+    training: TrainingParams = Field(default_factory=TrainingParams)
+    industry: IndustryParams = Field(default_factory=IndustryParams)
 
     def home_for(self, character_name: str) -> HomeMarket:
         return self.homes.get(character_name, self.default_home)

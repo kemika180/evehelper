@@ -12,10 +12,12 @@ is testable without ESI.
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import ClassVar, TypeVar
 
 from rich.style import Style
@@ -54,7 +56,7 @@ from evetrader.esi.models import (
 )
 from evetrader.market.investment import TrackedStatus
 from evetrader.market.listings import ListingStatus
-from evetrader.market.production import BuildAnalysis, MaterialLine
+from evetrader.market.production import BuildAnalysis
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
@@ -100,6 +102,134 @@ def _isk(value: float) -> str:
     if magnitude >= 1e3:
         return f"{value / 1e3:.1f}k"
     return f"{value:.0f}"
+
+
+def _duration(seconds: float) -> str:
+    """Compact training time: 7800 -> "2h10m", 2700 -> "45m", 2360760 -> "27d7h"."""
+    total = int(seconds)
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{days}d{hours}h" if hours else f"{days}d"
+    if hours and minutes:
+        return f"{hours}h{minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def _volume(cubic_metres: float) -> str:
+    """Compact m³: 310 -> "310 m³", 12500 -> "12.5k m³"."""
+    if cubic_metres >= 1e6:
+        return f"{cubic_metres / 1e6:.1f}M m³"
+    if cubic_metres >= 1e3:
+        return f"{cubic_metres / 1e3:.1f}k m³"
+    return f"{cubic_metres:.0f} m³"
+
+
+def _slug(title: str) -> str:
+    """A filesystem-safe slug from a product name (e.g. "Rifter" -> "rifter")."""
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+
+def _truncate(name: str, width: int) -> str:
+    """Name clipped to ``width`` cells with an ellipsis when it doesn't fit."""
+    return name if len(name) <= width else name[: width - 1] + "…"
+
+
+def recipe_markdown(build: BuildOpportunity, names: dict[int, str]) -> str:
+    """The crafting recipe as a Markdown document: materials (with buy price + volume), how to
+    self-source them (mine / build), what to buy, and quick-train skills. Pure."""
+
+    def name(type_id: int) -> str:
+        return names.get(type_id, str(type_id))
+
+    product = name(build.product_type_id)
+    out: list[str] = [f"# {product} — crafting recipe", ""]
+    out.append(f"Blueprint ME {build.material_efficiency}, per run.")
+    plan = build.plan
+    if plan is None:
+        return "\n".join(out) + "\n"
+
+    _tag = {"refine": "mine", "build": "build", "buildable": "build\\*", "buy": "buy"}
+    if plan.materials:
+        out += ["", "## Materials required", ""]
+        out += ["| Qty | Material | Buy @ Jita | Volume | Self-source |"]
+        out += ["|---:|---|---:|---:|---|"]
+        for material in plan.materials:
+            buy = _isk(material.buy_cost) if material.buy_cost is not None else "—"
+            tag = _tag.get(material.source, material.source)
+            out.append(
+                f"| {material.quantity:,} | {name(material.type_id)} | {buy} |"
+                f" {_volume(material.volume)} | {tag} |"
+            )
+        total = plan.total_buy_cost
+        buy_all = _isk(total) if total is not None else "—"
+        out += ["", f"**Buy all:** {buy_all} · {_volume(plan.total_material_volume)}"]
+        if any(m.source == "buildable" for m in plan.materials):
+            out += ["", "\\* buildable — you'd need its blueprint (see below)."]
+
+    if plan.missing_skills:
+        out += ["", "## Skills to build this (not yet trained)", ""]
+        for skill in plan.missing_skills:
+            when = f", train ~{_duration(skill.train_seconds)}" if skill.train_seconds else ""
+            out.append(f"- {name(skill.type_id)} {skill.level} (have {skill.current_level}{when})")
+        out += ["", f"**Total training:** ~{_duration(plan.total_training_seconds)}"]
+
+    if plan.blueprints:
+        out += ["", "## Blueprints needed (BPCs — est. copy-job cost)", ""]
+        for bp in plan.blueprints:
+            cost = f" — ~{_isk(bp.copy_cost)}" if bp.copy_cost is not None else ""
+            out.append(f"- {name(bp.blueprint_type_id)}{cost}")
+        bp_total = plan.total_blueprint_cost
+        if bp_total is not None:
+            out += ["", f"**Total blueprints (copy):** ~{_isk(bp_total)}"]
+
+    if plan.mine:
+        out += ["", "## To self-source — mine & refine", ""]
+        out += ["| Ore | Units | Volume (m³) | Location |", "|---|---:|---:|---|"]
+        for line in plan.mine:
+            ore = name(line.ore_type_id)
+            out.append(f"| {ore} | {line.quantity:,} | {line.volume:,.0f} | {line.location} |")
+        out += ["", f"**Total to haul:** {_volume(plan.total_mine_volume)}"]
+
+    if plan.build:
+        out += ["", "## To self-source — build (dependencies first)", ""]
+        for step in plan.build:
+            product = name(step.product_type_id)
+            out += ["", f"### {step.quantity:,} x {product} ({step.runs} run(s))", ""]
+            out += ["| Material | Qty | Volume (m³) |", "|---|---:|---:|"]
+            for inp in step.inputs:
+                out.append(f"| {name(inp.type_id)} | {inp.quantity:,} | {inp.volume:,.0f} |")
+
+    if plan.buy:
+        out += ["", "## Buy or produce (reactions / PI not modelled yet)", ""]
+        out += ["| Qty | Item | Buy @ Jita | Make via |", "|---:|---|---:|---|"]
+        _method = {"buy": "—", "reaction": "reaction", "pi": "PI"}
+        for item in plan.buy:
+            cost = _isk(item.buy_cost) if item.buy_cost is not None else "—"
+            out.append(
+                f"| {item.quantity:,} | {name(item.type_id)} | {cost} |"
+                f" {_method.get(item.method, item.method)} |"
+            )
+        buy_total = plan.total_buy_cost_items
+        if buy_total is not None:
+            out += ["", f"**Total to buy:** {_isk(buy_total)}"]
+
+    if build.training_tips:
+        out += ["", "## Recommended skills", ""]
+        for tip in build.training_tips:
+            if tip.unlocks_type_id is not None:
+                benefit = f"unlocks building {name(tip.unlocks_type_id)}"
+            else:
+                benefit = f"~{tip.ore_reduction:.0%} less ore to mine"
+            out.append(
+                f"- {name(tip.skill_id)} L{tip.current_level}→{tip.target_level}"
+                f" (~{_duration(tip.train_seconds)}): {benefit}"
+            )
+    out.append("")
+    return "\n".join(out)
 
 
 def _current_training(
@@ -819,19 +949,20 @@ class IndustryJobScreen(ModalScreen[None]):
 
 
 class MaterialsScreen(ModalScreen[None]):
-    """The bill of materials for one build: each input, its ME-adjusted quantity (per
-    run), and the cost to buy it vs self-build it, with the cheaper source marked."""
+    """The crafting recipe for one build: the materials it needs (with Jita buy price and
+    volume), how to self-source each (mine the byproduct-aware ore plan, or build the
+    sub-components), what must be bought, and quick skills to train. Exportable to Markdown."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         ("escape", "dismiss", "Close"),
-        ("enter", "dismiss", "Close"),
         ("q", "dismiss", "Close"),
+        ("e", "export", "Export .md"),
     ]
 
     DEFAULT_CSS = """
     MaterialsScreen { align: center middle; }
     MaterialsScreen #matbox {
-        width: 82;
+        width: 90;
         height: auto;
         max-height: 90%;
         overflow-y: auto;
@@ -851,49 +982,166 @@ class MaterialsScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="matbox"):
             yield Static(self._body(), id="matbody")
-            yield Static("click or esc to close", id="mathint")
+            yield Static("e export .md · esc to close", id="mathint")
 
-    def on_click(self) -> None:
-        self.dismiss()
+    def _tname(self, type_id: int) -> str:
+        return self._names.get(type_id, str(type_id))
 
     def _body(self) -> Text:
-        analysis = self._build.analysis
         text = Text()
         text.append(f"{self._title}\n", style="bold")
         text.append(f"ME {self._build.material_efficiency}  ·  per run\n", style="dim")
-        text.append(f"buy materials  {_isk(analysis.material_cost)}\n", style="dim")
-        text.append(f"self-source    {_isk(analysis.craft_cost)}\n", style="cyan")
-        if not analysis.missing_material_prices and analysis.craft_priced and analysis.savings > 0:
-            fraction = analysis.savings_fraction
-            pct = f" ({fraction:.0%})" if fraction is not None else ""
-            text.append(f"you save       {_isk(analysis.savings)}{pct}\n", style="green")
-        if analysis.craft_missing_prices:
-            missing = len(analysis.craft_missing_prices)
-            text.append(f"{missing} material(s) have no price at Jita\n", style="yellow")
-        text.append("\n")
-        header = f"{'Qty':>8}  {'Material':<24} {'Buy':>9} {'Build':>9} {'Refine':>9}  Src"
-        text.append(f"{header}\n", style="bold dim")
-        for line in analysis.materials:
-            self._append_material(text, line)
+        self._append_materials(text)
+        self._append_required_skills(text)
+        self._append_self_source(text)
+        self._append_blueprints(text)
+        self._append_buy(text)
+        self._append_tips(text)
         return text
 
-    def _append_material(self, text: Text, line: MaterialLine) -> None:
-        """One bill line: quantity, name, the buy/build/refine line-costs, cheapest source."""
-        name = self._names.get(line.type_id, str(line.type_id))
-        if len(name) > 24:
-            name = name[:23] + "…"
-        buy = _isk(line.line_cost) if line.line_cost is not None else "—"
-        build = self._line(line.build_unit_cost, line.quantity)
-        refine = self._line(line.refine_unit_cost, line.quantity)
-        marker = {"buy": "buy", "build": "▶ build", "refine": "▶ refine", "?": "?"}[line.source]
-        style = {"buy": "", "build": "green", "refine": "cyan", "?": "dim"}[line.source]
-        row = f"{line.quantity:>8,}  {name:<24} {buy:>9} {build:>9} {refine:>9}  {marker}"
-        text.append(f"{row}\n", style=style)
+    _SOURCE_TAG: ClassVar[dict[str, str]] = {
+        "refine": "mine",
+        "build": "build",
+        "buildable": "build*",
+        "buy": "buy",
+    }
 
-    @staticmethod
-    def _line(unit_cost: float | None, quantity: int) -> str:
-        """A per-line ISK cost from a unit cost, or an em dash when that source is n/a."""
-        return _isk(unit_cost * quantity) if unit_cost is not None else "—"
+    def _append_materials(self, text: Text) -> None:
+        plan = self._build.plan
+        if plan is None or not plan.materials:
+            return
+        text.append("\nmaterials required\n", style="bold")
+        text.append(
+            f"  {'Qty':>10}  {'Material':<24} {'Buy @ Jita':>11} {'Volume':>10}  Get\n",
+            style="dim",
+        )
+        for material in plan.materials:
+            name = _truncate(self._tname(material.type_id), 24)
+            buy = _isk(material.buy_cost) if material.buy_cost is not None else "—"
+            tag = self._SOURCE_TAG.get(material.source, material.source)
+            text.append(
+                f"  {material.quantity:>10,}  {name:<24} {buy:>11} {_volume(material.volume):>10}"
+                f"  {tag}\n"
+            )
+        total = plan.total_buy_cost
+        buy_all = _isk(total) if total is not None else "—"
+        text.append(
+            f"  buy all: {buy_all}  ·  {_volume(plan.total_material_volume)}\n", style="dim"
+        )
+        if any(m.source == "buildable" for m in plan.materials):
+            text.append("  * buildable — you'd need its blueprint (see below)\n", style="dim")
+
+    def _append_required_skills(self, text: Text) -> None:
+        plan = self._build.plan
+        if plan is None or not plan.missing_skills:
+            return
+        text.append("\nskills to build this (not yet trained)\n", style="bold")
+        for skill in plan.missing_skills:
+            name = self._tname(skill.type_id)
+            when = f"  train ~{_duration(skill.train_seconds)}" if skill.train_seconds else ""
+            text.append(
+                f"  {name} {skill.level}  (have {skill.current_level}){when}\n", style="red"
+            )
+        text.append(
+            f"  total training: ~{_duration(plan.total_training_seconds)}\n", style="dim red"
+        )
+
+    def _append_blueprints(self, text: Text) -> None:
+        plan = self._build.plan
+        if plan is None or not plan.blueprints:
+            return
+        text.append("\nblueprints needed (BPCs — est. copy-job cost)\n", style="bold")
+        for bp in plan.blueprints:
+            cost = f"   ~{_isk(bp.copy_cost)}" if bp.copy_cost is not None else "   —"
+            text.append(f"    {self._tname(bp.blueprint_type_id)}{cost}\n")
+        total = plan.total_blueprint_cost
+        if total is not None:
+            text.append(f"  total blueprints (copy): ~{_isk(total)}\n", style="dim")
+
+    def _append_self_source(self, text: Text) -> None:
+        plan = self._build.plan
+        if plan is None or not (plan.mine or plan.build):
+            return
+        text.append("\nto self-source\n", style="bold")
+        if plan.mine:
+            haul = _volume(plan.total_mine_volume)
+            text.append(f"  mine & refine  ({haul} to haul)\n", style="cyan")
+            for line in plan.mine:
+                ore = _truncate(self._tname(line.ore_type_id), 24)
+                vol = _volume(line.volume)
+                text.append(
+                    f"    ~{line.quantity:>10,}  {ore:<24} {line.location:<8} {vol:>10}\n",
+                    style="cyan",
+                )
+        if plan.build:
+            text.append("  build (dependencies first)\n", style="green")
+            for step in plan.build:
+                name = self._tname(step.product_type_id)
+                text.append(
+                    f"    {step.quantity:,} x {name}  ({step.runs} run(s))\n", style="green"
+                )
+                for inp in step.inputs:
+                    imat = _truncate(self._tname(inp.type_id), 24)
+                    text.append(
+                        f"        {inp.quantity:>10,}  {imat:<24} {_volume(inp.volume):>10}\n",
+                        style="dim green",
+                    )
+        ores = len(plan.mine)
+        acquire = f"  to acquire: {ores} ore type(s), {_volume(plan.total_mine_volume)}"
+        if plan.build:
+            acquire += f" · {len(plan.build)} sub-build(s)"
+        if plan.buy:
+            acquire += f" · {len(plan.buy)} to buy"
+        text.append(f"{acquire}\n", style="dim")
+
+    _BUY_METHOD: ClassVar[dict[str, str]] = {
+        "buy": "buy",
+        "reaction": "buy or react",
+        "pi": "buy or PI",
+    }
+
+    def _append_buy(self, text: Text) -> None:
+        plan = self._build.plan
+        if plan is None or not plan.buy:
+            return
+        text.append("\nbuy or produce (reactions / PI not modelled yet)\n", style="bold")
+        for item in plan.buy:
+            name = _truncate(self._tname(item.type_id), 28)
+            cost = _isk(item.buy_cost) if item.buy_cost is not None else "—"
+            tag = self._BUY_METHOD.get(item.method, item.method)
+            text.append(f"    {item.quantity:>8,}  {name:<28} {cost:>9}  {tag}\n")
+        total = plan.total_buy_cost_items
+        if total is not None:
+            text.append(f"  total to buy: {_isk(total)}\n", style="dim")
+
+    def _append_tips(self, text: Text) -> None:
+        """Quick skills that ease self-sourcing — less ore to mine, or a new build unlocked."""
+        tips = self._build.training_tips
+        if not tips:
+            return
+        text.append("\ntrain to help\n", style="bold magenta")
+        for tip in tips[:3]:
+            name = self._tname(tip.skill_id)
+            if tip.unlocks_type_id is not None:
+                benefit = f"unlocks building {self._tname(tip.unlocks_type_id)}"
+            else:
+                benefit = f"~{tip.ore_reduction:.0%} less ore to mine"
+            text.append(
+                f"  {name} L{tip.current_level}→{tip.target_level}"
+                f"  (~{_duration(tip.train_seconds)})  {benefit}\n",
+                style="magenta",
+            )
+
+    def action_export(self) -> None:
+        """Write the recipe detail to a Markdown file in the working directory."""
+        slug = _slug(self._title) or "recipe"
+        path = Path.cwd() / f"{slug}-recipe.md"
+        try:
+            path.write_text(recipe_markdown(self._build, self._names), encoding="utf-8")
+        except OSError as error:
+            self.query_one("#mathint", Static).update(f"export failed: {error}")
+            return
+        self.query_one("#mathint", Static).update(f"saved to {path}")
 
 
 class SdeUpdateScreen(ModalScreen[None]):
@@ -1082,8 +1330,11 @@ class TradingScreen(Screen[None]):
         self._listings_key: object | None = None
         self._builds_key: object | None = None
         self._asset_query: str = ""
+        # Last ISK values drawn per place. Phase 1 of a refresh re-renders assets before
+        # the market scan supplies fresh values; reusing these keeps its signature equal to
+        # phase 2's, so an unchanged refresh doesn't rebuild the tree (and reset expansions).
+        self._location_values: dict[int, float] = {}
         self._mfg_query: str = ""
-        self._mfg_sort: tuple[int, bool] = (4, True)  # Crafting: self-source savings, descending
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1247,9 +1498,7 @@ class TradingScreen(Screen[None]):
         self.query_one("#industry", DataTable).add_columns(
             "Activity", "Item", "Runs", "Time left", "Where"
         )
-        self.query_one("#manufacturing", DataTable).add_columns(
-            "Product", "ME", "Buy mats", "Self-source", "Savings"
-        )
+        self.query_one("#manufacturing", DataTable).add_columns("Product", "ME")
         self.run_worker(self._refresh(), exclusive=True)
         self.set_interval(self._interval, self._refresh)
 
@@ -1305,7 +1554,7 @@ class TradingScreen(Screen[None]):
         self._render_industry(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
-        status.update("Scanning for value…")
+        status.update("Updating ESI data…")
         try:
             report = await self._feed.opportunities(character_report)
         except Exception as error:
@@ -1401,10 +1650,9 @@ class TradingScreen(Screen[None]):
             )
 
     def _sorted_builds(self, report: OpportunityReport) -> list[tuple[BuildOpportunity, int]]:
-        """Owned builds as (build, copies-owned), filtered by the product search and
-        ordered by the active column sort (default: margin, descending). Copies of a
-        blueprint at the same research level are identical, so they collapse to one row
-        carrying the count."""
+        """Owned builds as (build, copies-owned), filtered by the product search and sorted
+        alphabetically by product. Copies of a blueprint at the same research level are
+        identical, so they collapse to one row carrying the count."""
         query = self._mfg_query.strip().lower()
 
         def product(build: BuildOpportunity) -> str:
@@ -1424,79 +1672,40 @@ class TradingScreen(Screen[None]):
             seen.add(row_id)
             rows.append((build, counts[row_id]))
 
-        column, reverse = self._mfg_sort
-        if column == 0:
-            rows.sort(key=lambda row: product(row[0]).lower(), reverse=reverse)
-        elif column == 1:
-            rows.sort(key=lambda row: row[0].material_efficiency, reverse=reverse)
-        elif column == 2:
-            rows.sort(key=lambda row: row[0].analysis.material_cost, reverse=reverse)
-        elif column == 3:
-            rows.sort(key=lambda row: row[0].analysis.craft_cost, reverse=reverse)
-        else:
-            rows.sort(key=lambda row: row[0].analysis.savings, reverse=reverse)
+        rows.sort(key=lambda row: (product(row[0]).lower(), row[0].material_efficiency))
         return rows
 
     def _render_builds(self, report: OpportunityReport) -> None:
-        """Owned blueprints, filtered/sorted, showing the per-run cost to craft: buying
-        every material vs self-sourcing each at its cheapest (build a sub-component where
-        that's cheaper than buying it), and the resulting savings. Rows that save by
-        self-sourcing are bold; partial rows (a material with no Jita price) are flagged.
-        When there's nothing to show, the hint line says why so the tab is never blank."""
+        """Owned blueprints, filtered and alphabetical — just the product and its ME. The
+        self-source detail (what to mine/build/buy, and where) is in the row's popup, so the
+        list stays scannable and carries no (misleading) mining ISK. The hint says why the
+        tab is empty when it is, so it's never blank."""
         # The hint has no cursor, so refresh it every call.
         self.query_one("#manufacturing-hint", Static).update(self._manufacturing_hint(report))
 
         rows = self._sorted_builds(report)
-        key = (tuple(rows), self._mfg_query, self._mfg_sort)
+        key = (tuple(rows), self._mfg_query)
         if key == self._builds_key:
             return
         self._builds_key = key
         table = self.query_one("#manufacturing", DataTable)
         table.clear()
         for build, copies in rows:
-            analysis = build.analysis
             name = report.names.get(build.product_type_id, str(build.product_type_id))
-            buy_partial = bool(analysis.missing_material_prices)
-            craft_partial = not analysis.craft_priced
-
-            buy_cell = Text(
-                _isk(analysis.material_cost),
-                justify="right",
-                style="yellow" if buy_partial else "dim",
-            )
-            craft_cell = Text(
-                _isk(analysis.craft_cost), justify="right", style="yellow" if craft_partial else ""
-            )
-            worthwhile = False
-            if buy_partial or craft_partial:
-                savings_cell = Text("partial", justify="right", style="yellow")
-            elif analysis.savings > 0:
-                worthwhile = True
-                fraction = analysis.savings_fraction
-                label = _isk(analysis.savings)
-                if fraction is not None:
-                    label += f" ({fraction:.0%})"
-                savings_cell = Text(label, justify="right", style="green")
-            else:
-                savings_cell = Text("—", justify="right", style="dim")
-
-            product = Text(name, style="bold" if worthwhile else "")
+            product = Text(name)
             if copies > 1:
                 product.append(f"  ×{copies}", style="cyan")  # noqa: RUF001 (copies owned)
             table.add_row(
                 product,
                 Text(f"ME {build.material_efficiency}", justify="right", style="dim"),
-                buy_cell,
-                craft_cell,
-                savings_cell,
                 key=str(build.blueprint_item_id),
             )
 
     def _manufacturing_hint(self, report: OpportunityReport) -> Text:
         if report.builds:
             return Text(
-                f"{len(report.builds)} blueprint(s): per-run craft cost — buy all "
-                "materials vs self-source each at its cheapest."
+                f"{len(report.builds)} blueprint(s) — select one for its self-source recipe: "
+                "what to mine (and where), build, or buy."
             )
         if not report.sde_available:
             hint = Text()
@@ -1625,19 +1834,6 @@ class TradingScreen(Screen[None]):
             self._mfg_query = event.value
             self._render_builds(self._report)
 
-    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
-        """Click a Manufacturing column header to sort by it; click again to reverse."""
-        if event.data_table.id != "manufacturing":
-            return
-        column, reverse = self._mfg_sort
-        if event.column_index == column:
-            reverse = not reverse
-        else:
-            reverse = event.column_index in (1, 2, 3, 4)  # numeric columns start descending
-        self._mfg_sort = (event.column_index, reverse)
-        if self._report is not None:
-            self._render_builds(self._report)
-
     def _render_assets(
         self, report: CharacterReport, location_values: dict[int, float] | None = None
     ) -> None:
@@ -1648,7 +1844,11 @@ class TradingScreen(Screen[None]):
         Skipped when neither the assets, the query, nor a shown value changed, so a periodic
         refresh leaves the tree (and the user's expand/collapse state) alone.
         """
-        values = location_values or {}
+        # Phase 2 supplies fresh values; phase 1 (location_values is None) reuses the last
+        # ones so its render signature matches phase 2's and an unchanged tick is a no-op.
+        if location_values is not None:
+            self._location_values = location_values
+        values = self._location_values
         query = self._asset_query.strip().lower()
         # Key on the *displayed* value strings, not raw floats, so tiny price drift between
         # refreshes doesn't rebuild the tree (and reset expansions) every tick.

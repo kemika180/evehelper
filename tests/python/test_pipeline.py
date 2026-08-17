@@ -14,7 +14,14 @@ from evetrader.data.universe import NameCache
 from evetrader.esi.auth import Authenticator
 from evetrader.esi.client import EsiClient
 from evetrader.data.sde import OreYield
-from evetrader.pipeline import _expand_recipes, _refine_prices, fetch_character, fetch_opportunities
+from evetrader.pipeline import (
+    _buildable_predicate,
+    _expand_recipes,
+    _ore_yields,
+    _refine_sources,
+    fetch_character,
+    fetch_opportunities,
+)
 
 _STATION = 60003760
 _REGION = 10000002
@@ -209,6 +216,18 @@ def _handler(request: httpx.Request) -> httpx.Response:
             },
             headers=exp,
         )
+    if path.endswith("/attributes/"):
+        return httpx.Response(
+            200,
+            json={
+                "charisma": 20,
+                "intelligence": 20,
+                "memory": 20,
+                "perception": 20,
+                "willpower": 20,
+            },
+            headers=exp,
+        )
     if "/characters/" in path and path.endswith("/orders/"):
         return httpx.Response(200, json=[], headers=exp)
     if path.endswith("/standings/"):
@@ -258,11 +277,19 @@ def _make_recipe_sde(path: Path) -> None:
 
 
 def _add_reprocessing_tables(conn: sqlite3.Connection) -> None:
-    """The reprocessing/category tables a real SDE always carries (empty here — no ore
-    refines into the toy minerals, so `ore_sources` returns nothing)."""
+    """The reprocessing/category/skill tables a real SDE always carries (empty here — no ore
+    refines into the toy minerals and no manufacturing skills are required, so `ore_sources`
+    and `manufacturing_skills` return nothing)."""
     conn.execute("CREATE TABLE invTypeMaterials (typeID INT, materialTypeID INT, quantity INT)")
-    conn.execute("CREATE TABLE invTypes (typeID INT, groupID INT, portionSize INT)")
-    conn.execute("CREATE TABLE invGroups (groupID INT, categoryID INT)")
+    conn.execute(
+        "CREATE TABLE invTypes (typeID INT, groupID INT, portionSize INT, typeName TEXT, volume FLOAT)"
+    )
+    conn.execute("CREATE TABLE invGroups (groupID INT, categoryID INT, groupName TEXT)")
+    conn.execute("CREATE TABLE industryActivitySkills (typeID INT, activityID INT, skillID INT, level INT)")
+    conn.execute("CREATE TABLE dgmTypeAttributes (typeID INT, attributeID INT, valueInt INT, valueFloat REAL)")
+    conn.execute("CREATE TABLE staStations (stationID INT, solarSystemID INT, regionID INT)")
+    conn.execute("CREATE TABLE mapSolarSystems (solarSystemID INT, regionID INT, security FLOAT)")
+    conn.execute("CREATE TABLE planetSchematicsTypeMap (typeID INT, isInput INT)")
 
 
 def _make_nested_sde(path: Path) -> None:
@@ -288,18 +315,87 @@ def _make_nested_sde(path: Path) -> None:
     conn.close()
 
 
-def test_refine_prices_picks_the_cheapest_ore_and_applies_efficiency() -> None:
-    # Mineral 300 comes from two ores: a dense one (2 units/ore) and a sparse one (1).
+def test_refine_sources_orders_by_accessibility_then_density_with_volume() -> None:
+    # Mineral 300: a dense ore 900 (2 units/ore) and a sparse ore 901 (1), both highsec.
     ore_sources = {
-        300: [OreYield(ore_type_id=900, units_per_ore=2.0), OreYield(ore_type_id=901, units_per_ore=1.0)],
-        301: [OreYield(ore_type_id=902, units_per_ore=4.0)],  # ore not on the market
+        300: [
+            OreYield(ore_type_id=900, units_per_ore=2.0, name="Dense", volume=0.1),
+            OreYield(ore_type_id=901, units_per_ore=1.0, name="Sparse", volume=0.2),
+        ]
     }
-    ask = {900: 100.0, 901: 40.0, 903: 5.0}  # 902 (for mineral 301) has no ask
-    prices = _refine_prices(ore_sources, ask, efficiency=0.5)
-    # 900: 100 / (2 * 0.5) = 100 ; 901: 40 / (1 * 0.5) = 80 -> cheapest is 80.
-    assert prices[300] == 80.0
-    # 301's only ore isn't priced, so it can't be refined.
-    assert 301 not in prices
+    yields = {900: 0.5, 901: 0.5}
+    meta = {900: (0, "highsec"), 901: (0, "highsec")}
+    options = _refine_sources(ore_sources, yields, meta, target_rank=0)[300]
+    # Same location -> the denser ore (less ore to mine) leads; the other is the alternative.
+    assert options[0].ore_type_id == 900
+    assert options[0].ore_units_per_unit == 1.0  # 1 / (2 units/ore * 0.5 yield)
+    assert options[0].location == "highsec"
+    assert options[0].unit_volume == 0.1
+    assert [option.ore_type_id for option in options[1:]] == [901]
+
+
+def test_refine_sources_biases_toward_the_home_security_band() -> None:
+    ore_sources = {
+        500: [
+            OreYield(ore_type_id=600, units_per_ore=1.0, name="Spodumain", volume=16.0),
+            OreYield(ore_type_id=601, units_per_ore=1.0, name="Veldspar", volume=0.1),
+        ]
+    }
+    yields = {600: 1.0, 601: 1.0}
+    meta = {600: (3, "nullsec"), 601: (0, "highsec")}
+    highsec = _refine_sources(ore_sources, yields, meta, target_rank=0)
+    assert highsec[500][0].ore_type_id == 601  # a highsec home is steered to the common ore
+    null = _refine_sources(ore_sources, yields, meta, target_rank=3)
+    assert null[500][0].ore_type_id == 600  # a null home is steered to its local ore
+
+
+def test_refine_sources_collapses_same_family_variants_to_the_base_ore() -> None:
+    # "Brimful Zeolites" (denser) is a variant of "Zeolites" -> dropped for the base rock.
+    ore_sources = {
+        700: [
+            OreYield(ore_type_id=800, units_per_ore=1.0, name="Zeolites", volume=10.0),
+            OreYield(ore_type_id=801, units_per_ore=2.0, name="Brimful Zeolites", volume=10.0),
+        ]
+    }
+    meta = {800: (5, "moon"), 801: (5, "moon")}
+    options = _refine_sources(ore_sources, {800: 1.0, 801: 1.0}, meta, target_rank=0)[700]
+    assert [option.ore_type_id for option in options] == [800]  # base Zeolites only
+    assert options[0].location == "moon"
+
+
+def _make_skill_sde(path: Path) -> None:
+    """A tiny SDE with a manufacturing skill requirement and an ore reprocessing skill."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE industryActivitySkills (typeID INT, activityID INT, skillID INT, level INT)"
+    )
+    conn.execute(
+        "CREATE TABLE dgmTypeAttributes (typeID INT, attributeID INT, valueInt INT, valueFloat REAL)"
+    )
+    conn.execute("INSERT INTO industryActivitySkills VALUES (938, 1, 3380, 3)")  # needs Industry III
+    conn.execute("INSERT INTO dgmTypeAttributes VALUES (1230, 790, 60377, NULL)")  # ore -> skill
+    conn.commit()
+    conn.close()
+
+
+def test_buildable_predicate_gates_on_manufacturing_skills(tmp_path: Path) -> None:
+    path = tmp_path / "skill.sqlite"
+    _make_skill_sde(path)
+    sde = SdeDatabase(path)
+    assert _buildable_predicate(sde, {3380: 3})(938) is True  # meets Industry III
+    assert _buildable_predicate(sde, {3380: 2})(938) is False  # one level short
+    assert _buildable_predicate(sde, {})(999) is True  # a blueprint with no requirements
+    sde.close()
+
+
+def test_ore_yields_apply_the_characters_reprocessing_skills(tmp_path: Path) -> None:
+    path = tmp_path / "skill.sqlite"
+    _make_skill_sde(path)
+    sde = SdeDatabase(path)
+    # Ore 1230's specific skill is 60377; at L4 with Reprocessing 5 / Efficiency 5 on base 0.5.
+    yields = _ore_yields(sde, 0.5, {3385: 5, 3389: 5, 60377: 4}, {1230})
+    assert yields[1230] == 0.5 * 1.15 * 1.10 * 1.08
+    sde.close()
 
 
 def test_expand_recipes_only_follows_owned_sub_blueprints(tmp_path: Path) -> None:
