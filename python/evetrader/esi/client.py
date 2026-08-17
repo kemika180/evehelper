@@ -12,10 +12,13 @@ the two places (with ``data/``) allowed to touch the outside world.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import pickle
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 
 import httpx
 
@@ -28,6 +31,8 @@ _ERROR_LIMIT_FLOOR = 5
 # Bounded concurrency for paged fetches — fast without hammering ESI. Successful
 # requests don't count against the error-limit budget; the cap keeps bursts modest.
 _MAX_CONCURRENT_PAGES = 8
+# Bump when `_CacheEntry`'s shape changes so an old on-disk cache is discarded, not misread.
+_CACHE_VERSION = 1
 
 Params = Mapping[str, str | int]
 
@@ -64,6 +69,30 @@ class _CacheEntry:
     pages: int
 
 
+def _load_cache(path: Path) -> dict[str, _CacheEntry]:
+    """The persisted response cache from a previous session, or empty on any problem —
+    a corrupt/old/absent cache must degrade to a cold start, never crash the launch."""
+    try:
+        with path.open("rb") as handle:
+            version, entries = pickle.load(handle)
+    except (OSError, pickle.UnpicklingError, EOFError, ValueError, TypeError, AttributeError):
+        return {}
+    if version != _CACHE_VERSION or not isinstance(entries, dict):
+        return {}
+    return entries
+
+
+def _save_cache(path: Path, cache: Mapping[str, _CacheEntry]) -> None:
+    """Persist the response cache atomically (temp file + rename). Best-effort — a failed
+    write just means the next session starts colder, so it's suppressed, not fatal."""
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("wb") as handle:
+            pickle.dump((_CACHE_VERSION, dict(cache)), handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+
+
 class EsiClient:
     """Cached, rate-limit-aware async GET transport for ESI."""
 
@@ -74,14 +103,26 @@ class EsiClient:
         *,
         now: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        cache_path: Path | None = None,
     ) -> None:
         self._config = config
         self._http = http
         self._now = now
         self._sleep = sleep
-        self._cache: dict[str, _CacheEntry] = {}
+        # Persist the response cache between sessions: a relaunch reuses entries still fresh
+        # per their Expires (no fetch) and revalidates the rest with If-None-Match (cheap 304).
+        self._cache_path = cache_path
+        self._cache: dict[str, _CacheEntry] = (
+            _load_cache(cache_path) if cache_path is not None else {}
+        )
         self._error_remain: int | None = None
         self._error_reset_at: datetime | None = None
+
+    def save_cache(self) -> None:
+        """Write the response cache to disk (if a ``cache_path`` was given) so the next launch
+        reuses still-fresh data instead of re-pulling everything. Call at shutdown."""
+        if self._cache_path is not None:
+            _save_cache(self._cache_path, self._cache)
 
     @property
     def _user_agent(self) -> str:

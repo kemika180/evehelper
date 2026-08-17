@@ -59,7 +59,7 @@ def _load_sde() -> SdeDatabase | None:
 
 def _build_resources(config: Config) -> _Resources:
     http = httpx.AsyncClient()
-    client = EsiClient(config, http)
+    client = EsiClient(config, http, cache_path=default_data_dir() / "esi_cache.pickle")
     return _Resources(
         http=http,
         client=client,
@@ -146,16 +146,20 @@ def _run_tui(config: Config) -> None:
         # One cheap HEAD to see if the local SDE is missing or a newer dump exists.
         return await asyncio.to_thread(check_sde_freshness, sde_path(), contact=config.contact)
 
-    EveTraderApp(
-        store,
-        make_feed,
-        login_fn,
-        remove_token_fn,
-        config.refresh_interval_seconds,
-        theme=config.theme,
-        download_sde_fn=download_sde_fn,
-        sde_check_fn=sde_check_fn,
-    ).run()
+    try:
+        EveTraderApp(
+            store,
+            make_feed,
+            login_fn,
+            remove_token_fn,
+            config.refresh_interval_seconds,
+            theme=config.theme,
+            download_sde_fn=download_sde_fn,
+            sde_check_fn=sde_check_fn,
+        ).run()
+    finally:
+        # Persist the ESI response cache so the next launch reuses still-fresh data.
+        resources.client.save_cache()
 
 
 def main() -> None:

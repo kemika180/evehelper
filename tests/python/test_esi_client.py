@@ -6,6 +6,7 @@ import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -182,3 +183,59 @@ def test_non_success_raises_esi_error() -> None:
         assert excinfo.value.status_code == 500
 
     _run(handler, body)
+
+
+def test_cache_persists_between_sessions(tmp_path: Path) -> None:
+    calls = 0
+    clock = _Clock(datetime(2020, 1, 1, tzinfo=UTC))
+    cache_file = tmp_path / "esi_cache.pickle"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.headers.get("If-None-Match") == "e1":
+            calls += 1
+            return httpx.Response(304, headers={"Expires": _http_date(clock.now + timedelta(minutes=5))})
+        calls += 1
+        expires = _http_date(clock.now + timedelta(minutes=5))
+        return httpx.Response(200, json={"n": calls}, headers={"Expires": expires, "ETag": "e1"})
+
+    async def go() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http:
+            # Session 1: one real fetch, then persist the cache.
+            first = EsiClient(_config(), http, now=clock, cache_path=cache_file)
+            body1 = await first.get("/x/")
+            first.save_cache()
+            assert calls == 1
+            assert cache_file.exists()
+
+            # Session 2 (new client), still within Expires -> served from disk, no network.
+            second = EsiClient(_config(), http, now=clock, cache_path=cache_file)
+            assert await second.get("/x/") == body1
+            assert calls == 1
+
+            # Session 3 after Expires passes -> revalidates with the persisted ETag; a 304
+            # reuses the persisted body without re-downloading it.
+            clock.advance(600)
+            third = EsiClient(_config(), http, now=clock, cache_path=cache_file)
+            assert await third.get("/x/") == body1
+            assert calls == 2  # one conditional request, no full re-fetch
+
+    asyncio.run(go())
+
+
+def test_missing_or_corrupt_cache_starts_cold(tmp_path: Path) -> None:
+    corrupt = tmp_path / "esi_cache.pickle"
+    corrupt.write_bytes(b"not a pickle")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    async def go() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http:
+            client = EsiClient(_config(), http, cache_path=corrupt)  # corrupt -> empty, no crash
+            assert await client.get("/x/") == b'{"ok":true}'
+            client.save_cache()  # overwrites the corrupt file cleanly
+
+    asyncio.run(go())
