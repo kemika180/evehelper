@@ -16,3 +16,7 @@ dist/
 
 # Exported crafting recipes (written to the working dir by the Crafting popup)
 *-recipe.md
+
+# Local agent/dev-process guidance — kept locally, never committed to the remote
+CLAUDE.md
+WORKFLOW.md
