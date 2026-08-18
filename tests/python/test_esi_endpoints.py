@@ -3,27 +3,24 @@ required (character endpoints authed; public market endpoint not)."""
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from email.utils import format_datetime
 
 import httpx
-
-from evetrader.config import Config, HomeMarket, RiskPreferences
+from evetrader.config import Config
 from evetrader.esi.client import EsiClient
 from evetrader.esi.endpoints import (
+    fetch_affiliation,
     fetch_assets,
+    fetch_attributes,
     fetch_blueprints,
-    fetch_corporation,
     fetch_industry_jobs,
     fetch_location,
-    fetch_market_history,
-    fetch_market_orders,
+    fetch_market_prices,
     fetch_open_orders,
+    fetch_ship,
     fetch_skillqueue,
-    fetch_attributes,
     fetch_skills,
-    fetch_standings,
-    fetch_station,
     fetch_wallet_balance,
     resolve_names,
 )
@@ -35,11 +32,6 @@ def _config() -> Config:
     return Config(
         esi_client_id="cid",
         contact="contact@example.com",
-        default_home=HomeMarket(region_id=10000002, station_id=60003760),
-        total_capital_isk=1.0,
-        risk=RiskPreferences(
-            min_margin=0.05, min_daily_isk_volume=0.0, max_capital_per_order_isk=1.0
-        ),
     )
 
 
@@ -184,42 +176,24 @@ def test_fetch_location_parses_station() -> None:
     _run(body, httpx.MockTransport(handler))
 
 
-def test_fetch_market_orders_is_public_and_paged() -> None:
+def test_fetch_market_prices_is_public_and_parses() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers.get("Authorization") is None  # public endpoint
-        page = int(request.url.params.get("page", "1"))
-        return httpx.Response(
-            200, json=[_order_json(page, is_buy=False)], headers={"X-Pages": "2", "Expires": _FUTURE}
-        )
-
-    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
-        orders = await fetch_market_orders(client, 10000002)
-        assert [o.order_id for o in orders] == [1, 2]
-
-    _run(body, httpx.MockTransport(handler))
-
-
-def test_fetch_market_history_passes_type_id_and_parses() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params.get("type_id") == "34"
+        assert request.url.path.endswith("/markets/prices/")
+        assert request.headers.get("Authorization") is None  # public, no token
         return httpx.Response(
             200,
             json=[
-                {
-                    "date": "2020-01-01",
-                    "average": 5.1,
-                    "highest": 5.5,
-                    "lowest": 4.9,
-                    "order_count": 120,
-                    "volume": 1_000_000,
-                }
+                {"type_id": 34, "average_price": 5.02, "adjusted_price": 5.44},
+                {"type_id": 44992, "adjusted_price": 4_500_000.0},  # no average for some types
             ],
             headers={"Expires": _FUTURE},
         )
 
     async def body(client: EsiClient, _: dict[str, str | None]) -> None:
-        history = await fetch_market_history(client, 10000002, 34)
-        assert history[0].volume == 1_000_000
+        prices = await fetch_market_prices(client)
+        assert prices[0].average_price == 5.02
+        assert prices[1].average_price == 0.0  # absent -> default, so callers can fall back
+        assert prices[1].adjusted_price == 4_500_000.0
 
     _run(body, httpx.MockTransport(handler))
 
@@ -269,17 +243,36 @@ def test_fetch_attributes_authenticates_and_parses() -> None:
     _run(body, httpx.MockTransport(handler))
 
 
-def test_fetch_standings_parses() -> None:
+def test_fetch_ship_authenticates_and_parses() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("Authorization") == "Bearer tok"
         return httpx.Response(
             200,
-            json=[{"from_id": 1000035, "from_type": "npc_corp", "standing": 3.5}],
+            json={"ship_type_id": 587, "ship_item_id": 1000000016991, "ship_name": "My Rifter"},
             headers={"Expires": _FUTURE},
         )
 
     async def body(client: EsiClient, _: dict[str, str | None]) -> None:
-        standings = await fetch_standings(client, 42, token="tok")
-        assert standings[0].standing == 3.5
+        ship = await fetch_ship(client, 42, token="tok")
+        assert ship.ship_type_id == 587
+        assert ship.ship_name == "My Rifter"
+
+    _run(body, httpx.MockTransport(handler))
+
+
+def test_fetch_affiliation_is_public_and_returns_corp_alliance() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("Authorization") is None  # public POST, no token
+        return httpx.Response(
+            200,
+            json=[{"character_id": 42, "corporation_id": 98000001, "alliance_id": 99000001}],
+        )
+
+    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
+        affiliation = await fetch_affiliation(client, 42)
+        assert affiliation is not None
+        assert affiliation.corporation_id == 98000001
+        assert affiliation.alliance_id == 99000001
 
     _run(body, httpx.MockTransport(handler))
 
@@ -304,43 +297,6 @@ def test_fetch_skillqueue_authenticates_and_parses() -> None:
         queue = await fetch_skillqueue(client, 42, token="tok")
         assert queue[0].skill_id == 16622
         assert queue[0].queue_position == 0
-
-    _run(body, httpx.MockTransport(handler))
-
-
-def test_fetch_station_is_public_and_parses_owner() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers.get("Authorization") is None
-        return httpx.Response(
-            200,
-            json={
-                "station_id": 60003760,
-                "name": "Jita IV - Moon 4 - Caldari Navy Assembly Plant",
-                "system_id": 30000142,
-                "type_id": 1529,
-                "owner": 1000035,
-            },
-            headers={"Expires": _FUTURE},
-        )
-
-    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
-        station = await fetch_station(client, 60003760)
-        assert station.owner == 1000035
-
-    _run(body, httpx.MockTransport(handler))
-
-
-def test_fetch_corporation_parses_faction() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"name": "Caldari Navy", "faction_id": 500001},
-            headers={"Expires": _FUTURE},
-        )
-
-    async def body(client: EsiClient, _: dict[str, str | None]) -> None:
-        corp = await fetch_corporation(client, 1000035)
-        assert corp.faction_id == 500001
 
     _run(body, httpx.MockTransport(handler))
 

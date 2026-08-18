@@ -10,15 +10,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from evetrader.config import Config
 from evetrader.configload import default_config_path, default_data_dir, load_config
+from evetrader.data.access import LastAccessStore
 from evetrader.data.sde import SdeDatabase, SdeError
-from evetrader.data.sde_download import SdeState, check_sde_freshness, download_sde
+from evetrader.data.sde_download import (
+    ProgressFn,
+    SdeState,
+    check_sde_freshness,
+    download_sde,
+)
 from evetrader.data.structures import StructureCache
 from evetrader.data.universe import NameCache
 from evetrader.esi.auth import (
@@ -77,6 +85,17 @@ def sde_path() -> Path:
     return default_data_dir() / "sde.sqlite"
 
 
+def _print_sde_progress(downloaded: int, total: int | None) -> None:
+    """Redraw a one-line download progress readout for the `sde` command."""
+    mb = downloaded / 1_000_000
+    if total:
+        pct, total_mb = downloaded / total, total / 1_000_000
+        sys.stdout.write(f"\r  {pct:5.1%}  ({mb:,.0f} / {total_mb:,.0f} MB)")
+    else:
+        sys.stdout.write(f"\r  {mb:,.0f} MB")
+    sys.stdout.flush()
+
+
 async def _run_login(config: Config) -> CharacterIdentity:
     async with httpx.AsyncClient() as http:
         return await login(config, http, KeyringTokenStore())
@@ -99,12 +118,15 @@ def _run_tui(config: Config) -> None:
     store = CharacterStore(_characters_path())
     asyncio.run(_migrate_legacy_character(config, store))
     resources = _build_resources(config)
+    last_access = LastAccessStore(default_data_dir() / "last_access.json")
 
     def make_feed(character_id: int) -> RefreshFeed:
-        record = next((r for r in store.records() if r.character_id == character_id), None)
-        home = config.home_for(record.name if record is not None else str(character_id))
         # Per-character: structure access (and its negative cache) is character-scoped.
         structure_cache = StructureCache(resources.client)
+        # Record this session's access once when the character is opened; the prior value
+        # is the cutoff for the Overview "since your last visit" feed, held constant across
+        # this session's refreshes (each refresh re-uses it, not an ever-advancing "now").
+        since = last_access.record_access(character_id, datetime.now(UTC))
 
         async def character() -> CharacterReport:
             return await fetch_character(
@@ -112,15 +134,15 @@ def _run_tui(config: Config) -> None:
                 resources.authenticator,
                 config,
                 character_id,
-                home,
                 resources.name_cache,
                 structure_cache,
                 resources.sde,
+                since=since,
             )
 
         async def opportunities(report: CharacterReport) -> OpportunityReport:
             return await fetch_opportunities(
-                resources.client, config, report, home, resources.name_cache, resources.sde
+                resources.client, config, report, resources.name_cache, resources.sde
             )
 
         return RefreshFeed(character=character, opportunities=opportunities)
@@ -132,11 +154,13 @@ def _run_tui(config: Config) -> None:
         with contextlib.suppress(Exception):
             KeyringTokenStore().delete(character_id)
 
-    async def download_sde_fn() -> bool:
+    async def download_sde_fn(on_progress: ProgressFn) -> bool:
         # Blocking download off the event loop; then reload so the next scan sees it.
         # Returns False on any failure so the launch prompt can report it, not crash.
         try:
-            await asyncio.to_thread(download_sde, sde_path(), contact=config.contact)
+            await asyncio.to_thread(
+                download_sde, sde_path(), contact=config.contact, on_progress=on_progress
+            )
         except Exception:  # network/IO failure is surfaced in the UI, not fatal
             return False
         resources.sde = _load_sde()
@@ -168,6 +192,11 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
 
+    # A missing DEFAULT config is fine — the app runs on built-in defaults (shared client
+    # id). But an explicitly requested --config that doesn't exist is almost certainly a
+    # typo, so fail loudly rather than silently ignoring it.
+    if args.config is not None and not args.config.exists():
+        parser.error(f"config file not found: {args.config}")
     config = load_config(args.config or default_config_path())
 
     if args.command == "login":
@@ -179,7 +208,7 @@ def main() -> None:
     elif args.command == "sde":
         dest = sde_path()
         print(f"Downloading the EVE SDE to {dest} … (~250 MB, one-time; re-run to update)")
-        download_sde(dest, contact=config.contact)
-        print("SDE ready.")
+        download_sde(dest, contact=config.contact, on_progress=_print_sde_progress)
+        print("\nSDE ready.")
     else:
         _run_tui(config)

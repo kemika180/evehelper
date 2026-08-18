@@ -44,7 +44,12 @@ SCOPES: tuple[str, ...] = (
     "esi-location.read_location.v1",
     "esi-skills.read_skills.v1",
     "esi-skills.read_skillqueue.v1",
+    "esi-location.read_ship_type.v1",  # current ship shown in the header
+    "esi-location.read_online.v1",  # online status (character picker "logged in now")
+    # Kept in the requested set to preserve existing tokens/app-registration even though
+    # the code no longer reads standings (fees were removed 2026-08-17).
     "esi-characters.read_standings.v1",
+    "esi-characters.read_loyalty.v1",  # LP balances per NPC corp
     # Name player-owned Upwell structures the character can dock at (asset browser).
     "esi-universe.read_structures.v1",
     # Pre-provisioned for upcoming modules so they need no further re-login (added

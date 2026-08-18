@@ -4,7 +4,6 @@ from pytest import approx
 
 from evetrader.market.production import (
     BlueprintNeeded,
-    BuildRun,
     BuyLine,
     MineableOre,
     MineLine,
@@ -14,58 +13,19 @@ from evetrader.market.production import (
     RequiredSkill,
     SelfSourcePlan,
     adjusted_material_quantity,
-    analyze_build,
     build_source_tree,
     collect_needs,
     plan_ore_mining,
 )
 
 
-def _recipe() -> Recipe:
-    return Recipe(
-        blueprint_type_id=938,
-        product_type_id=587,
-        product_quantity=1,
-        materials=(RecipeMaterial(34, 100), RecipeMaterial(35, 50)),
-    )
-
-
-# --- build-vs-buy costing ----------------------------------------------------
+# --- material-efficiency helper ----------------------------------------------
 
 
 def test_adjusted_material_quantity_applies_me_and_floors_at_runs() -> None:
     assert adjusted_material_quantity(100, runs=1, material_efficiency=0) == 100
     assert adjusted_material_quantity(100, runs=1, material_efficiency=10) == 90
     assert adjusted_material_quantity(1, runs=10, material_efficiency=10) == 10
-
-
-def test_analyze_build_costs_materials_and_applies_sale_fees() -> None:
-    analysis = analyze_build(
-        _recipe(),
-        material_efficiency=10,
-        material_prices={34: 5.0, 35: 10.0},
-        product_price=2000.0,
-        sales_tax=0.05,
-        broker_fee=0.03,
-    )
-    assert analysis.material_cost == 900.0  # 90@5 + 45@10
-    assert analysis.net_product_value == approx(1840.0)  # 8% total fees
-    assert analysis.margin == approx(940.0)
-    assert analysis.priced is True
-    assert analysis.verdict == "BUILD"
-
-
-def test_analyze_build_flags_missing_prices_and_unvalued_products() -> None:
-    partial = analyze_build(
-        _recipe(), material_efficiency=0, material_prices={34: 5.0}, product_price=2000.0
-    )
-    assert partial.missing_material_prices == (35,)
-    assert partial.priced is False
-    unvalued = analyze_build(
-        _recipe(), material_efficiency=0, material_prices={34: 5.0, 35: 10.0}, product_price=None
-    )
-    assert unvalued.product_priced is False
-    assert unvalued.material_cost == 100 * 5.0 + 50 * 10.0
 
 
 # --- self-source build tree --------------------------------------------------

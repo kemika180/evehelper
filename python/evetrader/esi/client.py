@@ -14,11 +14,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import pickle
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -33,6 +35,10 @@ _ERROR_LIMIT_FLOOR = 5
 _MAX_CONCURRENT_PAGES = 8
 # Bump when `_CacheEntry`'s shape changes so an old on-disk cache is discarded, not misread.
 _CACHE_VERSION = 1
+# The region-wide market order book: hundreds of pages (100s of MB) with a ~5-minute
+# Expires. It's re-fetched almost every launch anyway, so it's cached in-memory for the
+# session but never written to disk — persisting it would bloat the file for no speed-up.
+_UNPERSISTED_PATH = re.compile(r"/markets/\d+/orders/$")
 
 Params = Mapping[str, str | int]
 
@@ -82,14 +88,23 @@ def _load_cache(path: Path) -> dict[str, _CacheEntry]:
     return entries
 
 
+def _persistable(url: str) -> bool:
+    """Whether a cached response is worth keeping between sessions. Excludes the region-wide
+    order book (see ``_UNPERSISTED_PATH``): huge and short-lived, so it dominates the file
+    yet is re-fetched every launch. Everything else has a long enough TTL to speed a relaunch."""
+    return _UNPERSISTED_PATH.search(urlsplit(url).path) is None
+
+
 def _save_cache(path: Path, cache: Mapping[str, _CacheEntry]) -> None:
-    """Persist the response cache atomically (temp file + rename). Best-effort — a failed
-    write just means the next session starts colder, so it's suppressed, not fatal."""
+    """Persist the worth-keeping slice of the response cache atomically (temp file + rename).
+    Best-effort — a failed write just means the next session starts colder, so it's
+    suppressed, not fatal."""
+    persistable = {url: entry for url, entry in cache.items() if _persistable(url)}
     with contextlib.suppress(OSError):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         with tmp.open("wb") as handle:
-            pickle.dump((_CACHE_VERSION, dict(cache)), handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump((_CACHE_VERSION, persistable), handle, protocol=pickle.HIGHEST_PROTOCOL)
         tmp.replace(path)
 
 

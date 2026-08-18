@@ -1,14 +1,11 @@
-"""Build-vs-buy and self-source recipe engine. PURE — no I/O.
+"""Self-source recipe engine. PURE — no I/O.
 
-Two deterministic jobs, given (recipe, prices, ore sources) handed in by the impure layer:
-
-1. ``analyze_build`` — the build-vs-buy verdict: the cost to *buy* a blueprint's materials
-   vs the fee-adjusted sale value of its product (the asset browser's blueprint popup).
-2. ``build_source_tree`` / ``flatten_plan`` — the **self-source recipe**: how to make an
-   item yourself, expanding each material into a sub-build or the ore to mine. This side is
-   **cost-free by design** — mining's real cost is time, travel and risk, not a market price
-   — so it says only *what* to gather, roughly *where* (highsec/lowsec/null/abyssal/moon),
-   and how much volume it is (to judge hauling trips), leaving the worth-it call to the player.
+Given (recipe, ore sources) handed in by the impure layer, ``build_source_tree`` /
+``flatten_plan`` produce the **self-source recipe**: how to make an item yourself, expanding
+each material into a sub-build or the ore to mine. This side is **cost-free by design** —
+mining's real cost is time, travel and risk, not a market price — so it says only *what* to
+gather, roughly *where* (highsec/lowsec/null/abyssal/moon), and how much volume it is (to
+judge hauling trips), leaving the worth-it call to the player.
 
 The ``Recipe`` shape is activity-agnostic: manufacturing is the first consumer, but reactions
 and planetary interaction fit the same shape later.
@@ -42,62 +39,6 @@ class Recipe:
     materials: tuple[RecipeMaterial, ...]
 
 
-@dataclass(frozen=True)
-class MaterialLine:
-    """One input of a build: the material, its ME-adjusted quantity for the analyzed run
-    count, and its unit buy price at the reference market (None when it isn't priced)."""
-
-    type_id: int
-    quantity: int
-    unit_price: float | None
-
-    @property
-    def line_cost(self) -> float | None:
-        """Cost to buy this line outright: quantity times unit price, or None."""
-        return self.quantity * self.unit_price if self.unit_price is not None else None
-
-
-@dataclass(frozen=True)
-class BuildAnalysis:
-    """The build-vs-buy verdict for one recipe at a given ME, run count, and prices."""
-
-    runs: int
-    material_cost: float  # cost to BUY every (priced) material outright, for `runs` runs
-    product_value: float  # gross sale value of the output before fees (0 if unpriced)
-    net_product_value: float  # after sales tax + broker fee
-    # Missing prices leave the margin unreliable, so a verdict isn't trustworthy until
-    # `priced` — the caller should surface that rather than trust `verdict`.
-    missing_material_prices: tuple[int, ...]
-    # False when the product has no sell price at the reference market, so its value
-    # (and therefore the margin) is unknown — the build is still listed, just unvalued.
-    product_priced: bool = True
-    # The per-material breakdown (the bill of materials), for a build's detail view.
-    materials: tuple[MaterialLine, ...] = ()
-
-    @property
-    def margin(self) -> float:
-        """Net sale value minus material cost — the profit of building over buying."""
-        return self.net_product_value - self.material_cost
-
-    @property
-    def margin_fraction(self) -> float | None:
-        """Margin as a fraction of material cost (return on the build), or None when
-        there's nothing to divide by."""
-        return self.margin / self.material_cost if self.material_cost > 0 else None
-
-    @property
-    def priced(self) -> bool:
-        """Whether the product and every material had a price — i.e. the margin is
-        complete and the verdict trustworthy."""
-        return self.product_priced and not self.missing_material_prices
-
-    @property
-    def verdict(self) -> str:
-        """BUILD when building profits over buying, else BUY. Only meaningful when
-        ``priced`` (an incomplete cost can flip it)."""
-        return "BUILD" if self.margin > 0 else "BUY"
-
-
 def adjusted_material_quantity(base_quantity: int, runs: int, material_efficiency: int) -> int:
     """Units of a material a job actually consumes, after the blueprint's ME.
 
@@ -106,59 +47,6 @@ def adjusted_material_quantity(base_quantity: int, runs: int, material_efficienc
     modelled yet (a documented simplification); they'd multiply into the same factor."""
     reduced = base_quantity * runs * (1 - material_efficiency / 100)
     return max(runs, math.ceil(round(reduced, 2)))
-
-
-def analyze_build(
-    recipe: Recipe,
-    *,
-    material_efficiency: int,
-    material_prices: Mapping[int, float],
-    product_price: float | None,
-    sales_tax: float = 0.0,
-    broker_fee: float = 0.0,
-    runs: int = 1,
-) -> BuildAnalysis:
-    """Cost a build by buying every material, and (if the product is priced) compare it to
-    selling the product. Pure.
-
-    ``material_prices`` is the unit buy cost per material type; ``product_price`` the unit
-    sale value of the output (``None`` if it isn't sold at the reference market — the build
-    is still returned, just unvalued). Sale fees (``sales_tax`` + ``broker_fee``) apply to
-    the product side. Self-sourcing (build/mine) is a separate, cost-free concern — see
-    ``build_source_tree`` — so it isn't costed here."""
-    material_cost = 0.0
-    missing: list[int] = []
-    lines: list[MaterialLine] = []
-    for material in recipe.materials:
-        quantity = adjusted_material_quantity(material.quantity, runs, material_efficiency)
-        price = material_prices.get(material.type_id)
-        lines.append(MaterialLine(material.type_id, quantity, price))
-        if price is None:
-            missing.append(material.type_id)
-        else:
-            material_cost += quantity * price
-    materials = tuple(lines)
-
-    if product_price is None:
-        return BuildAnalysis(
-            runs=runs,
-            material_cost=material_cost,
-            product_value=0.0,
-            net_product_value=0.0,
-            missing_material_prices=tuple(missing),
-            product_priced=False,
-            materials=materials,
-        )
-    product_value = recipe.product_quantity * runs * product_price
-    net_product_value = product_value * (1 - sales_tax - broker_fee)
-    return BuildAnalysis(
-        runs=runs,
-        material_cost=material_cost,
-        product_value=product_value,
-        net_product_value=net_product_value,
-        missing_material_prices=tuple(missing),
-        materials=materials,
-    )
 
 
 # --- self-source recipe tree (cost-free) -------------------------------------

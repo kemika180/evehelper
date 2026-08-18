@@ -5,39 +5,54 @@ state and live market data from ESI (the official EVE REST API), analyses tradin
 opportunities, and tells you what to do while you play. It **never** automates
 transactions — EVE forbids that — it only advises; you execute the trades in-game.
 
-Pure Python. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and
-milestones, and [`WORKFLOW.md`](WORKFLOW.md) for the day-to-day dev process.
+Pure Python. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestones.
 
 ## Status
 
-Pre-milestone-1: planning docs only. Milestone 1 is the workspace scaffold — a
-`Config` pydantic model and an `evetrader` entry point that launches an empty
-Textual app, with all three checks green.
+Working TUI. It reads your character and live market data and shows: net worth (assets
+valued at Jita reference prices), a crafting **build-vs-buy** analysis with quick-train
+skill tips, an asset browser (into containers and ships), your full skill list and training
+queue, and your open orders flagged best-price or undercut. Multi-character. It never
+touches the game economy — you execute every trade in-game.
 
 ## How it works
 
 ```
-ESI (REST API)                pure analysis core              you
-─────────────                 ──────────────────             ───
-assets / wallet / orders  ┐                              ┌─ "place a buy order for
-location / skills         ├─► CharacterState ─┐          │   X at price P — expected
-                          │                   ├─► advisor ┤   margin M, ~ISK/hr H"
-public market orders +    ┘   MarketSnapshot ─┘   engine  └─ (you do it in-game)
-history (per region)
+ESI + SDE                       pure analysis core        you
+─────────                       ──────────────────        ───
+wallet / assets / orders   ┐                          ┌─ "build X yourself: mats
+skills / location / ship   │                          │   cost C vs buy at P — and
+public market prices       ├─►  analysis (market/) ──►│   train skill S to save more"
+blueprint recipes (SDE)    ┘                          └─ (you do it in-game)
 ```
 
 All network I/O is confined to `esi/` and `data/`; `market/` and `advisor/` are a
-pure, deterministic, unit-testable core.
+pure, deterministic, unit-testable core (enforced by import-linter).
 
 ## Setup
 
-Requires [`uv`](https://docs.astral.sh/uv/). You'll also need to register an
-application at <https://developers.eveonline.com> to get an SSO client id and the
-scopes for reading your character (assets, wallet, orders, location, skills).
+Requires [`uv`](https://docs.astral.sh/uv/). That's the only prerequisite — there's
+**nothing to register**. evetrader ships with a shared ESI application, so it runs with
+no config file at all:
 
 ```
 uv sync
 uv run evetrader
+```
+
+On first launch, press **`a`** to add your character: your browser opens EVE's official
+SSO, you log in with your own EVE account and authorize the read-only scopes, and the
+token is stored in your OS keyring (never in the repo). Then select the character to open
+the advisor.
+
+Configuration is optional. To customise, create `~/.config/evetrader/config.toml` — every
+field has a default, so include only what you want to change:
+
+```toml
+refresh_interval_seconds = 60   # how often the advisor re-runs (default 300)
+theme = "nord"                  # any built-in Textual theme (default "kemika-purple")
+# esi_client_id = "..."         # only if self-hosting your own ESI app registration
+# contact = "you@example.com"   # ESI User-Agent contact (URL or email); only for self-hosting
 ```
 
 For the crafting build-vs-buy analysis, download the EVE SDE (static data — blueprint
@@ -49,7 +64,7 @@ uv run evetrader sde
 
 It's fetched from the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLite mirror into
 your local data dir (gitignored, never committed). The rest of the app works without
-it; only the build-vs-buy view needs it.
+it; only the build-vs-buy view needs it. You can also grab it from the launch prompt.
 
 ## Checks
 

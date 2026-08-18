@@ -11,7 +11,6 @@ is testable without ESI.
 
 from __future__ import annotations
 
-import math
 import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
@@ -25,7 +24,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.color import Color
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -34,6 +33,7 @@ from textual.widgets import (
     Header,
     Input,
     OptionList,
+    ProgressBar,
     Static,
     TabbedContent,
     TabPane,
@@ -41,22 +41,19 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
-from textual_plotext import PlotextPlot
 
 from evetrader.data.assets import AssetLocation, AssetNode
-from evetrader.data.sde_download import SdeState
+from evetrader.data.sde_download import ProgressFn, SdeState
 from evetrader.data.skills import SkillReference
 from evetrader.esi.auth import CharacterIdentity
 from evetrader.esi.models import (
     Blueprint,
     IndustryJob,
-    MarketHistoryDay,
     Skill,
     SkillQueueEntry,
+    WalletTransaction,
 )
-from evetrader.market.investment import TrackedStatus
 from evetrader.market.listings import ListingStatus
-from evetrader.market.production import BuildAnalysis
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.themes import KEMIKA_PURPLE
@@ -71,25 +68,6 @@ def _finish(entry: SkillQueueEntry) -> str:
     if entry.finish_date is None:
         return "unknown"
     return _local(entry.finish_date)
-
-
-def _nice_ticks(low: float, high: float, count: int) -> list[float]:
-    """Round tick values spanning [low, high] at 1/2/2.5/5 x10^k intervals."""
-    if high <= low or count < 2:
-        return [low]
-    raw_step = (high - low) / (count - 1)
-    magnitude = 10.0 ** math.floor(math.log10(raw_step))
-    step = next(
-        (m * magnitude for m in (1.0, 2.0, 2.5, 5.0, 10.0) if m * magnitude >= raw_step),
-        10.0 * magnitude,
-    )
-    ticks: list[float] = []
-    value = math.floor(low / step) * step
-    while value <= high + step * 0.5:
-        if value >= low - step * 0.5:
-            ticks.append(value)
-        value += step
-    return ticks
 
 
 def _isk(value: float) -> str:
@@ -444,6 +422,22 @@ def _job_time_left(job: IndustryJob, reference: datetime) -> str:
     return _humanize_span(int((job.end_date - reference).total_seconds()))
 
 
+# Manufacturing line slots: base 1, +1 per level of Mass Production and Advanced Mass
+# Production. Reactions and research are separate pools, not counted here. Game constants.
+_MASS_PRODUCTION = 3387
+_ADVANCED_MASS_PRODUCTION = 24625
+_MANUFACTURING_ACTIVITY = 1
+
+
+def _free_manufacturing_slots(report: CharacterReport) -> int:
+    """Free manufacturing job lines: the slot cap (1 + Mass Production + Advanced Mass
+    Production levels) minus the manufacturing jobs currently occupying a line."""
+    levels = {skill.skill_id: skill.active_skill_level for skill in report.skills}
+    slots = 1 + levels.get(_MASS_PRODUCTION, 0) + levels.get(_ADVANCED_MASS_PRODUCTION, 0)
+    running = sum(1 for job in report.industry_jobs if job.activity_id == _MANUFACTURING_ACTIVITY)
+    return max(0, slots - running)
+
+
 def _asset_signature(locations: list[AssetLocation]) -> tuple[object, ...]:
     """A value that changes iff the asset tree changed — item moves between places,
     stack sizes, additions/removals — so the tree only rebuilds when it must."""
@@ -595,8 +589,9 @@ FetchCharacter = Callable[[], Awaitable[CharacterReport]]
 FetchOpportunities = Callable[[CharacterReport], Awaitable[OpportunityReport]]
 LoginFn = Callable[[], Awaitable[CharacterIdentity]]
 RemoveTokenFn = Callable[[int], None]
-# Download the SDE (in the background) and make it available; True on success.
-DownloadSdeFn = Callable[[], Awaitable[bool]]
+# Download the SDE (in the background) and make it available; True on success. The
+# ProgressFn is called with (bytes downloaded, total|None) so the prompt can show a bar.
+DownloadSdeFn = Callable[[ProgressFn], Awaitable[bool]]
 # Check whether the local SDE is missing/stale/current; drives the launch-time prompt.
 # None when the host didn't wire it (e.g. tests) — no prompt is shown then.
 SdeCheckFn = Callable[[], Awaitable[SdeState]]
@@ -612,83 +607,6 @@ class RefreshFeed:
 
 
 MakeFeed = Callable[[int], RefreshFeed]
-
-
-class PriceHistoryScreen(ModalScreen[None]):
-    """A modal price-history chart for one item (its N-day average/high/low, the
-    moving average, and today's price), plotted in the terminal."""
-
-    BINDINGS: ClassVar[list[BindingType]] = [
-        ("escape", "dismiss", "Close"),
-        ("enter", "dismiss", "Close"),
-        ("q", "dismiss", "Close"),
-    ]
-
-    DEFAULT_CSS = """
-    PriceHistoryScreen { align: center middle; }
-    PriceHistoryScreen #plotbox {
-        width: 88%;
-        height: 82%;
-        border: round $primary;
-        background: $surface;
-    }
-    PriceHistoryScreen #plothint { padding: 0 1; color: $text-muted; }
-    """
-
-    def __init__(
-        self,
-        title: str,
-        days: list[MarketHistoryDay],
-        *,
-        fair_value: float,
-        current_price: float,
-    ) -> None:
-        super().__init__()
-        self._title = title
-        self._days = sorted(days, key=lambda day: day.date)
-        self._fair_value = fair_value
-        self._current_price = current_price
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="plotbox"):
-            yield PlotextPlot()
-            yield Static(
-                "cyan = daily avg · magenta = fair value · yellow = now   ·   esc to close",
-                id="plothint",
-            )
-
-    def on_mount(self) -> None:
-        plt = self.query_one(PlotextPlot).plt
-        days = self._days
-        count = len(days)
-        if count == 0:
-            plt.title(f"{self._title} — no history")
-            return
-        averages = [day.average for day in days]
-        plt.plot(list(range(count)), averages, color="cyan")
-        plt.hline(self._fair_value, color="magenta")
-        plt.hline(self._current_price, color="yellow")
-
-        # X axis: real dates at ~6 evenly spaced positions instead of 0..N indices.
-        ticks = min(6, count)
-        if count > 1:
-            positions = [round(i * (count - 1) / (ticks - 1)) for i in range(ticks)]
-        else:
-            positions = [0]
-        plt.xticks(
-            [float(p) for p in positions], [days[p].date.strftime("%b %d") for p in positions]
-        )
-
-        # Y axis: round, human-readable ISK values.
-        low = min(*averages, self._current_price, self._fair_value)
-        high = max(*averages, self._current_price, self._fair_value)
-        y_ticks = _nice_ticks(low, high, 5)
-        plt.yticks(y_ticks, [_isk(value) for value in y_ticks])
-
-        plt.title(
-            f"{self._title}   ·   now {_isk(self._current_price)}   ·   "
-            f"fair {_isk(self._fair_value)}   ·   last {count} days"
-        )
 
 
 _STATUS_LABEL: dict[str, tuple[str, str]] = {
@@ -817,18 +735,11 @@ class BlueprintInfoScreen(ModalScreen[None]):
     BlueprintInfoScreen #bphint { padding: 1 0 0 0; color: $text-muted; }
     """
 
-    def __init__(
-        self,
-        name: str,
-        node: AssetNode,
-        blueprint: Blueprint,
-        build: BuildAnalysis | None = None,
-    ) -> None:
+    def __init__(self, name: str, node: AssetNode, blueprint: Blueprint) -> None:
         super().__init__()
         self._name = name
         self._node = node
         self._blueprint = blueprint
-        self._build = build
 
     def compose(self) -> ComposeResult:
         with Vertical(id="bpbox"):
@@ -859,31 +770,7 @@ class BlueprintInfoScreen(ModalScreen[None]):
             text.append(f"{blueprint.runs:,} runs remaining\n", style="dim")
         if self._node.quantity > 1:
             text.append(f"stack of {self._node.quantity:,}\n", style="dim")
-        if self._build is not None:
-            _append_build(text, self._build)
         return text
-
-
-def _append_build(text: Text, build: BuildAnalysis) -> None:
-    """The build-vs-buy block: material cost vs Jita sale value, per run."""
-    text.append("\nBuild vs buy — per run (Jita)\n", style="bold")
-    text.append(f"  materials   {_isk(build.material_cost)}\n", style="dim")
-    if not build.product_priced:
-        text.append("  product not sold at Jita — value unknown\n", style="yellow")
-        return
-    text.append(f"  sell value  {_isk(build.net_product_value)}  after fees\n", style="dim")
-    positive = build.margin > 0
-    colour = "green" if positive else "yellow"
-    prefix = "+" if positive else ""
-    line = f"  margin      {prefix}{_isk(build.margin)}"
-    if build.margin_fraction is not None:
-        line += f"  ({build.margin_fraction:+.0%})"
-    text.append(f"{line}\n", style=colour)
-    if build.missing_material_prices:
-        missing = len(build.missing_material_prices)
-        text.append(f"  no Jita price for {missing} material(s) — margin partial\n", style="yellow")
-    else:
-        text.append(f"  → {build.verdict}\n", style=f"bold {colour}")
 
 
 class IndustryJobScreen(ModalScreen[None]):
@@ -1161,6 +1048,7 @@ class SdeUpdateScreen(ModalScreen[None]):
     }
     SdeUpdateScreen #sdemsg { padding: 0 0 1 0; }
     SdeUpdateScreen #sdestatus { padding: 1 0 0 0; color: $text-muted; }
+    SdeUpdateScreen #sdeprogress { display: none; padding: 1 0 0 0; width: 100%; }
     SdeUpdateScreen #sdebuttons { height: auto; align: right middle; }
     SdeUpdateScreen Button { margin: 0 0 0 2; }
     """
@@ -1179,6 +1067,7 @@ class SdeUpdateScreen(ModalScreen[None]):
                     self._download_label(), id="sde-download", variant="primary", compact=True
                 )
             yield Static("", id="sdestatus")
+            yield ProgressBar(id="sdeprogress", show_eta=True)
 
     def _message(self) -> Text:
         text = Text()
@@ -1211,34 +1100,23 @@ class SdeUpdateScreen(ModalScreen[None]):
             button.disabled = True
         status = self.query_one("#sdestatus", Static)
         status.update("Downloading… this can take a minute.")
-        ok = await self._download_sde_fn()
+        bar = self.query_one("#sdeprogress", ProgressBar)
+        bar.display = True
+        # The download runs in a worker thread, so marshal each progress tick back onto
+        # the UI thread. total=None leaves the bar indeterminate (server sent no length).
+        app = self.app
+
+        def report(downloaded: int, total: int | None) -> None:
+            app.call_from_thread(bar.update, total=total, progress=downloaded)
+
+        ok = await self._download_sde_fn(report)
         if ok:
             self.dismiss()
             return
+        bar.display = False
         status.update("Download failed — check your connection, or continue without it.")
         self.query_one("#sde-skip", Button).disabled = False
         self.query_one("#sde-download", Button).disabled = False
-
-
-# Tracked-item verdict -> (label, style) for the Overview watchlist.
-_VERDICT_DISPLAY: dict[str, tuple[str, str]] = {
-    "BUY": ("BUY", "bold green"),
-    "SELL": ("SELL", "bold yellow"),
-    "HOLD": ("hold", "dim"),
-    "NODATA": ("no data", "dim"),
-}
-
-
-def _trend_cell(status: TrackedStatus) -> Text:
-    """An arrow + magnitude for how the recent price sits against the window median."""
-    if not status.has_data:
-        return Text("—", justify="right", style="dim")
-    trend = status.trend
-    if abs(trend) < 0.005:
-        return Text("→ flat", justify="right", style="dim")
-    if trend > 0:
-        return Text(f"↑ {trend:.0%}", justify="right", style="green")
-    return Text(f"↓ {abs(trend):.0%}", justify="right", style="red")
 
 
 class TradingScreen(Screen[None]):
@@ -1257,7 +1135,7 @@ class TradingScreen(Screen[None]):
     # Pane id -> the scrollable widget to focus when its tab is activated, so the arrow
     # keys (and hjkl) scroll it straight away without a click or tab-in.
     _TAB_FOCUS: ClassVar[dict[str, str]] = {
-        "overview": "#tracked",
+        "overview": "#digest",
         "trading": "#my-buys",
         "queue": "#skillqueue",
         "skills": "#skilltree",
@@ -1293,12 +1171,13 @@ class TradingScreen(Screen[None]):
         background: $boost;
     }
     TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
-    TradingScreen #tracked, TradingScreen #skillqueue,
+    TradingScreen #digest, TradingScreen #skillqueue,
     TradingScreen #skilltree, TradingScreen #assettree, TradingScreen #industry,
     TradingScreen #manufacturing {
         margin: 0 1;
         height: 1fr;
     }
+    TradingScreen #digest-body { padding: 1 2; }
     TradingScreen #my-buys, TradingScreen #my-sells {
         margin: 0 1;
         height: auto;
@@ -1316,17 +1195,21 @@ class TradingScreen(Screen[None]):
     TradingScreen #manufacturing-search { margin: 0 1; }
     """
 
-    def __init__(self, feed: RefreshFeed, interval_seconds: int) -> None:
+    def __init__(self, feed: RefreshFeed, interval_seconds: int, character_name: str) -> None:
         super().__init__()
         self._feed = feed
         self._interval = interval_seconds
+        self._character_name = character_name
         self._report: OpportunityReport | None = None
         self._character: CharacterReport | None = None
         # Signatures of the data last drawn into each view, so a periodic refresh
         # doesn't rebuild it (resetting cursor/scroll/expansions) when unchanged.
         self._skills_key: object | None = None
         self._assets_key: object | None = None
-        self._tracked_key: object | None = None
+        self._digest_key: object | None = None
+        # Assets value from the last market scan (phase 2); None until the first scan,
+        # so the phase-1 digest can show a placeholder and re-render when it arrives.
+        self._digest_assets_value: float | None = None
         self._listings_key: object | None = None
         self._builds_key: object | None = None
         self._asset_query: str = ""
@@ -1338,19 +1221,19 @@ class TradingScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("", id="location")
-        yield Static("Fetching market data… (select a row for its price chart)", id="status")
+        yield Static(self._character_name, id="location")
+        yield Static("Fetching market data…", id="status")
         with TabbedContent():
             with TabPane("Overview", id="overview"):
                 with Horizontal(id="stats"):
                     yield Static(id="stat-wallet", classes="stat")
-                    yield Static(id="stat-networth", classes="stat")
+                    yield Static(id="stat-assets", classes="stat")
+                    yield Static(id="stat-sp", classes="stat")
                     yield Static(id="stat-slots", classes="stat")
-                    yield Static(id="stat-tax", classes="stat")
-                    yield Static(id="stat-broker", classes="stat")
+                    yield Static(id="stat-industry", classes="stat")
                 yield Static("", id="training")
-                yield Static("TRACKED ITEMS — trend vs recent value", classes="section")
-                yield NavDataTable(id="tracked", zebra_stripes=True, cursor_type="row")
+                with VerticalScroll(id="digest"):
+                    yield Static("", id="digest-body")
             with TabPane("Trading", id="trading"):
                 yield Static("YOUR BUY ORDERS", classes="section", id="my-buys-section")
                 yield NavDataTable(id="my-buys", zebra_stripes=True, cursor_type="row")
@@ -1381,20 +1264,7 @@ class TradingScreen(Screen[None]):
         if event.data_table.id == "manufacturing":
             self._open_materials(event)
             return
-        if event.data_table.id != "tracked":
-            return  # order-overlay rows (my-buys/my-sells) carry no drill-down
-        if self._report is None or event.row_key.value is None:
-            return
-        type_id = int(event.row_key.value)
-        days = self._report.history.get(type_id)
-        status = next((s for s in self._report.tracked if s.type_id == type_id), None)
-        if days and status is not None and status.has_data:
-            name = self._report.names.get(type_id, str(type_id))
-            self.app.push_screen(
-                PriceHistoryScreen(
-                    name, days, fair_value=status.fair_value, current_price=status.price
-                )
-            )
+        # Remaining tables (my-buys / my-sells) carry no drill-down.
 
     def _open_skill_info(self, event: DataTable.RowSelected) -> None:
         if self._character is None or event.row_key.value is None:
@@ -1471,14 +1341,7 @@ class TradingScreen(Screen[None]):
         if blueprint is None:  # only blueprint leaves carry data, but guard anyway
             return
         name = self._character.names.get(node.type_id, str(node.type_id))
-        # Attach the build-vs-buy analysis if the market phase has produced one.
-        build: BuildAnalysis | None = None
-        if self._report is not None:
-            match = next(
-                (b for b in self._report.builds if b.blueprint_item_id == node.item_id), None
-            )
-            build = match.analysis if match is not None else None
-        self.app.push_screen(BlueprintInfoScreen(name, node, blueprint, build))
+        self.app.push_screen(BlueprintInfoScreen(name, node, blueprint))
 
     def _skill_name(self, skill_id: int, info: SkillReference | None) -> str:
         if info is not None:
@@ -1487,9 +1350,6 @@ class TradingScreen(Screen[None]):
         return self._character.names.get(skill_id, str(skill_id))
 
     def on_mount(self) -> None:
-        self.query_one("#tracked", DataTable).add_columns(
-            "Item", "Now", "Trend", "Fair", "Range", "Advice"
-        )
         for order_table in ("#my-buys", "#my-sells"):
             self.query_one(order_table, DataTable).add_columns(
                 "Item", "Where", "Qty", "Your price", "Best other", "Status"
@@ -1545,13 +1405,14 @@ class TradingScreen(Screen[None]):
             status.update(f"[Character load failed] {type(error).__name__}: {error}")
             return
         self._character = character_report
-        self.query_one("#location", Static).update(f"📍 {character_report.station_name}")
+        self.query_one("#location", Static).update(self._header_line(character_report))
         self._render_stats(character_report)
         self._render_training(character_report)
         self._render_skill_queue(character_report)
         self._render_skills(character_report)
         self._render_assets(character_report)
         self._render_industry(character_report)
+        self._render_digest(character_report)
 
         # Phase 2: the market scan is slower; character info is already on screen.
         status.update("Updating ESI data…")
@@ -1561,15 +1422,28 @@ class TradingScreen(Screen[None]):
             status.update(f"[Market scan failed] {type(error).__name__}: {error}")
             return
         self._report = report
-        self._render_tracked(report)
         self._render_listings(report)
         self._render_builds(report)
-        self._set_tile("#stat-networth", "NET WORTH", f"{_isk(report.net_worth)} ISK", "bold green")
+        # Assets value comes from the market scan; fill the tile (and the digest) now.
+        assets_value = sum(report.location_values.values())
+        self._digest_assets_value = assets_value
+        self._set_tile("#stat-assets", "ASSETS", f"{_isk(assets_value)} ISK", "bold green")
         self._render_assets(character_report, report.location_values)  # now with ISK values
-        buys = sum(1 for status_ in report.tracked if status_.verdict == "BUY")
-        sells = sum(1 for status_ in report.tracked if status_.verdict == "SELL")
+        self._render_digest(character_report)
+        new_items = len(character_report.completed_transactions)
         updated = character_report.captured_at.astimezone().strftime("%H:%M:%S")
-        status.update(f"{buys} to buy · {sells} to sell · updated {updated}")
+        status.update(f"{new_items} trades since your last visit · updated {updated}")
+
+    def _header_line(self, report: CharacterReport) -> str:
+        """Header identity: character, corp, alliance (if in one), current ship (if the
+        scope granted it), and where they actually are now — all joined into one line."""
+        parts = [self._character_name]
+        for value in (report.corporation_name, report.alliance_name, report.ship_name):
+            if value:
+                parts.append(value)
+        if report.current_location_name:
+            parts.append(report.current_location_name)
+        return "  ·  ".join(parts)
 
     def _set_tile(self, selector: str, label: str, value: str, value_style: str) -> None:
         content = Text()
@@ -1578,43 +1452,121 @@ class TradingScreen(Screen[None]):
         self.query_one(selector, Static).update(content)
 
     def _render_stats(self, report: CharacterReport) -> None:
-        fees = report.character.fees
         self._set_tile(
             "#stat-wallet", "WALLET", f"{_isk(report.character.wallet_balance)} ISK", "bold green"
         )
-        # Net worth needs market prices (phase 2); show a placeholder until they arrive.
-        self._set_tile("#stat-networth", "NET WORTH", "…", "bold green")
+        # Assets value needs market prices (phase 2); show the last value (or a placeholder
+        # on first load) so it doesn't flicker to "…" on every refresh.
+        assets = self._digest_assets_value
+        assets_text = "…" if assets is None else f"{_isk(assets)} ISK"
+        self._set_tile("#stat-assets", "ASSETS", assets_text, "bold green")
+        self._set_tile("#stat-sp", "SKILL POINTS", f"{_isk(report.total_sp)} SP", "bold cyan")
         self._set_tile(
             "#stat-slots", "FREE ORDER SLOTS", str(report.character.free_order_slots), "bold cyan"
         )
-        self._set_tile("#stat-tax", "SALES TAX", f"{fees.sales_tax:.2%}", "bold yellow")
-        self._set_tile("#stat-broker", "BROKER FEE", f"{fees.broker_fee:.2%}", "bold yellow")
+        free_industry = str(_free_manufacturing_slots(report))
+        self._set_tile("#stat-industry", "FREE INDUSTRY JOBS", free_industry, "bold cyan")
 
-    def _render_tracked(self, report: OpportunityReport) -> None:
-        """The Overview watchlist: every tracked item with today's price, its trend
-        against the recent median, where it sits in its range, and a BUY/SELL/HOLD
-        verdict. Selecting a row opens that item's price-history chart."""
-        key = tuple(report.tracked)  # frozen statuses -> compares by value; skip if unchanged
-        if key == self._tracked_key:
+    def _render_digest(self, report: CharacterReport) -> None:
+        """The Overview activity digest: a header of assets value and open/running counts,
+        then what's happened — trades since your last visit, jobs ready to deliver, and
+        skills that finished training. Skipped when unchanged, to keep scroll position."""
+        reference = report.captured_at
+        buys = [order for order in report.open_orders if order.is_buy_order]
+        sells = [order for order in report.open_orders if not order.is_buy_order]
+        running = [job for job in report.industry_jobs if _job_state(job, reference) == "active"]
+        ready = [job for job in report.industry_jobs if _job_state(job, reference) == "ready"]
+        finished = [
+            entry
+            for entry in report.skill_queue
+            if entry.finish_date is not None and entry.finish_date <= reference
+        ]
+        txns = report.completed_transactions
+        key = (
+            len(buys),
+            len(sells),
+            len(running),
+            tuple((job.job_id, _job_subject_type(job)) for job in ready),
+            tuple((entry.skill_id, entry.finished_level) for entry in finished),
+            tuple(
+                (txn.transaction_id, txn.is_buy, txn.type_id, txn.quantity, txn.unit_price)
+                for txn in txns
+            ),
+        )
+        if key == self._digest_key:
             return
-        self._tracked_key = key
-        table = self.query_one("#tracked", DataTable)
-        table.clear()
-        for status in report.tracked:
-            name = report.names.get(status.type_id, str(status.type_id))
-            label, style = _VERDICT_DISPLAY[status.verdict]
-            now = _isk(status.price) if status.price > 0.0 else "—"
-            fair = _isk(status.fair_value) if status.has_data else "—"
-            band = f"{status.channel_position:.0%}" if status.has_data else "—"
-            table.add_row(
-                Text(name, style="bold"),
-                Text(now, justify="right"),
-                _trend_cell(status),
-                Text(fair, justify="right", style="dim"),
-                Text(band, justify="right", style="dim"),
-                Text(label, style=style),
-                key=str(status.type_id),
-            )
+        self._digest_key = key
+
+        text = Text()
+        text.append(str(len(buys)), style="bold")
+        text.append(" buy / ", style="dim")
+        text.append(str(len(sells)), style="bold")
+        text.append(" sell orders open", style="dim")
+        text.append("   ·   ", style="dim")
+        text.append(str(len(running)), style="bold")
+        text.append(" jobs running\n", style="dim")
+
+        self._digest_transactions(text, report, txns)
+        self._digest_ready_jobs(text, report, ready)
+        self._digest_finished_training(text, report, finished)
+        self.query_one("#digest-body", Static).update(text)
+
+    def _theme_color(self, *names: str) -> str:
+        """The first set colour among ``names`` from the active theme, so the digest tracks
+        the user's theme instead of hard-coded colours. Falls back to the last name."""
+        theme = self.app.current_theme
+        for name in names:
+            value = getattr(theme, name, None)
+            if value:
+                return str(value)
+        return names[-1]
+
+    def _digest_header(self, text: Text, title: str) -> None:
+        text.append(f"\n{title}\n", style=f"bold {self._theme_color('accent', 'primary')}")
+
+    def _digest_transactions(
+        self, text: Text, report: CharacterReport, txns: list[WalletTransaction]
+    ) -> None:
+        self._digest_header(text, "Since your last visit")
+        if not txns:
+            text.append("  nothing new\n", style="dim italic")
+            return
+        buy_color = self._theme_color("warning", "secondary")
+        sell_color = self._theme_color("success", "primary")
+        for txn in txns:
+            name = report.names.get(txn.type_id, str(txn.type_id))
+            verb, style = ("Bought", buy_color) if txn.is_buy else ("Sold", sell_color)
+            text.append(f"  {verb:<7}", style=style)
+            text.append(f"{txn.quantity:,} x {name}")
+            text.append(f"   {_isk(txn.quantity * txn.unit_price)} ISK\n", style="dim")
+
+    def _digest_ready_jobs(
+        self, text: Text, report: CharacterReport, ready: list[IndustryJob]
+    ) -> None:
+        self._digest_header(text, "Ready to deliver")
+        if not ready:
+            text.append("  none\n", style="dim italic")
+            return
+        marker_style = f"bold {self._theme_color('success', 'primary')}"
+        for job in sorted(ready, key=lambda job: job.end_date):
+            subject = _job_subject_type(job)
+            name = report.names.get(subject, str(subject))
+            text.append("  ● ", style=marker_style)
+            text.append(name)
+            text.append(f"   {_activity_name(job.activity_id)} x{job.runs:,}\n", style="dim")
+
+    def _digest_finished_training(
+        self, text: Text, report: CharacterReport, finished: list[SkillQueueEntry]
+    ) -> None:
+        self._digest_header(text, "Finished training")
+        if not finished:
+            text.append("  none\n", style="dim italic")
+            return
+        marker_style = f"bold {self._theme_color('success', 'primary')}"
+        for entry in sorted(finished, key=lambda entry: entry.queue_position):
+            name = self._skill_name(entry.skill_id, report.skill_reference.get(entry.skill_id))
+            text.append("  ✓ ", style=marker_style)
+            text.append(f"{name} → L{entry.finished_level}\n")
 
     def _render_listings(self, report: OpportunityReport) -> None:
         # Both overlays share one signature — a periodic refresh with unchanged orders
@@ -2021,8 +1973,6 @@ class TradingScreen(Screen[None]):
         return report.names.get(item.type_id, str(item.type_id)).lower()
 
     def _location_label(self, location_id: int, report: CharacterReport) -> str:
-        if location_id == report.character.station_id:
-            return report.station_name  # the home place, named (incl. structures)
         return report.names.get(location_id, f"Location {location_id}")
 
 
@@ -2057,7 +2007,7 @@ class CharacterPickerScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("Select a character  ·  [a] add  ·  [d] remove", id="hint")
+        yield Static("Select a character", id="hint")
         yield NavOptionList(id="characters")
         yield Static("", id="picker_status")
         yield Footer()
@@ -2087,7 +2037,9 @@ class CharacterPickerScreen(Screen[None]):
 
     def select_character(self, character_id: int) -> None:
         self._last_character_id = character_id
-        self.app.push_screen(TradingScreen(self._make_feed(character_id), self._interval))
+        record = next((r for r in self._store.records() if r.character_id == character_id), None)
+        name = record.name if record is not None else str(character_id)
+        self.app.push_screen(TradingScreen(self._make_feed(character_id), self._interval, name))
 
     def action_resume(self) -> None:
         """Esc with a character already open returns to it, rather than sitting here."""

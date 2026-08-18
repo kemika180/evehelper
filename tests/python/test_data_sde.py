@@ -154,18 +154,16 @@ def test_ore_reprocessing_skills_reads_attribute_790(tmp_path: Path) -> None:
     sde.close()
 
 
-def test_station_security_resolves_a_stations_system_security(tmp_path: Path) -> None:
+def test_system_security_resolves_a_systems_security(tmp_path: Path) -> None:
     path = tmp_path / "sec.sqlite"
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE staStations (stationID INT, solarSystemID INT, regionID INT)")
     conn.execute("CREATE TABLE mapSolarSystems (solarSystemID INT, regionID INT, security FLOAT)")
-    conn.execute("INSERT INTO staStations VALUES (60003760, 30000142, 10000002)")  # Jita 4-4
     conn.execute("INSERT INTO mapSolarSystems VALUES (30000142, 10000002, 0.9459)")  # Jita, highsec
     conn.commit()
     conn.close()
     sde = SdeDatabase(path)
-    assert sde.station_security(60003760) == pytest.approx(0.9459)
-    assert sde.station_security(99999999) is None  # a player structure isn't in the SDE
+    assert sde.system_security(30000142) == pytest.approx(0.9459)
+    assert sde.system_security(99999999) is None  # a system not in the SDE
     sde.close()
 
 

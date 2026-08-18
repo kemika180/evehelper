@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import enum
 import zlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -25,6 +25,11 @@ import httpx
 FUZZWORK_SDE_URL = "https://www.fuzzwork.co.uk/dump/latest-sqlite.db.gz"
 _CHUNK = 1 << 20  # 1 MiB
 _GZIP_WBITS = 16 + zlib.MAX_WBITS  # decode a gzip (not raw zlib) stream
+
+# Called with (compressed bytes downloaded so far, total compressed bytes or None) after
+# each chunk, so a caller can drive a progress bar. Progress tracks the *compressed*
+# transfer — the slow part; decompression is effectively instant.
+ProgressFn = Callable[[int, int | None], None]
 
 
 class SdeState(enum.Enum):
@@ -88,21 +93,49 @@ def write_decompressed(chunks: Iterable[bytes], dest: Path) -> None:
     partial.replace(dest)
 
 
+def _content_length(response: httpx.Response) -> int | None:
+    """The response's compressed size from ``Content-Length``, or None if absent/unparsable."""
+    raw = response.headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _reporting(
+    chunks: Iterable[bytes], total: int | None, on_progress: ProgressFn | None
+) -> Iterable[bytes]:
+    """Yield chunks unchanged, reporting the running byte count to ``on_progress``."""
+    downloaded = 0
+    for chunk in chunks:
+        downloaded += len(chunk)
+        if on_progress is not None:
+            on_progress(downloaded, total)
+        yield chunk
+
+
 def download_sde(
     dest: Path,
     *,
     url: str = FUZZWORK_SDE_URL,
     contact: str = "",
     client: httpx.Client | None = None,
+    on_progress: ProgressFn | None = None,
 ) -> None:
-    """Stream the compressed SDE from ``url``, decompress, and write to ``dest``."""
+    """Stream the compressed SDE from ``url``, decompress, and write to ``dest``.
+
+    ``on_progress`` (if given) is called after each chunk with the compressed bytes
+    downloaded and the total from ``Content-Length`` (or None when the server omits it)."""
     owns_client = client is None
     client = client or httpx.Client(follow_redirects=True, timeout=None)
     try:
         headers = {"User-Agent": f"evetrader ({contact})"} if contact else {}
         with client.stream("GET", url, headers=headers) as response:
             response.raise_for_status()
-            write_decompressed(response.iter_bytes(_CHUNK), dest)
+            total = _content_length(response)
+            write_decompressed(_reporting(response.iter_bytes(_CHUNK), total, on_progress), dest)
     finally:
         if owns_client:
             client.close()

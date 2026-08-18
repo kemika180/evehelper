@@ -4,7 +4,7 @@ Inbound external data: extras are ignored (ESI may add fields) but every field w
 consume is strictly typed. These never cross into the analysis core as raw dicts.
 """
 
-from datetime import date, datetime
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
@@ -102,6 +102,38 @@ class CharacterOrder(_EsiModel):
     range: str
 
 
+class WalletTransaction(_EsiModel):
+    """One row of GET /characters/{id}/wallet/transactions/ (a completed trade).
+
+    ``is_buy`` distinguishes a purchase from a sale, so one fetch covers both sides
+    of the Overview's "since your last visit" feed."""
+
+    transaction_id: int
+    date: datetime
+    type_id: int
+    quantity: int
+    unit_price: float
+    is_buy: bool
+
+
+class CharacterAffiliation(_EsiModel):
+    """One row of POST /characters/affiliation/ — a character's corp (and alliance, if
+    any). Public, so it needs no token; the header shows corp/alliance from it."""
+
+    character_id: int
+    corporation_id: int
+    alliance_id: int | None = None
+    faction_id: int | None = None
+
+
+class CharacterShip(_EsiModel):
+    """GET /characters/{id}/ship/ — the ship the character is currently in."""
+
+    ship_type_id: int
+    ship_item_id: int
+    ship_name: str
+
+
 class Location(_EsiModel):
     """GET /characters/{id}/location/ — exactly one of station/structure is set."""
 
@@ -110,32 +142,17 @@ class Location(_EsiModel):
     structure_id: int | None = None
 
 
-class MarketOrder(_EsiModel):
-    """One row of GET /markets/{region_id}/orders/ (public regional market)."""
+class MarketPrice(_EsiModel):
+    """One row of GET /markets/prices/ — CCP's daily global reference prices for a type.
 
-    order_id: int
+    ``average_price`` is a smoothed market-wide average of what the item actually trades
+    for (what you'd realistically transact against, given EVE's slow mine/build/haul
+    cycles); ``adjusted_price`` is CCP's derived value used for industry job-cost/EIV.
+    Some types carry only one of the two, so both default to 0.0."""
+
     type_id: int
-    location_id: int
-    system_id: int
-    is_buy_order: bool
-    price: float
-    volume_remain: int
-    volume_total: int
-    min_volume: int
-    range: str
-    duration: int
-    issued: datetime
-
-
-class MarketHistoryDay(_EsiModel):
-    """One row of GET /markets/{region_id}/history/ (daily aggregates per type)."""
-
-    date: date
-    average: float
-    highest: float
-    lowest: float
-    order_count: int
-    volume: int
+    average_price: float = 0.0
+    adjusted_price: float = 0.0
 
 
 class EsiName(_EsiModel):
@@ -176,14 +193,6 @@ class CharacterAttributes(_EsiModel):
     willpower: int
 
 
-class Standing(_EsiModel):
-    """One row of GET /characters/{id}/standings/ (toward faction/corp/agent)."""
-
-    from_id: int
-    from_type: str
-    standing: float
-
-
 class SkillQueueEntry(_EsiModel):
     """One row of GET /characters/{id}/skillqueue/ (a queued skill level)."""
 
@@ -197,25 +206,6 @@ class SkillQueueEntry(_EsiModel):
     training_start_sp: int | None = None
     level_start_sp: int | None = None
     level_end_sp: int | None = None
-
-
-class Station(_EsiModel):
-    """GET /universe/stations/{station_id}/ — an NPC station's public data."""
-
-    station_id: int
-    name: str
-    system_id: int
-    type_id: int
-    # Owning corporation id (present for NPC stations); needed for broker standings.
-    owner: int | None = None
-
-
-class Corporation(_EsiModel):
-    """GET /corporations/{corporation_id}/ — only the fields we need."""
-
-    name: str
-    # Present for NPC corporations; the faction whose standing affects broker fees.
-    faction_id: int | None = None
 
 
 class Structure(_EsiModel):

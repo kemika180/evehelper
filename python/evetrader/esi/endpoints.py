@@ -17,19 +17,18 @@ from evetrader.esi.models import (
     Asset,
     AssetName,
     Blueprint,
+    CharacterAffiliation,
     CharacterAttributes,
     CharacterOrder,
+    CharacterShip,
     CharacterSkills,
-    Corporation,
     EsiName,
     IndustryJob,
     Location,
-    MarketHistoryDay,
-    MarketOrder,
+    MarketPrice,
     SkillQueueEntry,
-    Standing,
-    Station,
     Structure,
+    WalletTransaction,
 )
 
 _WALLET = TypeAdapter(float)
@@ -38,11 +37,11 @@ _ASSET_NAMES = TypeAdapter(list[AssetName])
 _BLUEPRINTS = TypeAdapter(list[Blueprint])
 _INDUSTRY_JOBS = TypeAdapter(list[IndustryJob])
 _CHARACTER_ORDERS = TypeAdapter(list[CharacterOrder])
-_MARKET_ORDERS = TypeAdapter(list[MarketOrder])
-_MARKET_HISTORY = TypeAdapter(list[MarketHistoryDay])
+_MARKET_PRICES = TypeAdapter(list[MarketPrice])
 _NAMES = TypeAdapter(list[EsiName])
-_STANDINGS = TypeAdapter(list[Standing])
+_AFFILIATIONS = TypeAdapter(list[CharacterAffiliation])
 _SKILLQUEUE = TypeAdapter(list[SkillQueueEntry])
+_TRANSACTIONS = TypeAdapter(list[WalletTransaction])
 
 
 async def fetch_wallet_balance(client: EsiClient, character_id: int, token: str) -> float:
@@ -82,6 +81,16 @@ async def fetch_industry_jobs(
     return _INDUSTRY_JOBS.validate_json(body)
 
 
+async def fetch_transactions(
+    client: EsiClient, character_id: int, token: str
+) -> list[WalletTransaction]:
+    """The character's recent wallet transactions (buys and sells). A single unpaged
+    response of the most recent trades; older history sits behind ``from_id``, which the
+    Overview digest never needs — it only reports trades since the previous session."""
+    body = await client.get(f"/characters/{character_id}/wallet/transactions/", token=token)
+    return _TRANSACTIONS.validate_json(body)
+
+
 async def fetch_open_orders(
     client: EsiClient, character_id: int, token: str
 ) -> list[CharacterOrder]:
@@ -94,22 +103,25 @@ async def fetch_location(client: EsiClient, character_id: int, token: str) -> Lo
     return Location.model_validate_json(body)
 
 
-async def fetch_market_orders(
-    client: EsiClient, region_id: int, type_id: int | None = None
-) -> list[MarketOrder]:
-    # Filtering by type keeps this to a handful of pages; a whole region is ~400.
-    params: dict[str, str | int] = {"order_type": "all"}
-    if type_id is not None:
-        params["type_id"] = type_id
-    pages = await client.get_all_pages(f"/markets/{region_id}/orders/", params=params)
-    return [order for page in pages for order in _MARKET_ORDERS.validate_json(page)]
+async def fetch_ship(client: EsiClient, character_id: int, token: str) -> CharacterShip:
+    """The ship the character is currently in (needs the read_ship_type scope)."""
+    body = await client.get(f"/characters/{character_id}/ship/", token=token)
+    return CharacterShip.model_validate_json(body)
 
 
-async def fetch_market_history(
-    client: EsiClient, region_id: int, type_id: int
-) -> list[MarketHistoryDay]:
-    body = await client.get(f"/markets/{region_id}/history/", params={"type_id": type_id})
-    return _MARKET_HISTORY.validate_json(body)
+async def fetch_affiliation(client: EsiClient, character_id: int) -> CharacterAffiliation | None:
+    """The character's corp/alliance via POST /characters/affiliation/ (public, no token).
+    Returns None if the id resolves to nothing."""
+    body = await client.post_json("/characters/affiliation/", body=[character_id])
+    rows = _AFFILIATIONS.validate_json(body)
+    return rows[0] if rows else None
+
+
+async def fetch_market_prices(client: EsiClient) -> list[MarketPrice]:
+    """CCP's daily global reference prices for every type — one cheap unpaged call,
+    the source for asset valuation and build costing (see ``MarketPrice``)."""
+    body = await client.get("/markets/prices/")
+    return _MARKET_PRICES.validate_json(body)
 
 
 async def fetch_skills(client: EsiClient, character_id: int, token: str) -> CharacterSkills:
@@ -124,11 +136,6 @@ async def fetch_attributes(
     return CharacterAttributes.model_validate_json(body)
 
 
-async def fetch_standings(client: EsiClient, character_id: int, token: str) -> list[Standing]:
-    body = await client.get(f"/characters/{character_id}/standings/", token=token)
-    return _STANDINGS.validate_json(body)
-
-
 async def fetch_skillqueue(
     client: EsiClient, character_id: int, token: str
 ) -> list[SkillQueueEntry]:
@@ -136,20 +143,10 @@ async def fetch_skillqueue(
     return _SKILLQUEUE.validate_json(body)
 
 
-async def fetch_station(client: EsiClient, station_id: int) -> Station:
-    body = await client.get(f"/universe/stations/{station_id}/")
-    return Station.model_validate_json(body)
-
-
 async def fetch_structure(client: EsiClient, structure_id: int, token: str) -> Structure:
     """A player-owned structure's public info; needs docking access (else 403)."""
     body = await client.get(f"/universe/structures/{structure_id}/", token=token)
     return Structure.model_validate_json(body)
-
-
-async def fetch_corporation(client: EsiClient, corporation_id: int) -> Corporation:
-    body = await client.get(f"/corporations/{corporation_id}/")
-    return Corporation.model_validate_json(body)
 
 
 async def resolve_names(client: EsiClient, ids: Sequence[int]) -> list[EsiName]:

@@ -2,11 +2,13 @@
 report into the table and panels."""
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from rich.text import Text
+from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Input, OptionList, Static, TabbedContent, Tree
 
 from evetrader.advisor.state import CharacterState, TradeSkills
@@ -17,16 +19,13 @@ from evetrader.esi.models import (
     Blueprint,
     CharacterAttributes,
     IndustryJob,
-    MarketHistoryDay,
     Skill,
     SkillQueueEntry,
+    WalletTransaction,
 )
-from evetrader.market.fees import EffectiveFees
-from evetrader.market.investment import TrackedStatus
 from evetrader.market.listings import ListingStatus
 from evetrader.market.production import (
     BlueprintNeeded,
-    BuildAnalysis,
     BuildInput,
     BuildStep,
     BuyItem,
@@ -37,7 +36,7 @@ from evetrader.market.production import (
     SourceNode,
 )
 from evetrader.market.training import TrainingTip
-from evetrader.data.sde_download import SdeState
+from evetrader.data.sde_download import ProgressFn, SdeState
 from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
 from evetrader.session import CharacterRecord, CharacterStore
 from evetrader.tui.app import (
@@ -47,7 +46,6 @@ from evetrader.tui.app import (
     EveTraderApp,
     IndustryJobScreen,
     MaterialsScreen,
-    PriceHistoryScreen,
     RefreshFeed,
     SdeCheckFn,
     SdeUpdateScreen,
@@ -177,12 +175,8 @@ def test_train_time_is_per_skill_not_cumulative() -> None:
 
 def _character_state() -> CharacterState:
     return CharacterState(
-        station_id=60003760,
         wallet_balance=5_000_000.0,
-        fees=EffectiveFees(sales_tax=0.036, broker_fee=0.0146),
-        trade_skills=TradeSkills(
-            accounting=5, broker_relations=4, trade=5, retail=0, wholesale=0, tycoon=0
-        ),
+        trade_skills=TradeSkills(trade=5, retail=0, wholesale=0, tycoon=0),
         free_order_slots=23,
     )
 
@@ -207,7 +201,6 @@ def _character_report() -> CharacterReport:
         attributes=CharacterAttributes(
             charisma=20, intelligence=20, memory=20, perception=20, willpower=20
         ),
-        holdings={34: 500},
         names={
             16622: "Accounting",
             3443: "Trade",
@@ -218,7 +211,6 @@ def _character_report() -> CharacterReport:
             587: "Rifter",
             60003760: "Jita IV - Moon 4 - CNAP",
         },
-        station_name="Jita IV - Moon 4 - Caldari Navy Assembly Plant",
         skill_reference={
             16622: SkillReference(
                 name="Accounting",
@@ -260,6 +252,22 @@ def _character_report() -> CharacterReport:
             ),
         ],
         open_orders=[],
+        completed_transactions=[
+            WalletTransaction(
+                transaction_id=1, date=datetime(2019, 12, 31, tzinfo=UTC),
+                type_id=587, quantity=2, unit_price=1_000_000.0, is_buy=False,  # sold 2 Rifters
+            ),
+            WalletTransaction(
+                transaction_id=2, date=datetime(2019, 12, 30, tzinfo=UTC),
+                type_id=34, quantity=1000, unit_price=5.0, is_buy=True,  # bought Tritanium
+            ),
+        ],
+        current_system_id=30000142,
+        total_sp=45_000_000,
+        corporation_name="Test Corporation",
+        alliance_name="Test Alliance",
+        ship_name="Rifter",
+        current_location_name="Amarr VIII - Emperor Family Academy",
     )
 
 
@@ -292,51 +300,8 @@ def _asset_tree() -> list[AssetLocation]:
     ]
 
 
-def _tracked(
-    type_id: int,
-    verdict: str,
-    price: float,
-    fair: float,
-    position: float,
-    *,
-    trend: float = 0.0,
-    held: int = 0,
-) -> TrackedStatus:
-    return TrackedStatus(
-        type_id=type_id,
-        verdict=verdict,
-        has_data=True,
-        price=price,
-        fair_value=fair,
-        channel_position=position,
-        trend=trend,
-        held=held,
-        note="test",
-    )
-
-
-def _history_days() -> list[MarketHistoryDay]:
-    return [
-        MarketHistoryDay.model_validate(
-            {
-                "date": f"2020-01-0{day}",
-                "average": 1000.0,
-                "highest": 1100.0,
-                "lowest": 900.0,
-                "order_count": 10,
-                "volume": 1000,
-            }
-        )
-        for day in range(1, 5)
-    ]
-
-
 def _opportunity_report() -> OpportunityReport:
     return OpportunityReport(
-        tracked=[
-            _tracked(34, "BUY", price=700.0, fair=1000.0, position=0.05, trend=-0.03),
-            _tracked(35, "SELL", price=1300.0, fair=1000.0, position=0.95, trend=0.08, held=500),
-        ],
         listing_buys=[],
         listing_sells=[
             ListingStatus(
@@ -345,20 +310,12 @@ def _opportunity_report() -> OpportunityReport:
             )
         ],
         names={34: "Tritanium", 35: "Pyerite", 587: "Rifter"},
-        history={34: _history_days(), 35: _history_days()},
         builds=[
-            BuildOpportunity(  # the owned Rifter Blueprint (item 13) builds at a profit
+            BuildOpportunity(  # the owned Rifter Blueprint (item 13)
                 blueprint_item_id=13,
                 blueprint_type_id=938,
                 product_type_id=587,
                 material_efficiency=10,
-                analysis=BuildAnalysis(
-                    runs=1,
-                    material_cost=1_200_000.0,
-                    product_value=1_850_000.0,
-                    net_product_value=1_800_000.0,
-                    missing_material_prices=(),
-                ),
             )
         ],
         sde_available=True,
@@ -380,13 +337,6 @@ def _build(
         blueprint_type_id=bp_type,
         product_type_id=product,
         material_efficiency=me,
-        analysis=BuildAnalysis(
-            runs=1,
-            material_cost=material_cost,
-            product_value=0.0,
-            net_product_value=0.0,
-            missing_material_prices=(),
-        ),
         tree=tree,
         plan=plan,
         training_tips=training_tips,
@@ -395,7 +345,6 @@ def _build(
 
 def _manufacturing_report() -> OpportunityReport:
     return OpportunityReport(
-        tracked=[],
         listing_buys=[],
         listing_sells=[],
         names={
@@ -411,7 +360,6 @@ def _manufacturing_report() -> OpportunityReport:
             3380: "Industry",
             3389: "Reprocessing Efficiency",
         },
-        history={},
         builds=[
             _build(
                 13, 900, 587, 10, 1_000_000.0,
@@ -513,13 +461,13 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
                 await pilot.pause()
 
             trading = app.screen  # top of the stack
-            # The Overview watchlist lists every tracked item with its verdict.
-            tracked = trading.query_one("#tracked", DataTable)
-            assert tracked.row_count == 2
-            buy_row = " ".join(str(cell) for cell in tracked.get_row_at(0))
-            assert "Tritanium" in buy_row and "BUY" in buy_row
-            sell_row = " ".join(str(cell) for cell in tracked.get_row_at(1))
-            assert "Pyerite" in sell_row and "SELL" in sell_row
+            # The Overview digest: counts, trades since last visit, and jobs ready to deliver.
+            digest = str(trading.query_one("#digest-body", Static).render())
+            assert "1 jobs running" in digest  # only the still-running manufacturing job
+            assert "Sold" in digest and "Rifter" in digest  # a completed sale
+            assert "Bought" in digest and "Tritanium" in digest  # a completed buy
+            # The finished ME-research job is ready for delivery (names its blueprint).
+            assert "Ready to deliver" in digest and "Rifter Blueprint" in digest
             # Active-listings overlay: the fixture has one undercut sell order, no buys.
             assert trading.query_one("#my-buys", DataTable).row_count == 0
             my_sells = trading.query_one("#my-sells", DataTable)
@@ -528,9 +476,19 @@ def test_selecting_a_character_opens_the_rendered_trading_screen(tmp_path: Path)
             assert "Pyerite" in listing_row and "undercut" in listing_row
             wallet_text = str(trading.query_one("#stat-wallet", Static).render())
             assert "WALLET" in wallet_text and "5.00m" in wallet_text
-            # The station shows its resolved name in the location row, not the id.
+            # Overview tiles: skill points and free manufacturing slots.
+            sp_text = str(trading.query_one("#stat-sp", Static).render())
+            assert "SKILL POINTS" in sp_text and "45.00m" in sp_text
+            industry_text = str(trading.query_one("#stat-industry", Static).render())
+            # 1 base manufacturing slot, minus the one running manufacturing job = 0 free.
+            assert "FREE INDUSTRY JOBS" in industry_text and "0" in industry_text
+            # The header names the character, corp, alliance, ship, and where they actually
+            # are now — the current location, not the home market.
             location_text = str(trading.query_one("#location", Static).render())
-            assert "Jita IV - Moon 4 - Caldari Navy Assembly Plant" in location_text
+            for token in ("Alice", "Test Corporation", "Test Alliance", "Rifter"):
+                assert token in location_text
+            assert "Amarr VIII - Emperor Family Academy" in location_text
+            assert "Jita IV - Moon 4 - Caldari Navy Assembly Plant" not in location_text
             # Completion is shown in local time (same conversion, TZ-independent here).
             expected_local = (
                 datetime(2026, 8, 1, 12, 0, tzinfo=UTC).astimezone().strftime("%Y-%m-%d %H:%M %Z")
@@ -595,7 +553,7 @@ def test_shift_hl_and_shift_arrows_cycle_tabs_from_a_focused_table(tmp_path: Pat
             # Opening a tab moves focus onto its inner table (not the tab strip), so
             # this exercises the "tab bar isn't selected" path.
             assert tabbed.active == "overview"
-            assert app.focused is not None and app.focused.id == "tracked"
+            assert app.focused is not None and app.focused.id == "digest"
 
             await pilot.press("L")  # Shift+l -> next tab
             await pilot.pause()
@@ -614,33 +572,6 @@ def test_shift_hl_and_shift_arrows_cycle_tabs_from_a_focused_table(tmp_path: Pat
             assert tabbed.active == "overview"
 
             await pilot.press("q")
-
-    asyncio.run(_drive())
-
-
-def test_selecting_a_buy_row_opens_the_price_chart(tmp_path: Path) -> None:
-    store = CharacterStore(tmp_path / "characters.json")
-    store.add(CharacterRecord(1, "Alice"))
-
-    async def _drive() -> None:
-        app = _build_app(store)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            picker = app.screen
-            assert isinstance(picker, CharacterPickerScreen)
-            picker.select_character(1)
-            for _ in range(4):
-                await pilot.pause()
-
-            trading = app.screen
-            tracked = trading.query_one("#tracked", DataTable)
-            tracked.focus()
-            await pilot.pause()
-            await pilot.press("enter")  # select the highlighted row
-            await pilot.pause()
-
-            assert isinstance(app.screen, PriceHistoryScreen)
-            await pilot.press("escape")
 
     asyncio.run(_drive())
 
@@ -930,22 +861,12 @@ def _app_with_assets(
     charge_types: frozenset[int] = frozenset(),
 ):
     base = _character_report()
-    report = CharacterReport(
-        base.captured_at,
-        base.character,
-        base.skill_queue,
-        base.skills,
-        base.attributes,
-        base.holdings,
-        {**base.names, **names},
-        base.station_name,
-        base.skill_reference,
-        locations,
-        {},
-        base.blueprints,
-        base.industry_jobs,
-        base.open_orders,
-        charge_types,
+    report = replace(
+        base,
+        names={**base.names, **names},
+        assets=locations,
+        asset_names={},
+        charge_type_ids=charge_types,
     )
 
     async def character() -> CharacterReport:
@@ -966,14 +887,13 @@ def _app_with_assets(
     )
 
 
-def test_overview_shows_net_worth_and_places_show_isk_value(tmp_path: Path) -> None:
+def test_overview_shows_assets_value_and_places_show_isk_value(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
     report = OpportunityReport(
-        tracked=[], listing_buys=[], listing_sells=[], names={}, history={},
+        listing_buys=[], listing_sells=[], names={},
         builds=[], sde_available=True,
         location_values={60003760: 1_500_000_000.0},
-        net_worth=2_000_000_000.0,
     )
 
     async def _drive() -> None:
@@ -988,8 +908,8 @@ def test_overview_shows_net_worth_and_places_show_isk_value(tmp_path: Path) -> N
 
             trading = app.screen
             assert isinstance(trading, TradingScreen)
-            networth = str(trading.query_one("#stat-networth", Static).render())
-            assert "2.00b" in networth  # filled in after the market phase
+            assets = str(trading.query_one("#stat-assets", Static).render())
+            assert "ASSETS" in assets and "1.50b" in assets  # filled in after the market phase
             # The place carrying the valued assets shows its total.
             tree = trading.query_one("#assettree", Tree)
             assert "1.50b" in str(tree.root.children[0].label)
@@ -1147,21 +1067,11 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
     )
     container = AssetNode(2, 17363, 1, "Hangar", True, (ship,))
     base = _character_report()
-    report = CharacterReport(
-        base.captured_at,
-        base.character,
-        base.skill_queue,
-        base.skills,
-        base.attributes,
-        base.holdings,
-        {**base.names, 24696: "Harbinger", 17363: "Container"},
-        base.station_name,
-        base.skill_reference,
-        [AssetLocation(60003760, (container,))],
-        {},
-        base.blueprints,
-        base.industry_jobs,
-        base.open_orders,
+    report = replace(
+        base,
+        names={**base.names, 24696: "Harbinger", 17363: "Container"},
+        assets=[AssetLocation(60003760, (container,))],
+        asset_names={},
     )
 
     async def _drive() -> None:
@@ -1274,9 +1184,6 @@ def test_selecting_a_blueprint_asset_opens_its_detail(tmp_path: Path) -> None:
             assert "Rifter Blueprint" in body
             assert "Blueprint Copy (BPC)" in body
             assert "42 runs remaining" in body
-            # The market phase has produced a build-vs-buy analysis for this blueprint.
-            assert "Build vs buy" in body
-            assert "BUILD" in body
             await pilot.press("escape")
 
     asyncio.run(_drive())
@@ -1314,7 +1221,7 @@ def test_manufacturing_tab_explains_a_missing_sde(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
     empty = OpportunityReport(
-        tracked=[], listing_buys=[], listing_sells=[], names={}, history={},
+        listing_buys=[], listing_sells=[], names={},
         builds=[], sde_available=False
     )
 
@@ -1479,7 +1386,7 @@ def test_launch_prompts_to_download_when_sde_missing(tmp_path: Path) -> None:
     store.add(CharacterRecord(1, "Alice"))
     calls: list[bool] = []
 
-    async def fake_download() -> bool:
+    async def fake_download(on_progress: ProgressFn) -> bool:
         calls.append(True)
         return True
 
@@ -1504,12 +1411,51 @@ def test_launch_prompts_to_download_when_sde_missing(tmp_path: Path) -> None:
     asyncio.run(_drive())
 
 
+def test_download_shows_progress_bar_and_fills_it(tmp_path: Path) -> None:
+    from textual.widgets import ProgressBar
+
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+
+    async def fake_download(on_progress: ProgressFn) -> bool:
+        # Report from a worker thread, exactly as the real asyncio.to_thread path does,
+        # so the screen's call_from_thread marshalling is exercised.
+        def worker() -> None:
+            on_progress(50, 100)
+            on_progress(100, 100)
+
+        await asyncio.to_thread(worker)
+        return True
+
+    async def fake_check() -> SdeState:
+        return SdeState.MISSING
+
+    seen: list[float | None] = []
+
+    async def _drive() -> None:
+        app = _build_app(store, download_sde_fn=fake_download, sde_check_fn=fake_check)
+        async with app.run_test() as pilot:
+            for _ in range(4):
+                await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, SdeUpdateScreen)
+            bar = screen.query_one("#sdeprogress", ProgressBar)
+            assert bar.display is False  # hidden until the download starts
+            await pilot.click("#sde-download")
+            for _ in range(6):
+                await pilot.pause()
+                seen.append(bar.percentage)
+
+    asyncio.run(_drive())
+    assert 1.0 in seen  # the bar reached 100% before the screen dismissed
+
+
 def test_launch_prompt_skips_without_downloading(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
     calls: list[bool] = []
 
-    async def fake_download() -> bool:
+    async def fake_download(on_progress: ProgressFn) -> bool:
         calls.append(True)
         return True
 
@@ -1535,7 +1481,7 @@ def test_launch_does_not_prompt_when_sde_current(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
 
-    async def fake_download() -> bool:
+    async def fake_download(on_progress: ProgressFn) -> bool:
         return True
 
     async def fake_check() -> SdeState:
@@ -1611,8 +1557,8 @@ def test_activating_a_tab_focuses_its_scrollable_area(tmp_path: Path) -> None:
 
             trading = app.screen
             assert isinstance(trading, TradingScreen)
-            # The default tab (Overview) auto-focuses its watchlist table.
-            assert app.focused is trading.query_one("#tracked", DataTable)
+            # The default tab (Overview) auto-focuses its scrollable digest.
+            assert app.focused is trading.query_one("#digest", VerticalScroll)
 
             for tab, widget_id in (
                 ("assets", "#assettree"),
@@ -1643,7 +1589,7 @@ def test_vim_keys_move_the_table_cursor(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            table = trading.query_one("#tracked", DataTable)
+            table = trading.query_one("#industry", DataTable)  # two jobs -> two rows
             table.focus()
             await pilot.pause()
             assert table.cursor_row == 0

@@ -7,8 +7,6 @@ with hand-built state.
 
 from dataclasses import dataclass
 
-from evetrader.market.fees import EffectiveFees
-
 # Market order-slot bonuses per skill level (base 5 orders). Game constants.
 _BASE_ORDER_SLOTS = 5
 _TRADE_PER_LEVEL = 4
@@ -19,10 +17,8 @@ _TYCOON_PER_LEVEL = 32
 
 @dataclass(frozen=True)
 class TradeSkills:
-    """Levels of the skills that affect fees and order slots."""
+    """Levels of the skills that grant market order slots."""
 
-    accounting: int
-    broker_relations: int
     trade: int
     retail: int
     wholesale: int
@@ -44,9 +40,7 @@ def total_order_slots(skills: TradeSkills) -> int:
 class CharacterState:
     """What the advisor needs to know about the character, right now."""
 
-    station_id: int
     wallet_balance: float
-    fees: EffectiveFees
     trade_skills: TradeSkills
     # Order slots not currently occupied by open orders.
     free_order_slots: int

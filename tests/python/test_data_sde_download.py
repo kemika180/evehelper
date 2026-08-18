@@ -86,3 +86,50 @@ def test_download_sde_streams_decompresses_and_sends_user_agent(tmp_path: Path) 
         download_sde(dest, url="https://example.test/sde.bz2", contact="c@e.com", client=client)
 
     assert dest.read_bytes() == payload
+
+
+def test_download_sde_reports_progress_against_content_length(tmp_path: Path) -> None:
+    payload = b"x" * 4096
+    compressed = gzip.compress(payload)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Explicit Content-Length so progress can report a total to divide against.
+        return httpx.Response(
+            200, content=compressed, headers={"Content-Length": str(len(compressed))}
+        )
+
+    ticks: list[tuple[int, int | None]] = []
+
+    def record(downloaded: int, total: int | None) -> None:
+        ticks.append((downloaded, total))
+    dest = tmp_path / "sde.sqlite"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        download_sde(
+            dest, url="https://example.test/sde.gz", client=client, on_progress=record
+        )
+
+    assert ticks  # at least one progress tick fired
+    assert all(total == len(compressed) for _, total in ticks)  # total is the compressed size
+    assert ticks[-1][0] == len(compressed)  # final tick reports the full transfer
+    assert [downloaded for downloaded, _ in ticks] == sorted(d for d, _ in ticks)  # monotonic
+
+
+def test_download_sde_progress_total_none_without_content_length(tmp_path: Path) -> None:
+    compressed = gzip.compress(b"y" * 100)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # httpx.Response computes Content-Length from content; strip it to simulate a
+        # chunked response so the total is unknown.
+        response = httpx.Response(200, content=compressed)
+        del response.headers["Content-Length"]
+        return response
+
+    ticks: list[tuple[int, int | None]] = []
+
+    def record(downloaded: int, total: int | None) -> None:
+        ticks.append((downloaded, total))
+    dest = tmp_path / "sde.sqlite"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        download_sde(dest, url="https://example.test/sde.gz", client=client, on_progress=record)
+
+    assert ticks and all(total is None for _, total in ticks)  # no length -> total is None

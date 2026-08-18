@@ -3,15 +3,17 @@ error-limit backoff, descriptive User-Agent, and bearer auth."""
 
 import asyncio
 import json
+import pickle
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
 
-from evetrader.config import Config, HomeMarket, RiskPreferences
+from evetrader.config import Config
 from evetrader.esi.client import EsiClient, EsiError
 
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -21,11 +23,6 @@ def _config() -> Config:
     return Config(
         esi_client_id="cid",
         contact="contact@example.com",
-        default_home=HomeMarket(region_id=10000002, station_id=60003760),
-        total_capital_isk=1.0,
-        risk=RiskPreferences(
-            min_margin=0.05, min_daily_isk_volume=0.0, max_capital_per_order_isk=1.0
-        ),
     )
 
 
@@ -220,6 +217,36 @@ def test_cache_persists_between_sessions(tmp_path: Path) -> None:
             third = EsiClient(_config(), http, now=clock, cache_path=cache_file)
             assert await third.get("/x/") == body1
             assert calls == 2  # one conditional request, no full re-fetch
+
+    asyncio.run(go())
+
+
+def test_region_order_book_is_not_persisted(tmp_path: Path) -> None:
+    clock = _Clock(datetime(2020, 1, 1, tzinfo=UTC))
+    cache_file = tmp_path / "esi_cache.pickle"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        expires = _http_date(clock.now + timedelta(minutes=5))
+        return httpx.Response(200, json=[1], headers={"Expires": expires, "ETag": "e"})
+
+    async def go() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http:
+            client = EsiClient(_config(), http, now=clock, cache_path=cache_file)
+            # The huge, short-lived region order book is served from the in-memory cache...
+            await client.get("/markets/10000002/orders/", params={"order_type": "all"})
+            assert await client.get("/markets/10000002/orders/", params={"order_type": "all"}) == (
+                b"[1]"  # second read within Expires -> no network, so it is cached in memory
+            )
+            await client.get("/universe/stations/60003760/")
+            client.save_cache()
+
+        with cache_file.open("rb") as handle:
+            _version, entries = pickle.load(handle)
+        paths = {urlsplit(url).path for url in entries}
+        # ...but it is left out of the on-disk cache; the long-lived station stays.
+        assert "/latest/markets/10000002/orders/" not in paths
+        assert "/latest/universe/stations/60003760/" in paths
 
     asyncio.run(go())
 

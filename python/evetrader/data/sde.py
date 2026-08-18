@@ -163,15 +163,14 @@ class SdeDatabase:
         ).fetchall()
         return {int(type_id): float(volume) for type_id, volume in rows if volume is not None}
 
-    def station_security(self, station_id: int) -> float | None:
-        """The security status of an NPC station's solar system, or None if the station
-        isn't in the SDE (a player structure, which the SDE doesn't carry). Lets the refine
-        model bias ore options toward what's mineable at the character's home security."""
+    def system_security(self, solar_system_id: int) -> float | None:
+        """The security status of a solar system, or None if it isn't in the SDE. Lets the
+        refine model bias ore options toward what's mineable where the character currently
+        is. Keyed by the system directly, so it works even when docked in a player structure
+        (which staStations doesn't carry)."""
         row = self._conn.execute(
-            "SELECT s.security FROM staStations st "
-            "JOIN mapSolarSystems s ON s.solarSystemID = st.solarSystemID "
-            "WHERE st.stationID = ?",
-            (station_id,),
+            "SELECT security FROM mapSolarSystems WHERE solarSystemID = ?",
+            (solar_system_id,),
         ).fetchone()
         return float(row[0]) if row is not None and row[0] is not None else None
 
