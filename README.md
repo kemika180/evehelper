@@ -67,16 +67,12 @@ theme = "nord"                  # any built-in Textual theme (default "kemika-pu
 # contact = "you@example.com"   # ESI User-Agent contact (URL or email); only for self-hosting
 ```
 
-For the crafting build-vs-buy analysis, download the EVE SDE (static data — blueprint
-recipes; ~250 MB, one-time, re-run to update after a patch):
-
-```
-uv run evetrader sde
-```
-
-It's fetched from the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLite mirror into
-your local data dir (gitignored, never committed). The rest of the app works without
-it; only the build-vs-buy view needs it. You can also grab it from the launch prompt.
+The **Crafting** tab needs the EVE SDE (static data — blueprint recipes; ~250 MB). You
+don't have to do anything: evetrader offers to download it on launch (with a progress
+bar) whenever it's missing or a newer version has been published — just accept the
+prompt. It's pulled from the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLite mirror
+into your local data dir (gitignored, never committed). The rest of the app works
+without it; only build-vs-buy needs it.
 
 ## Checks
 
