@@ -5,7 +5,7 @@ state and live market data from ESI (the official EVE REST API), analyses tradin
 opportunities, and tells you what to do while you play. It **never** automates
 transactions — EVE forbids that — it only advises; you execute the trades in-game.
 
-Pure Python. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestones.
+Pure Python.
 
 ## Status
 

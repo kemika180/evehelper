@@ -34,7 +34,7 @@ testpaths = ["tests/python"]
 
 # The non-negotiable pure-core boundary, enforced mechanically: the analysis
 # core (market/, advisor/) is deterministic and must never reach the I/O shell
-# (esi/, data/) or the network. See ARCHITECTURE.md § Internal boundary contract.
+# (esi/, data/) or the network.
 [tool.importlinter]
 root_package = "evetrader"
 include_external_packages = true

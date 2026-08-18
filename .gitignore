@@ -20,3 +20,5 @@ dist/
 # Local agent/dev-process guidance — kept locally, never committed to the remote
 CLAUDE.md
 WORKFLOW.md
+# Internal design/roadmap doc — kept local, not shared in the repo
+ARCHITECTURE.md
