@@ -73,14 +73,3 @@ bar) whenever it's missing or a newer version has been published — just accept
 prompt. It's pulled from the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLite mirror
 into your local data dir (gitignored, never committed). The rest of the app works
 without it; only build-vs-buy needs it.
-
-## Checks
-
-All four must pass before any change is considered complete:
-
-```
-uv run pytest tests/python -v
-uv run mypy --strict python/
-uv run ruff check python/
-uv run lint-imports          # pure-core import boundary
-```
