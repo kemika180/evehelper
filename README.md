@@ -1,29 +1,41 @@
 # evetrader
 
-A terminal (TUI) money-making advisor for EVE Online. It reads your character
-state and live market data from ESI (the official EVE REST API), analyses trading
-opportunities, and tells you what to do while you play. It **never** automates
-transactions — EVE forbids that — it only advises; you execute the trades in-game.
+A terminal (TUI) companion for EVE Online: a **read-only dashboard** for one or more
+of your characters — net worth, assets, skills, industry jobs, and your live market
+orders — plus a crafting **build-vs-buy** advisor. It reads everything from ESI (the
+official EVE API) and the static data export, and shows you where you stand. It
+**never** writes to the game or automates anything (EVE forbids that) — you act
+in-game; evetrader only informs.
 
 Pure Python.
 
-## Status
+## What it shows
 
-Working TUI. It reads your character and live market data and shows: net worth (assets
-valued at Jita reference prices), a crafting **build-vs-buy** analysis with quick-train
-skill tips, an asset browser (into containers and ships), your full skill list and training
-queue, and your open orders flagged best-price or undercut. Multi-character. It never
-touches the game economy — you execute every trade in-game.
+Multi-character — a picker on launch, then a per-character view with these tabs:
+
+- **Overview** — net worth (your assets valued at Jita reference prices), wallet, skill
+  points, free order/industry slots, and an activity digest: trades since your last
+  visit, industry jobs ready to deliver, and skills that finished training.
+- **Trading** — your own open buy/sell orders, each flagged best-price or undercut. (It
+  does *not* scan the market to suggest new trades — it tracks the orders you've placed.)
+- **Crafting** — for a blueprint you own, a build-vs-buy analysis: the full self-source
+  production tree and its shopping/mining plan, priced against Jita, with quick-train
+  skill tips that would lower the build cost. Needs the SDE (below).
+- **Industry** — your running and ready-to-deliver industry jobs.
+- **Skills** / **Skill Queue** — your full skill list (with level pips) and the training
+  queue with live SP progress; select any skill for details.
+- **Assets** — a searchable browser of everything you own, expandable into containers
+  and ships.
 
 ## How it works
 
 ```
-ESI + SDE                       pure analysis core        you
-─────────                       ──────────────────        ───
-wallet / assets / orders   ┐                          ┌─ "build X yourself: mats
-skills / location / ship   │                          │   cost C vs buy at P — and
-public market prices       ├─►  analysis (market/) ──►│   train skill S to save more"
-blueprint recipes (SDE)    ┘                          └─ (you do it in-game)
+ESI + SDE (read-only)               evetrader (TUI)             you
+─────────────────────               ───────────────            ───
+wallet · assets · orders        ┌─ dashboard: net worth,   ┌─ decide what to
+skills · industry · location ─► │  assets, skills, jobs,    │  train / build / list,
+prices · blueprint recipes      └─ your live orders  +      │  then act in-game
+                                   crafting build-vs-buy  ──┘
 ```
 
 All network I/O is confined to `esi/` and `data/`; `market/` and `advisor/` are a
@@ -43,13 +55,13 @@ uv run evetrader
 On first launch, press **`a`** to add your character: your browser opens EVE's official
 SSO, you log in with your own EVE account and authorize the read-only scopes, and the
 token is stored in your OS keyring (never in the repo). Then select the character to open
-the advisor.
+its dashboard.
 
 Configuration is optional. To customise, create `~/.config/evetrader/config.toml` — every
 field has a default, so include only what you want to change:
 
 ```toml
-refresh_interval_seconds = 60   # how often the advisor re-runs (default 300)
+refresh_interval_seconds = 60   # how often it re-reads ESI (default 300)
 theme = "nord"                  # any built-in Textual theme (default "kemika-purple")
 # esi_client_id = "..."         # only if self-hosting your own ESI app registration
 # contact = "you@example.com"   # ESI User-Agent contact (URL or email); only for self-hosting
