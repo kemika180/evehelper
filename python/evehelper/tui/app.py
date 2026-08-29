@@ -86,6 +86,23 @@ def _isk(value: float) -> str:
     return f"{value:.0f}"
 
 
+def _isk_scale(peak: float) -> tuple[float, str]:
+    """A shared divisor and unit label for an ISK axis, picked from the largest value on it.
+    Only steps up to the next unit once the peak is well into it (5x), so the top tick reads
+    like "30 billion", never "1.0 billion" over "0.1 billion": 30bn -> (1e9, "billion ISK"),
+    4bn -> (1e6, "million ISK")."""
+    magnitude = abs(peak)
+    if magnitude >= 5e12:
+        return 1e12, "trillion ISK"
+    if magnitude >= 5e9:
+        return 1e9, "billion ISK"
+    if magnitude >= 5e6:
+        return 1e6, "million ISK"
+    if magnitude >= 5e3:
+        return 1e3, "thousand ISK"
+    return 1.0, "ISK"
+
+
 def _duration(seconds: float) -> str:
     """Compact training time: 7800 -> "2h10m", 2700 -> "45m", 2360760 -> "27d7h"."""
     total = int(seconds)
@@ -1506,9 +1523,11 @@ class TradingScreen(Screen[None]):
         plt.clear_figure()
         if history:
             positions = [float(i) for i in range(len(history))]
-            totals = [sample.total / 1_000_000 for sample in history]  # millions of ISK
-            wallets = [sample.wallet_balance / 1_000_000 for sample in history]
-            assets = [sample.assets_value / 1_000_000 for sample in history]
+            # Scale every line by the same divisor, chosen from the largest value on the axis.
+            divisor, unit = _isk_scale(max(sample.total for sample in history))
+            totals = [sample.total / divisor for sample in history]
+            wallets = [sample.wallet_balance / divisor for sample in history]
+            assets = [sample.assets_value / divisor for sample in history]
             plt.plot(positions, totals, marker="braille", label="Total", color="cyan")
             plt.plot(positions, wallets, marker="braille", label="Wallet", color="green")
             plt.plot(positions, assets, marker="braille", label="Assets", color="orange")
@@ -1519,7 +1538,7 @@ class TradingScreen(Screen[None]):
                 history[int(i)].captured_at.astimezone().strftime("%m-%d %H:%M") for i in ticks
             ]
             plt.xticks(ticks, labels)
-            plt.title("Estimated wealth (million ISK)")
+            plt.title(f"Estimated wealth ({unit})")
         else:
             plt.title("Estimated wealth — recording as the market scan runs…")
         widget.refresh()

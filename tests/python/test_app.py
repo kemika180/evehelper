@@ -55,6 +55,7 @@ from evehelper.tui.app import (
     TradingScreen,
     _completion,
     _current_training,
+    _isk_scale,
     _job_state,
     _job_subject_type,
     _skill_progress,
@@ -701,6 +702,14 @@ def test_refresh_records_wealth_and_exports_tsv(tmp_path: Path) -> None:
             await pilot.press("q")
 
     asyncio.run(_drive())
+
+
+def test_isk_scale_steps_up_only_when_well_into_a_unit() -> None:
+    assert _isk_scale(30_000_000_000.0) == (1e9, "billion ISK")  # 30bn -> billions
+    assert _isk_scale(4_000_000_000.0) == (1e6, "million ISK")  # 4bn stays in millions
+    assert _isk_scale(6_000_000_000_000.0) == (1e12, "trillion ISK")
+    assert _isk_scale(5_000_000.0) == (1e6, "million ISK")  # exactly at the 5x cutoff
+    assert _isk_scale(900.0) == (1.0, "ISK")
 
 
 def _pip_styles(pips: Text) -> list[str]:
