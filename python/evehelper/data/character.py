@@ -37,7 +37,7 @@ async def build_character_state(
     skills: CharacterSkills,
     open_orders: list[CharacterOrder],
 ) -> CharacterState:
-    """Fetch character data and build the pure CharacterState for the advisor.
+    """Fetch character data and build the pure CharacterState for the analysis core.
 
     `skills` and `open_orders` are passed in (already fetched by the caller, which
     also surfaces them to the TUI) so they aren't fetched twice.

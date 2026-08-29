@@ -39,7 +39,7 @@ from evehelper.market.production import (
 )
 from evehelper.market.training import TrainingTip
 from evehelper.data.sde_download import ProgressFn, SdeState
-from evehelper.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
+from evehelper.pipeline import BuildOpportunity, CharacterReport, MarketReport
 from evehelper.session import CharacterRecord, CharacterStore
 from evehelper.tui.app import (
     BlueprintInfoScreen,
@@ -52,7 +52,7 @@ from evehelper.tui.app import (
     SdeCheckFn,
     SdeUpdateScreen,
     SkillInfoScreen,
-    TradingScreen,
+    DashboardScreen,
     _completion,
     _current_training,
     _isk_scale,
@@ -303,8 +303,8 @@ def _asset_tree() -> list[AssetLocation]:
     ]
 
 
-def _opportunity_report() -> OpportunityReport:
-    return OpportunityReport(
+def _market_report() -> MarketReport:
+    return MarketReport(
         listing_buys=[],
         listing_sells=[
             ListingStatus(
@@ -346,8 +346,8 @@ def _build(
     )
 
 
-def _manufacturing_report() -> OpportunityReport:
-    return OpportunityReport(
+def _manufacturing_report() -> MarketReport:
+    return MarketReport(
         listing_buys=[],
         listing_sells=[],
         names={
@@ -400,19 +400,19 @@ def _manufacturing_report() -> OpportunityReport:
 
 def _build_app(
     store: CharacterStore,
-    opportunity: OpportunityReport | None = None,
+    market_report: MarketReport | None = None,
     download_sde_fn: DownloadSdeFn | None = None,
     sde_check_fn: SdeCheckFn | None = None,
     wealth: WealthStore | None = None,
 ) -> EveHelperApp:
-    report = opportunity if opportunity is not None else _opportunity_report()
+    report = market_report if market_report is not None else _market_report()
     wealth_store = wealth if wealth is not None else WealthStore(Path(mkdtemp()) / "wealth.json")
 
     def make_feed(character_id: int) -> RefreshFeed:
         async def character() -> CharacterReport:
             return _character_report()
 
-        async def opportunities(state: CharacterState) -> OpportunityReport:
+        async def market(state: CharacterState) -> MarketReport:
             return report
 
         def export_wealth() -> Path:
@@ -422,7 +422,7 @@ def _build_app(
 
         return RefreshFeed(
             character=character,
-            opportunities=opportunities,
+            market=market,
             record_wealth=lambda sample: wealth_store.record(character_id, sample),
             wealth_history=lambda: wealth_store.history(character_id),
             export_wealth=export_wealth,
@@ -535,7 +535,7 @@ def test_escape_on_picker_resumes_the_last_character(tmp_path: Path) -> None:
             picker.select_character(1)
             for _ in range(3):
                 await pilot.pause()
-            assert isinstance(app.screen, TradingScreen)
+            assert isinstance(app.screen, DashboardScreen)
 
             await pilot.press("escape")  # trading -> picker
             await pilot.pause()
@@ -544,7 +544,7 @@ def test_escape_on_picker_resumes_the_last_character(tmp_path: Path) -> None:
             await pilot.press("escape")  # picker -> back to the character
             for _ in range(3):
                 await pilot.pause()
-            assert isinstance(app.screen, TradingScreen)
+            assert isinstance(app.screen, DashboardScreen)
 
     asyncio.run(_drive())
 
@@ -564,7 +564,7 @@ def test_shift_hl_and_shift_arrows_cycle_tabs_from_a_focused_table(tmp_path: Pat
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             tabbed = trading.query_one(TabbedContent)
             # Opening a tab moves focus onto its inner table (not the tab strip), so
             # this exercises the "tab bar isn't selected" path.
@@ -623,7 +623,7 @@ def test_selecting_a_skill_row_opens_the_skill_info_popup(tmp_path: Path) -> Non
             assert "Reduces sales tax." in popup_text  # bundled description
             await pilot.click("#skillbody")  # clicking the popup dismisses it
             await pilot.pause()
-            assert isinstance(app.screen, TradingScreen)
+            assert isinstance(app.screen, DashboardScreen)
 
     asyncio.run(_drive())
 
@@ -654,7 +654,7 @@ def test_skill_queue_refresh_keeps_the_selected_row(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "queue"
             await pilot.pause()
             table = trading.query_one("#skillqueue", DataTable)
@@ -692,7 +692,7 @@ def test_refresh_records_wealth_and_exports_tsv(tmp_path: Path) -> None:
             assert history[0].total == 5_000_000.0
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "wealth"
             await pilot.pause()
             await pilot.press("e")  # export to TSV
@@ -862,7 +862,7 @@ def test_skill_tree_survives_a_refresh_when_skills_unchanged(tmp_path: Path) -> 
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             tree = trading.query_one("#skilltree", Tree)
             trade = next(node for node in tree.root.children if str(node.label) == "Trade")
             assert trade.is_expanded  # groups start open
@@ -972,8 +972,8 @@ def _app_with_assets(
     async def character() -> CharacterReport:
         return report
 
-    async def opportunities(state: CharacterState) -> OpportunityReport:
-        return _opportunity_report()
+    async def market(state: CharacterState) -> MarketReport:
+        return _market_report()
 
     async def login_fn() -> CharacterIdentity:
         return CharacterIdentity(999, "New Char")
@@ -982,7 +982,7 @@ def _app_with_assets(
         store,
         lambda cid: RefreshFeed(
             character=character,
-            opportunities=opportunities,
+            market=market,
             record_wealth=lambda sample: None,
             wealth_history=list,
             export_wealth=lambda: Path("wealth.tsv"),
@@ -996,7 +996,7 @@ def _app_with_assets(
 def test_overview_shows_assets_value_and_places_show_isk_value(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
-    report = OpportunityReport(
+    report = MarketReport(
         listing_buys=[], listing_sells=[], names={},
         builds=[], sde_available=True,
         location_values={60003760: 1_500_000_000.0},
@@ -1013,7 +1013,7 @@ def test_overview_shows_assets_value_and_places_show_isk_value(tmp_path: Path) -
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             assets = str(trading.query_one("#stat-assets", Static).render())
             assert "ASSETS" in assets and "1.50b" in assets  # filled in after the market phase
             # The place carrying the valued assets shows its total.
@@ -1184,8 +1184,8 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
         async def character() -> CharacterReport:
             return report
 
-        async def opportunities(state: CharacterState) -> OpportunityReport:
-            return _opportunity_report()
+        async def market(state: CharacterState) -> MarketReport:
+            return _market_report()
 
         async def login_fn() -> CharacterIdentity:
             return CharacterIdentity(999, "New Char")
@@ -1194,7 +1194,7 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
             store,
             lambda cid: RefreshFeed(
             character=character,
-            opportunities=opportunities,
+            market=market,
             record_wealth=lambda sample: None,
             wealth_history=list,
             export_wealth=lambda: Path("wealth.tsv"),
@@ -1316,7 +1316,7 @@ def test_manufacturing_tab_ranks_owned_blueprints(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "manufacturing-tab"
             await pilot.pause()
             table = trading.query_one("#manufacturing", DataTable)
@@ -1332,7 +1332,7 @@ def test_manufacturing_tab_ranks_owned_blueprints(tmp_path: Path) -> None:
 def test_manufacturing_tab_explains_a_missing_sde(tmp_path: Path) -> None:
     store = CharacterStore(tmp_path / "characters.json")
     store.add(CharacterRecord(1, "Alice"))
-    empty = OpportunityReport(
+    empty = MarketReport(
         listing_buys=[], listing_sells=[], names={},
         builds=[], sde_available=False
     )
@@ -1348,7 +1348,7 @@ def test_manufacturing_tab_explains_a_missing_sde(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "manufacturing-tab"
             await pilot.pause()
             assert trading.query_one("#manufacturing", DataTable).row_count == 0
@@ -1376,7 +1376,7 @@ def test_manufacturing_dedupes_counts_searches_and_sorts(tmp_path: Path) -> None
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "manufacturing-tab"
             await pilot.pause()
             table = trading.query_one("#manufacturing", DataTable)
@@ -1420,7 +1420,7 @@ def test_manufacturing_row_opens_material_breakdown(
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "manufacturing-tab"
             await pilot.pause()
             table = trading.query_one("#manufacturing", DataTable)
@@ -1477,7 +1477,7 @@ def test_manufacturing_refresh_preserves_cursor_when_unchanged(tmp_path: Path) -
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "manufacturing-tab"
             await pilot.pause()
             table = trading.query_one("#manufacturing", DataTable)
@@ -1626,7 +1626,7 @@ def test_industry_tab_lists_jobs_and_opens_detail(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "industry-tab"
             await pilot.pause()
             table = trading.query_one("#industry", DataTable)
@@ -1668,7 +1668,7 @@ def test_activating_a_tab_focuses_its_scrollable_area(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             # The default tab (Overview) auto-focuses its scrollable digest.
             assert app.focused is trading.query_one("#digest", VerticalScroll)
 
@@ -1732,7 +1732,7 @@ def test_slash_focuses_the_asset_search_box(tmp_path: Path) -> None:
                 await pilot.pause()
 
             trading = app.screen
-            assert isinstance(trading, TradingScreen)
+            assert isinstance(trading, DashboardScreen)
             trading.query_one(TabbedContent).active = "assets"
             await pilot.pause()
             assert app.focused is trading.query_one("#assettree", Tree)

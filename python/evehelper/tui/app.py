@@ -1,4 +1,4 @@
-"""The evehelper TUI: a character picker, then the per-character advisor screen.
+"""The evehelper TUI: a character picker, then the per-character dashboard screen.
 
 On launch you pick a set-up character (or add/remove one); selecting it opens the
 trading screen. Refresh is timer-driven, never keystroke-driven; the injected
@@ -58,7 +58,7 @@ from evehelper.esi.models import (
     WalletTransaction,
 )
 from evehelper.market.listings import ListingStatus
-from evehelper.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
+from evehelper.pipeline import BuildOpportunity, CharacterReport, MarketReport
 from evehelper.session import CharacterRecord, CharacterStore
 from evehelper.tui.themes import KEMIKA_PURPLE
 
@@ -607,7 +607,7 @@ class NavOptionList(OptionList):
 
 
 FetchCharacter = Callable[[], Awaitable[CharacterReport]]
-FetchOpportunities = Callable[[CharacterReport], Awaitable[OpportunityReport]]
+FetchMarketReport = Callable[[CharacterReport], Awaitable[MarketReport]]
 # Append a wealth sample for this character (throttled by the store); read back the
 # recorded history for the plot; and export it to a TSV file, returning where it landed.
 RecordWealth = Callable[[WealthSample], None]
@@ -629,7 +629,7 @@ class RefreshFeed:
     slower market scan."""
 
     character: FetchCharacter
-    opportunities: FetchOpportunities
+    market: FetchMarketReport
     record_wealth: RecordWealth
     wealth_history: WealthHistory
     export_wealth: ExportWealth
@@ -1148,8 +1148,9 @@ class SdeUpdateScreen(ModalScreen[None]):
         self.query_one("#sde-download", Button).disabled = False
 
 
-class TradingScreen(Screen[None]):
-    """Per-character advisor view: opportunities plus character and skill-queue."""
+class DashboardScreen(Screen[None]):
+    """Per-character dashboard: net worth, wealth trend, own orders, skills, assets,
+    industry, and the crafting build-vs-buy advisor across tabs."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         ("escape", "app.pop_screen", "Switch character"),
@@ -1181,51 +1182,51 @@ class TradingScreen(Screen[None]):
     }
 
     DEFAULT_CSS = """
-    TradingScreen #location { padding: 0 2; text-style: bold; color: $accent; }
-    TradingScreen #status { padding: 0 2; color: $text-muted; }
+    DashboardScreen #location { padding: 0 2; text-style: bold; color: $accent; }
+    DashboardScreen #status { padding: 0 2; color: $text-muted; }
     /* Fill the window down the tab chain so only the inner tables/tree scroll —
        otherwise every level is height:auto and the screen scrolls too. */
-    TradingScreen TabbedContent,
-    TradingScreen ContentSwitcher,
-    TradingScreen TabPane { height: 1fr; }
-    TradingScreen #stats { height: 6; padding: 1 1 0 1; }
-    TradingScreen .stat {
+    DashboardScreen TabbedContent,
+    DashboardScreen ContentSwitcher,
+    DashboardScreen TabPane { height: 1fr; }
+    DashboardScreen #stats { height: 6; padding: 1 1 0 1; }
+    DashboardScreen .stat {
         width: 1fr;
         height: 100%;
         border: round $primary;
         padding: 0 1;
         margin: 0 1 0 0;
     }
-    TradingScreen #training {
+    DashboardScreen #training {
         margin: 1 2 0 2;
         padding: 0 1;
         background: $boost;
     }
-    TradingScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
-    TradingScreen #digest, TradingScreen #skillqueue,
-    TradingScreen #skilltree, TradingScreen #assettree, TradingScreen #industry,
-    TradingScreen #manufacturing {
+    DashboardScreen .section { padding: 1 2 0 2; text-style: bold; color: $accent; }
+    DashboardScreen #digest, DashboardScreen #skillqueue,
+    DashboardScreen #skilltree, DashboardScreen #assettree, DashboardScreen #industry,
+    DashboardScreen #manufacturing {
         margin: 0 1;
         height: 1fr;
     }
-    TradingScreen #digest-body { padding: 1 2; }
-    TradingScreen #my-buys, TradingScreen #my-sells {
+    DashboardScreen #digest-body { padding: 1 2; }
+    DashboardScreen #my-buys, DashboardScreen #my-sells {
         margin: 0 1;
         height: auto;
         max-height: 8;
     }
-    TradingScreen #assetsearch { margin: 0 1; }
+    DashboardScreen #assetsearch { margin: 0 1; }
     /* Make the selected row unmistakable — the theme default is a muted purple
        that's easy to lose, especially over zebra stripes. */
-    TradingScreen DataTable > .datatable--cursor {
+    DashboardScreen DataTable > .datatable--cursor {
         background: $accent;
         color: $background;
         text-style: bold;
     }
-    TradingScreen #manufacturing-hint { padding: 0 2; color: $text-muted; }
-    TradingScreen #manufacturing-search { margin: 0 1; }
-    TradingScreen #wealth-hint { padding: 0 2; color: $text-muted; }
-    TradingScreen #wealthplot { height: 1fr; margin: 0 1; }
+    DashboardScreen #manufacturing-hint { padding: 0 2; color: $text-muted; }
+    DashboardScreen #manufacturing-search { margin: 0 1; }
+    DashboardScreen #wealth-hint { padding: 0 2; color: $text-muted; }
+    DashboardScreen #wealthplot { height: 1fr; margin: 0 1; }
     """
 
     def __init__(self, feed: RefreshFeed, interval_seconds: int, character_name: str) -> None:
@@ -1233,7 +1234,7 @@ class TradingScreen(Screen[None]):
         self._feed = feed
         self._interval = interval_seconds
         self._character_name = character_name
-        self._report: OpportunityReport | None = None
+        self._report: MarketReport | None = None
         self._character: CharacterReport | None = None
         # Signatures of the data last drawn into each view, so a periodic refresh
         # doesn't rebuild it (resetting cursor/scroll/expansions) when unchanged.
@@ -1453,7 +1454,7 @@ class TradingScreen(Screen[None]):
         # Phase 2: the market scan is slower; character info is already on screen.
         status.update("Updating ESI data…")
         try:
-            report = await self._feed.opportunities(character_report)
+            report = await self._feed.market(character_report)
         except Exception as error:
             status.update(f"[Market scan failed] {type(error).__name__}: {error}")
             return
@@ -1653,7 +1654,7 @@ class TradingScreen(Screen[None]):
             text.append("  ✓ ", style=marker_style)
             text.append(f"{name} → L{entry.finished_level}\n")
 
-    def _render_listings(self, report: OpportunityReport) -> None:
+    def _render_listings(self, report: MarketReport) -> None:
         # Both overlays share one signature — a periodic refresh with unchanged orders
         # leaves the cursor/scroll of both tables alone.
         key = (tuple(report.listing_buys), tuple(report.listing_sells))
@@ -1664,7 +1665,7 @@ class TradingScreen(Screen[None]):
         self._fill_listings("#my-sells", report.listing_sells, report, "undercut")
 
     def _fill_listings(
-        self, table_id: str, statuses: list[ListingStatus], report: OpportunityReport, beaten: str
+        self, table_id: str, statuses: list[ListingStatus], report: MarketReport, beaten: str
     ) -> None:
         table = self.query_one(table_id, DataTable)
         table.clear()
@@ -1686,7 +1687,7 @@ class TradingScreen(Screen[None]):
                 key=str(status.order_id),
             )
 
-    def _sorted_builds(self, report: OpportunityReport) -> list[tuple[BuildOpportunity, int]]:
+    def _sorted_builds(self, report: MarketReport) -> list[tuple[BuildOpportunity, int]]:
         """Owned builds as (build, copies-owned), filtered by the product search and sorted
         alphabetically by product. Copies of a blueprint at the same research level are
         identical, so they collapse to one row carrying the count."""
@@ -1712,7 +1713,7 @@ class TradingScreen(Screen[None]):
         rows.sort(key=lambda row: (product(row[0]).lower(), row[0].material_efficiency))
         return rows
 
-    def _render_builds(self, report: OpportunityReport) -> None:
+    def _render_builds(self, report: MarketReport) -> None:
         """Owned blueprints, filtered and alphabetical — just the product and its ME. The
         self-source detail (what to mine/build/buy, and where) is in the row's popup, so the
         list stays scannable and carries no (misleading) mining ISK. The hint says why the
@@ -1738,7 +1739,7 @@ class TradingScreen(Screen[None]):
                 key=str(build.blueprint_item_id),
             )
 
-    def _manufacturing_hint(self, report: OpportunityReport) -> Text:
+    def _manufacturing_hint(self, report: MarketReport) -> Text:
         if report.builds:
             return Text(
                 f"{len(report.builds)} blueprint(s) — select one for its self-source recipe: "
@@ -2143,7 +2144,7 @@ class CharacterPickerScreen(Screen[None]):
         self._last_character_id = character_id
         record = next((r for r in self._store.records() if r.character_id == character_id), None)
         name = record.name if record is not None else str(character_id)
-        self.app.push_screen(TradingScreen(self._make_feed(character_id), self._interval, name))
+        self.app.push_screen(DashboardScreen(self._make_feed(character_id), self._interval, name))
 
     def action_resume(self) -> None:
         """Esc with a character already open returns to it, rather than sitting here."""
@@ -2180,7 +2181,7 @@ class CharacterPickerScreen(Screen[None]):
 
 
 class EveHelperApp(App[None]):
-    """Advises trades; never executes them."""
+    """Read-only dashboard; never writes to or automates the game."""
 
     TITLE = "evehelper"
     BINDINGS: ClassVar[list[BindingType]] = [("q", "quit", "Quit")]

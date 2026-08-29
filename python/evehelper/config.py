@@ -1,4 +1,4 @@
-"""User configuration for a trading session.
+"""User configuration for evehelper.
 
 Pydantic models only, never raw dicts. This module is pure data — no I/O — so the
 analysis core may import it freely. Loading config from disk lives elsewhere.
@@ -49,7 +49,7 @@ class IndustryParams(BaseModel):
 
 
 class Config(BaseModel):
-    """Top-level user configuration for a trading session."""
+    """Top-level user configuration."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

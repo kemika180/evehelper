@@ -1,7 +1,7 @@
-"""CharacterState: the character-side hand-off to the pure advisor. Pure.
+"""CharacterState: the character-side hand-off to the pure analysis core. Pure.
 
-Plain data consumed read-only by the engine. Built by data/character.py from live
-ESI data; this module never imports the I/O layer, so the engine stays testable
+Plain data consumed read-only by the analysis core. Built by data/character.py from
+live ESI data; this module never imports the I/O layer, so the core stays testable
 with hand-built state.
 """
 
@@ -38,7 +38,7 @@ def total_order_slots(skills: TradeSkills) -> int:
 
 @dataclass(frozen=True)
 class CharacterState:
-    """What the advisor needs to know about the character, right now."""
+    """What the analysis core needs to know about the character, right now."""
 
     wallet_balance: float
     trade_skills: TradeSkills

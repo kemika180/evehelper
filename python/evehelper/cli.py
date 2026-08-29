@@ -46,9 +46,9 @@ from evehelper.esi.auth import (
 from evehelper.esi.client import EsiClient
 from evehelper.pipeline import (
     CharacterReport,
-    OpportunityReport,
+    MarketReport,
     fetch_character,
-    fetch_opportunities,
+    fetch_market_report,
 )
 from evehelper.session import CharacterRecord, CharacterStore
 from evehelper.tui.app import EveHelperApp, RefreshFeed
@@ -156,8 +156,8 @@ def _run_tui(config: Config) -> None:
                 since=since,
             )
 
-        async def opportunities(report: CharacterReport) -> OpportunityReport:
-            return await fetch_opportunities(
+        async def market(report: CharacterReport) -> MarketReport:
+            return await fetch_market_report(
                 resources.client, config, report, resources.name_cache, resources.sde
             )
 
@@ -179,7 +179,7 @@ def _run_tui(config: Config) -> None:
 
         return RefreshFeed(
             character=character,
-            opportunities=opportunities,
+            market=market,
             record_wealth=record_wealth,
             wealth_history=wealth_history,
             export_wealth=export_wealth,

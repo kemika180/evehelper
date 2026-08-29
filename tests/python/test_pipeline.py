@@ -22,7 +22,7 @@ from evehelper.pipeline import (
     _refine_sources,
     _reference_prices,
     fetch_character,
-    fetch_opportunities,
+    fetch_market_report,
 )
 
 _STATION = 60003760
@@ -436,7 +436,7 @@ def test_pipeline_produces_buys_and_sells(tmp_path: Path) -> None:
             sde_path = tmp_path / "sde.sqlite"
             _make_recipe_sde(sde_path)
             sde = SdeDatabase(sde_path)
-            report = await fetch_opportunities(
+            report = await fetch_market_report(
                 client, _config(), character, name_cache, sde
             )
             # The owned blueprint yields a self-source recipe, ranked and named.

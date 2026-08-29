@@ -1,7 +1,8 @@
-"""Composition root: fetch, build the pure inputs, run the advisor. Impure.
+"""Fetch ESI data and assemble the read-only reports the dashboard renders. Impure.
 
 Split into two phases so the TUI renders the character (and holdings) immediately,
-then fills in market suggestions after the slower scan.
+then fills in the market-priced overlays — asset valuation, own-order best/beaten
+status, and build-vs-buy — after the slower scan.
 """
 
 from __future__ import annotations
@@ -152,7 +153,7 @@ class BuildOpportunity:
 
 
 @dataclass(frozen=True)
-class OpportunityReport:
+class MarketReport:
     """Slow phase: the market-priced overlays — own-order status, asset valuation,
     and build-vs-buy for owned blueprints."""
 
@@ -868,13 +869,13 @@ async def _classify_own_listings(
     return classify_listings(book, own)
 
 
-async def fetch_opportunities(
+async def fetch_market_report(
     client: EsiClient,
     config: Config,
     character: CharacterReport,
     name_cache: NameCache,
     sde: SdeDatabase | None = None,
-) -> OpportunityReport:
+) -> MarketReport:
     """Classify the character's own orders (live), then value their assets and run
     build-vs-buy for owned blueprints against CCP's global average reference prices."""
     listings = await _classify_own_listings(client, character.open_orders)
@@ -931,7 +932,7 @@ async def fetch_opportunities(
         for bp in build.plan.blueprints
     ]
     names = await name_cache.resolve(name_ids)
-    return OpportunityReport(
+    return MarketReport(
         listing_buys=listing_buys,
         listing_sells=listing_sells,
         names=names,

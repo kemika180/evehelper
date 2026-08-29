@@ -1,1 +1,1 @@
-"""Textual TUI: lists ranked suggestions; refresh driven by cache expiry."""
+"""Textual TUI: a per-character dashboard; refresh driven by cache expiry."""
