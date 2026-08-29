@@ -1,5 +1,9 @@
 # evehelper
 
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![Checked with mypy](https://www.mypy-lang.org/static/mypy_badge.svg)](https://mypy-lang.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 A terminal (TUI) companion for EVE Online: a **read-only dashboard** for one or more
 of your characters — net worth, assets, skills, industry jobs, and your live market
 orders — plus a crafting **build-vs-buy** advisor. It reads everything from ESI (the
@@ -52,6 +56,8 @@ Requires [`uv`](https://docs.astral.sh/uv/). That's the only prerequisite — th
 no config file at all:
 
 ```
+git clone https://github.com/kemika180/evehelper.git
+cd evehelper
 uv sync
 uv run evehelper
 ```
