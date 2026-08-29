@@ -1497,16 +1497,21 @@ class TradingScreen(Screen[None]):
         self._set_tile("#stat-industry", "FREE INDUSTRY JOBS", free_industry, "bold cyan")
 
     def _render_wealth(self) -> None:
-        """Draw the estimated-wealth trend (total ISK over time) from recorded samples.
-        A single sample plots as one marker; no samples yet shows an empty titled chart."""
+        """Draw the estimated-wealth trend over time: total (wallet + assets) plus its two
+        components as their own lines. A single sample plots as one marker; no samples yet
+        shows an empty titled chart."""
         widget = self.query_one("#wealthplot", PlotextPlot)
         history = self._feed.wealth_history()
         plt = widget.plt
         plt.clear_figure()
         if history:
-            totals = [sample.total / 1_000_000 for sample in history]  # millions of ISK
             positions = [float(i) for i in range(len(history))]
-            plt.plot(positions, totals, marker="braille")
+            totals = [sample.total / 1_000_000 for sample in history]  # millions of ISK
+            wallets = [sample.wallet_balance / 1_000_000 for sample in history]
+            assets = [sample.assets_value / 1_000_000 for sample in history]
+            plt.plot(positions, totals, marker="braille", label="Total", color="cyan")
+            plt.plot(positions, wallets, marker="braille", label="Wallet", color="green")
+            plt.plot(positions, assets, marker="braille", label="Assets", color="orange")
             # Label a handful of evenly spaced points with their local date/time.
             step = max(1, len(history) // 6)
             ticks = positions[::step]
