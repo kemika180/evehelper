@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from evetrader.config import Config
+from evehelper.config import Config
 
 
 def _valid_config() -> Config:

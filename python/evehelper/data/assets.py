@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from evetrader.esi.models import Asset
+from evehelper.esi.models import Asset
 
 
 @dataclass(frozen=True)

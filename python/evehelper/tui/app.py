@@ -1,4 +1,4 @@
-"""The evetrader TUI: a character picker, then the per-character advisor screen.
+"""The evehelper TUI: a character picker, then the per-character advisor screen.
 
 On launch you pick a set-up character (or add/remove one); selecting it opens the
 trading screen. Refresh is timer-driven, never keystroke-driven; the injected
@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,24 +40,27 @@ from textual.widgets import (
     TabPane,
     Tree,
 )
+from textual.widgets.data_table import RowDoesNotExist
 from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
+from textual_plotext import PlotextPlot
 
-from evetrader.data.assets import AssetLocation, AssetNode
-from evetrader.data.sde_download import ProgressFn, SdeState
-from evetrader.data.skills import SkillReference
-from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import (
+from evehelper.data.assets import AssetLocation, AssetNode
+from evehelper.data.sde_download import ProgressFn, SdeState
+from evehelper.data.skills import SkillReference
+from evehelper.data.wealth import WealthSample
+from evehelper.esi.auth import CharacterIdentity
+from evehelper.esi.models import (
     Blueprint,
     IndustryJob,
     Skill,
     SkillQueueEntry,
     WalletTransaction,
 )
-from evetrader.market.listings import ListingStatus
-from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
-from evetrader.session import CharacterRecord, CharacterStore
-from evetrader.tui.themes import KEMIKA_PURPLE
+from evehelper.market.listings import ListingStatus
+from evehelper.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
+from evehelper.session import CharacterRecord, CharacterStore
+from evehelper.tui.themes import KEMIKA_PURPLE
 
 
 def _local(moment: datetime) -> str:
@@ -587,6 +591,11 @@ class NavOptionList(OptionList):
 
 FetchCharacter = Callable[[], Awaitable[CharacterReport]]
 FetchOpportunities = Callable[[CharacterReport], Awaitable[OpportunityReport]]
+# Append a wealth sample for this character (throttled by the store); read back the
+# recorded history for the plot; and export it to a TSV file, returning where it landed.
+RecordWealth = Callable[[WealthSample], None]
+WealthHistory = Callable[[], list[WealthSample]]
+ExportWealth = Callable[[], Path]
 LoginFn = Callable[[], Awaitable[CharacterIdentity]]
 RemoveTokenFn = Callable[[int], None]
 # Download the SDE (in the background) and make it available; True on success. The
@@ -604,6 +613,9 @@ class RefreshFeed:
 
     character: FetchCharacter
     opportunities: FetchOpportunities
+    record_wealth: RecordWealth
+    wealth_history: WealthHistory
+    export_wealth: ExportWealth
 
 
 MakeFeed = Callable[[int], RefreshFeed]
@@ -1130,6 +1142,7 @@ class TradingScreen(Screen[None]):
         # bind these (they use bare h/l and arrows), so the keys bubble up here.
         Binding("H,shift+left", "prev_tab", "Prev tab", show=False),
         Binding("L,shift+right", "next_tab", "Next tab", show=False),
+        Binding("e", "export_wealth", "Export wealth TSV", show=False),
     ]
 
     # Pane id -> the scrollable widget to focus when its tab is activated, so the arrow
@@ -1142,6 +1155,7 @@ class TradingScreen(Screen[None]):
         "assets": "#assettree",
         "industry-tab": "#industry",
         "manufacturing-tab": "#manufacturing",
+        "wealth": "#wealthplot",
     }
     # Tabs whose "/" shortcut jumps to a filter box, by pane id -> that box's selector.
     _TAB_SEARCH: ClassVar[dict[str, str]] = {
@@ -1193,6 +1207,8 @@ class TradingScreen(Screen[None]):
     }
     TradingScreen #manufacturing-hint { padding: 0 2; color: $text-muted; }
     TradingScreen #manufacturing-search { margin: 0 1; }
+    TradingScreen #wealth-hint { padding: 0 2; color: $text-muted; }
+    TradingScreen #wealthplot { height: 1fr; margin: 0 1; }
     """
 
     def __init__(self, feed: RefreshFeed, interval_seconds: int, character_name: str) -> None:
@@ -1234,6 +1250,9 @@ class TradingScreen(Screen[None]):
                 yield Static("", id="training")
                 with VerticalScroll(id="digest"):
                     yield Static("", id="digest-body")
+            with TabPane("Wealth", id="wealth"):
+                yield Static("Estimated wealth over time · press e to export TSV", id="wealth-hint")
+                yield PlotextPlot(id="wealthplot")
             with TabPane("Trading", id="trading"):
                 yield Static("YOUR BUY ORDERS", classes="section", id="my-buys-section")
                 yield NavDataTable(id="my-buys", zebra_stripes=True, cursor_type="row")
@@ -1430,6 +1449,16 @@ class TradingScreen(Screen[None]):
         self._set_tile("#stat-assets", "ASSETS", f"{_isk(assets_value)} ISK", "bold green")
         self._render_assets(character_report, report.location_values)  # now with ISK values
         self._render_digest(character_report)
+        # Record this valuation (wallet + assets) for the wealth trend; the store throttles
+        # so a periodic refresh doesn't pile up points, then redraw the plot.
+        self._feed.record_wealth(
+            WealthSample(
+                captured_at=character_report.captured_at,
+                wallet_balance=character_report.character.wallet_balance,
+                assets_value=assets_value,
+            )
+        )
+        self._render_wealth()
         new_items = len(character_report.completed_transactions)
         updated = character_report.captured_at.astimezone().strftime("%H:%M:%S")
         status.update(f"{new_items} trades since your last visit · updated {updated}")
@@ -1466,6 +1495,38 @@ class TradingScreen(Screen[None]):
         )
         free_industry = str(_free_manufacturing_slots(report))
         self._set_tile("#stat-industry", "FREE INDUSTRY JOBS", free_industry, "bold cyan")
+
+    def _render_wealth(self) -> None:
+        """Draw the estimated-wealth trend (total ISK over time) from recorded samples.
+        A single sample plots as one marker; no samples yet shows an empty titled chart."""
+        widget = self.query_one("#wealthplot", PlotextPlot)
+        history = self._feed.wealth_history()
+        plt = widget.plt
+        plt.clear_figure()
+        if history:
+            totals = [sample.total / 1_000_000 for sample in history]  # millions of ISK
+            positions = [float(i) for i in range(len(history))]
+            plt.plot(positions, totals, marker="braille")
+            # Label a handful of evenly spaced points with their local date/time.
+            step = max(1, len(history) // 6)
+            ticks = positions[::step]
+            labels = [
+                history[int(i)].captured_at.astimezone().strftime("%m-%d %H:%M") for i in ticks
+            ]
+            plt.xticks(ticks, labels)
+            plt.title("Estimated wealth (million ISK)")
+        else:
+            plt.title("Estimated wealth — recording as the market scan runs…")
+        widget.refresh()
+
+    def action_export_wealth(self) -> None:
+        """Write this character's wealth history to a TSV file and report where it went."""
+        status = self.query_one("#status", Static)
+        if not self._feed.wealth_history():
+            status.update("No wealth history to export yet.")
+            return
+        path = self._feed.export_wealth()
+        status.update(f"Wealth history exported to {path}")
 
     def _render_digest(self, report: CharacterReport) -> None:
         """The Overview activity digest: a header of assets value and open/running counts,
@@ -1662,7 +1723,7 @@ class TradingScreen(Screen[None]):
         if not report.sde_available:
             hint = Text()
             hint.append("Crafting cost needs the EVE SDE. Download it once:  ", style="yellow")
-            hint.append("uv run evetrader sde", style="bold")
+            hint.append("uv run evehelper sde", style="bold")
             return hint
         owns_blueprints = self._character is not None and bool(self._character.blueprints)
         if not owns_blueprints:
@@ -1685,53 +1746,72 @@ class TradingScreen(Screen[None]):
         bar.append(f"· completes {_finish(current)}", style="dim")
         target.update(bar)
 
+    @contextmanager
+    def _keep_row_cursor(self, table: DataTable[object]) -> Iterator[None]:
+        """Hold the cursor on the same keyed row across a clear()/rebuild, so a timer
+        refresh doesn't snap a scrolled table back to the top. Rows must carry stable
+        ``key=``s; if the selected row is gone after the rebuild the cursor is left be."""
+        coordinate = table.cursor_coordinate
+        row_key = (
+            table.coordinate_to_cell_key(coordinate).row_key.value
+            if table.is_valid_coordinate(coordinate)
+            else None
+        )
+        yield
+        if row_key is None:
+            return
+        with suppress(RowDoesNotExist):
+            table.move_cursor(row=table.get_row_index(row_key))
+
     def _render_skill_queue(self, report: CharacterReport) -> None:
         """The full queue as Skill / Time left / Completion; current row highlighted,
         already-completed entries marked done."""
         table = self.query_one("#skillqueue", DataTable)
-        table.clear()
         current = _current_training(report.skill_queue, report.captured_at)
         reference = report.captured_at
-        for entry in sorted(report.skill_queue, key=lambda e: e.queue_position):
-            name = report.names.get(entry.skill_id, str(entry.skill_id))
-            if current is not None and entry.queue_position == current.queue_position:
-                marker, style = "▶ ", "bold magenta"
-            elif _is_completed(entry, reference):
-                marker, style = "✓ ", "dim strike"
-            else:
-                marker, style = "  ", "cyan"
-            table.add_row(
-                Text(f"{marker}{name} → L{entry.finished_level}", style=style),
-                Text(_train_time(entry, reference), style="yellow"),
-                Text(_completion(entry, reference), style="dim"),
-                key=str(entry.queue_position),
-            )
+        with self._keep_row_cursor(table):
+            table.clear()
+            for entry in sorted(report.skill_queue, key=lambda e: e.queue_position):
+                name = report.names.get(entry.skill_id, str(entry.skill_id))
+                if current is not None and entry.queue_position == current.queue_position:
+                    marker, style = "▶ ", "bold magenta"
+                elif _is_completed(entry, reference):
+                    marker, style = "✓ ", "dim strike"
+                else:
+                    marker, style = "  ", "cyan"
+                table.add_row(
+                    Text(f"{marker}{name} → L{entry.finished_level}", style=style),
+                    Text(_train_time(entry, reference), style="yellow"),
+                    Text(_completion(entry, reference), style="dim"),
+                    key=str(entry.queue_position),
+                )
 
     def _render_industry(self, report: CharacterReport) -> None:
         """Running/ready industry jobs: Activity / Item / Runs / Time left / Where.
         Ready-to-deliver jobs sort to the top; each row is coloured by state."""
         table = self.query_one("#industry", DataTable)
-        table.clear()
         reference = report.captured_at
         jobs = sorted(
             report.industry_jobs,
             key=lambda job: (0 if _job_state(job, reference) == "ready" else 1, job.end_date),
         )
-        for job in jobs:
-            state = _job_state(job, reference)
-            marker, style, _ = _JOB_STATES[state]
-            subject = _job_subject_type(job)
-            item = report.names.get(subject, str(subject))
-            where = report.names.get(job.facility_id, str(job.facility_id))
-            time_style = "green" if state == "ready" else "yellow"
-            table.add_row(
-                Text(f"{marker}{_activity_name(job.activity_id)}", style=style),
-                Text(item),
-                Text(f"{job.runs:,}", justify="right"),
-                Text(_job_time_left(job, reference), style=time_style),
-                Text(where, style="dim"),
-                key=str(job.job_id),
-            )
+        with self._keep_row_cursor(table):
+            table.clear()
+            for job in jobs:
+                state = _job_state(job, reference)
+                marker, style, _ = _JOB_STATES[state]
+                subject = _job_subject_type(job)
+                item = report.names.get(subject, str(subject))
+                where = report.names.get(job.facility_id, str(job.facility_id))
+                time_style = "green" if state == "ready" else "yellow"
+                table.add_row(
+                    Text(f"{marker}{_activity_name(job.activity_id)}", style=style),
+                    Text(item),
+                    Text(f"{job.runs:,}", justify="right"),
+                    Text(_job_time_left(job, reference), style=time_style),
+                    Text(where, style="dim"),
+                    key=str(job.job_id),
+                )
 
     def _render_skills(self, report: CharacterReport) -> None:
         """All trained skills as a tree grouped by skill category; a leaf's data is
@@ -2075,10 +2155,10 @@ class CharacterPickerScreen(Screen[None]):
         self.query_one("#picker_status", Static).update("Removed character")
 
 
-class EveTraderApp(App[None]):
+class EveHelperApp(App[None]):
     """Advises trades; never executes them."""
 
-    TITLE = "evetrader"
+    TITLE = "evehelper"
     BINDINGS: ClassVar[list[BindingType]] = [("q", "quit", "Quit")]
 
     def __init__(

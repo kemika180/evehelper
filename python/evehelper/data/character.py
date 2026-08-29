@@ -6,11 +6,11 @@ into the pure core's CharacterState.
 
 from __future__ import annotations
 
-from evetrader.advisor.state import CharacterState, TradeSkills, total_order_slots
-from evetrader.config import Config
-from evetrader.esi.client import EsiClient
-from evetrader.esi.endpoints import fetch_wallet_balance
-from evetrader.esi.models import CharacterOrder, CharacterSkills
+from evehelper.advisor.state import CharacterState, TradeSkills, total_order_slots
+from evehelper.config import Config
+from evehelper.esi.client import EsiClient
+from evehelper.esi.endpoints import fetch_wallet_balance
+from evehelper.esi.models import CharacterOrder, CharacterSkills
 
 # EVE skill type ids (stable game constants; sanity-check against live data).
 _TRADE = 3443

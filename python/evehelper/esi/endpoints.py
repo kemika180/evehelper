@@ -12,8 +12,8 @@ from collections.abc import Sequence
 
 from pydantic import TypeAdapter
 
-from evetrader.esi.client import EsiClient
-from evetrader.esi.models import (
+from evehelper.esi.client import EsiClient
+from evehelper.esi.models import (
     Asset,
     AssetName,
     Blueprint,

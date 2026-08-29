@@ -1,7 +1,7 @@
 """build_asset_tree reconstructs the nested hierarchy from ESI's flat asset list."""
 
-from evetrader.data.assets import build_asset_tree, location_values, nameable_item_ids
-from evetrader.esi.models import Asset
+from evehelper.data.assets import build_asset_tree, location_values, nameable_item_ids
+from evehelper.esi.models import Asset
 
 
 def _asset(

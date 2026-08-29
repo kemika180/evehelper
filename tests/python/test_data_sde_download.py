@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from evetrader.data.sde_download import (
+from evehelper.data.sde_download import (
     SdeState,
     check_sde_freshness,
     download_sde,
@@ -78,7 +78,7 @@ def test_download_sde_streams_decompresses_and_sends_user_agent(tmp_path: Path) 
     compressed = gzip.compress(payload)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert "evetrader" in request.headers.get("User-Agent", "")
+        assert "evehelper" in request.headers.get("User-Agent", "")
         return httpx.Response(200, content=compressed)
 
     dest = tmp_path / "sde.sqlite"

@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "evetrader"
+name = "evehelper"
 version = "0.1.0"
 description = "A TUI money-making advisor for EVE Online (ESI market data + character state)."
 requires-python = ">=3.12"
@@ -12,11 +12,12 @@ dependencies = [
     "pydantic>=2.11",
     "httpx>=0.28",
     "textual>=8.0",
+    "textual-plotext>=1.0",
     "keyring>=25.0",
 ]
 
 [project.scripts]
-evetrader = "evetrader.cli:main"
+evehelper = "evehelper.cli:main"
 
 [dependency-groups]
 dev = [
@@ -27,7 +28,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["python/evetrader"]
+packages = ["python/evehelper"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
@@ -36,11 +37,11 @@ testpaths = ["tests/python"]
 # core (market/, advisor/) is deterministic and must never reach the I/O shell
 # (esi/, data/) or the network.
 [tool.importlinter]
-root_package = "evetrader"
+root_package = "evehelper"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "Pure analysis core never imports the I/O shell or network libraries"
 type = "forbidden"
-source_modules = ["evetrader.market", "evetrader.advisor"]
-forbidden_modules = ["evetrader.esi", "evetrader.data", "httpx"]
+source_modules = ["evehelper.market", "evehelper.advisor"]
+forbidden_modules = ["evehelper.esi", "evehelper.data", "httpx"]

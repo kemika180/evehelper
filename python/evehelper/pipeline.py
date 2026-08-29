@@ -12,23 +12,23 @@ from datetime import UTC, datetime
 
 import polars as pl
 
-from evetrader.advisor.state import CharacterState
-from evetrader.config import Config
-from evetrader.data.assets import (
+from evehelper.advisor.state import CharacterState
+from evehelper.config import Config
+from evehelper.data.assets import (
     AssetLocation,
     build_asset_tree,
     location_values,
     nameable_item_ids,
 )
-from evetrader.data.character import build_character_state
-from evetrader.data.market import orders_frame_from_pages
-from evetrader.data.sde import OreYield, SdeDatabase
-from evetrader.data.skills import SkillReference, load_skills
-from evetrader.data.structures import StructureCache
-from evetrader.data.universe import NameCache
-from evetrader.esi.auth import Authenticator
-from evetrader.esi.client import EsiClient, EsiError
-from evetrader.esi.endpoints import (
+from evehelper.data.character import build_character_state
+from evehelper.data.market import orders_frame_from_pages
+from evehelper.data.sde import OreYield, SdeDatabase
+from evehelper.data.skills import SkillReference, load_skills
+from evehelper.data.structures import StructureCache
+from evehelper.data.universe import NameCache
+from evehelper.esi.auth import Authenticator
+from evehelper.esi.client import EsiClient, EsiError
+from evehelper.esi.endpoints import (
     fetch_affiliation,
     fetch_asset_names,
     fetch_assets,
@@ -43,7 +43,7 @@ from evetrader.esi.endpoints import (
     fetch_skills,
     fetch_transactions,
 )
-from evetrader.esi.models import (
+from evehelper.esi.models import (
     Blueprint,
     CharacterAttributes,
     CharacterOrder,
@@ -53,8 +53,8 @@ from evetrader.esi.models import (
     SkillQueueEntry,
     WalletTransaction,
 )
-from evetrader.market.listings import ListingStatus, OwnOrder, classify_listings
-from evetrader.market.production import (
+from evehelper.market.listings import ListingStatus, OwnOrder, classify_listings
+from evehelper.market.production import (
     BlueprintNeeded,
     BuildInput,
     BuildStep,
@@ -71,7 +71,7 @@ from evetrader.market.production import (
     collect_needs,
     plan_ore_mining,
 )
-from evetrader.market.refining import (
+from evehelper.market.refining import (
     REPROCESSING_EFFICIENCY_SKILL_ID,
     REPROCESSING_SKILL_ID,
     mineral_commonness,
@@ -79,7 +79,7 @@ from evetrader.market.refining import (
     reprocessing_yield,
     security_target_rank,
 )
-from evetrader.market.training import (
+from evehelper.market.training import (
     TrainingCandidate,
     TrainingTip,
     max_level_within,
@@ -164,7 +164,7 @@ class OpportunityReport:
     # installed or no owned blueprint is manufacturable).
     builds: list[BuildOpportunity]
     # Whether the local SDE was available this run — lets the UI explain an empty
-    # Manufacturing tab (needs `evetrader sde`) instead of leaving it blank.
+    # Manufacturing tab (needs `evehelper sde`) instead of leaving it blank.
     sde_available: bool
     # Total ISK value of assets at each place (global average reference prices), keyed by
     # location_id — the Overview ASSETS tile sums these.

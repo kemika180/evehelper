@@ -2,7 +2,7 @@
 
 from pytest import approx
 
-from evetrader.market.refining import mineral_commonness, reprocessing_yield, security_target_rank
+from evehelper.market.refining import mineral_commonness, reprocessing_yield, security_target_rank
 
 
 def test_yield_is_the_base_rate_with_no_skills() -> None:

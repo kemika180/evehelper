@@ -2,7 +2,7 @@
 
 from pytest import approx
 
-from evetrader.market.production import (
+from evehelper.market.production import (
     BlueprintNeeded,
     BuyLine,
     MineableOre,

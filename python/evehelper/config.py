@@ -61,7 +61,7 @@ class Config(BaseModel):
     # Contact sent in the ESI User-Agent, as ESI's rules require. ESI accepts a URL or an
     # email; the shared app uses its project URL so no personal address is exposed. Override
     # to your own contact if you self-host with your own client id.
-    contact: str = Field(default="https://github.com/kemika180/evetrader", min_length=1)
+    contact: str = Field(default="https://github.com/kemika180/evehelper", min_length=1)
     # Loopback port for the PKCE SSO callback; must match the registered redirect. The
     # shared registration uses 8765, so leave this alone unless using your own app.
     callback_port: int = Field(default=8765, gt=0, lt=65536)

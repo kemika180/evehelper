@@ -1,7 +1,7 @@
 """ESI boundary models parse representative payloads and honour ESI quirks."""
 
 
-from evetrader.esi.models import (
+from evehelper.esi.models import (
     Asset,
     Blueprint,
     CharacterOrder,

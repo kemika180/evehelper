@@ -5,9 +5,9 @@ from pathlib import Path
 
 import httpx
 
-from evetrader.config import Config
-from evetrader.data.universe import NameCache
-from evetrader.esi.client import EsiClient
+from evehelper.config import Config
+from evehelper.data.universe import NameCache
+from evehelper.esi.client import EsiClient
 
 
 def _config() -> Config:

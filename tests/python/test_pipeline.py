@@ -7,15 +7,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
-from evetrader.config import Config
-from evetrader.data.sde import SdeDatabase
-from evetrader.data.structures import StructureCache
-from evetrader.data.universe import NameCache
-from evetrader.esi.auth import Authenticator
-from evetrader.esi.client import EsiClient
-from evetrader.data.sde import OreYield
-from evetrader.esi.models import MarketPrice
-from evetrader.pipeline import (
+from evehelper.config import Config
+from evehelper.data.sde import SdeDatabase
+from evehelper.data.structures import StructureCache
+from evehelper.data.universe import NameCache
+from evehelper.esi.auth import Authenticator
+from evehelper.esi.client import EsiClient
+from evehelper.data.sde import OreYield
+from evehelper.esi.models import MarketPrice
+from evehelper.pipeline import (
     _buildable_predicate,
     _expand_recipes,
     _ore_yields,

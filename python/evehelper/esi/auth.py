@@ -18,7 +18,7 @@ import hashlib
 import secrets
 import urllib.parse
 import webbrowser
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -27,15 +27,32 @@ import httpx
 import keyring
 from pydantic import BaseModel, ConfigDict
 
-from evetrader import __version__
-from evetrader.config import Config
-from evetrader.esi.models import TokenResponse
+from evehelper import __version__
+from evehelper.config import Config
+from evehelper.esi.models import TokenResponse
 
 _AUTHORIZE_URL = "https://login.eveonline.com/v2/oauth/authorize/"
 _TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
-_KEYRING_SERVICE = "evetrader"
+_KEYRING_SERVICE = "evehelper"
+# Pre-rename keyring service; tokens stored under it are migrated on launch so
+# characters set up as "evetrader" keep working without a re-login.
+_LEGACY_KEYRING_SERVICE = "evetrader"
 # Refresh a little before the access token actually expires.
 _EXPIRY_SKEW = timedelta(seconds=30)
+
+
+def migrate_legacy_tokens(character_ids: Iterable[int]) -> None:
+    """Copy refresh tokens saved under the old ``evetrader`` keyring service to the
+    current one, so existing characters survive the rename. Idempotent: an id already
+    present under the new service is left untouched, and a missing legacy token is a
+    no-op."""
+    for character_id in character_ids:
+        key = str(character_id)
+        if keyring.get_password(_KEYRING_SERVICE, key) is not None:
+            continue
+        legacy = keyring.get_password(_LEGACY_KEYRING_SERVICE, key)
+        if legacy is not None:
+            keyring.set_password(_KEYRING_SERVICE, key, legacy)
 
 SCOPES: tuple[str, ...] = (
     "esi-wallet.read_character_wallet.v1",
@@ -72,7 +89,7 @@ def _utc_now() -> datetime:
 
 
 def _user_agent(contact: str) -> str:
-    return f"evetrader/{__version__} ({contact})"
+    return f"evehelper/{__version__} ({contact})"
 
 
 def _b64url(raw: bytes) -> str:
@@ -270,7 +287,7 @@ async def _receive_code(port: int, expected_state: str) -> str:
         params = urllib.parse.parse_qs(urllib.parse.urlparse(target).query)
         writer.write(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
-            b"evetrader: authorization received. You may close this tab."
+            b"evehelper: authorization received. You may close this tab."
         )
         await writer.drain()
         writer.close()

@@ -11,8 +11,8 @@ from collections.abc import Awaitable, Callable
 import httpx
 import pytest
 
-from evetrader.config import Config
-from evetrader.esi.auth import (
+from evehelper.config import Config
+from evehelper.esi.auth import (
     AuthError,
     Authenticator,
     build_authorize_url,

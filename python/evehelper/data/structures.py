@@ -8,9 +8,9 @@ go through the client's Expires cache like any other GET.
 
 from __future__ import annotations
 
-from evetrader.esi.client import EsiClient, EsiError
-from evetrader.esi.endpoints import fetch_structure
-from evetrader.esi.models import Structure
+from evehelper.esi.client import EsiClient, EsiError
+from evehelper.esi.endpoints import fetch_structure
+from evehelper.esi.models import Structure
 
 
 class StructureCache:

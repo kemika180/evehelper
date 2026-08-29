@@ -12,8 +12,8 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from evetrader.esi.client import EsiClient
-from evetrader.esi.endpoints import resolve_names
+from evehelper.esi.client import EsiClient
+from evehelper.esi.endpoints import resolve_names
 
 _CHUNK = 1000
 

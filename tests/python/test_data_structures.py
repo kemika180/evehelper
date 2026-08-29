@@ -4,9 +4,9 @@ import asyncio
 
 import httpx
 
-from evetrader.config import Config
-from evetrader.data.structures import StructureCache
-from evetrader.esi.client import EsiClient
+from evehelper.config import Config
+from evehelper.data.structures import StructureCache
+from evehelper.esi.client import EsiClient
 
 _OK = 1_035_660_376_235  # a structure the character can dock at
 _FORBIDDEN = 1_040_000_000_001  # one it cannot

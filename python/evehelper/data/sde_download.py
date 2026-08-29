@@ -49,7 +49,7 @@ def remote_last_modified(
     owns_client = client is None
     client = client or httpx.Client(follow_redirects=True, timeout=10.0)
     try:
-        headers = {"User-Agent": f"evetrader ({contact})"} if contact else {}
+        headers = {"User-Agent": f"evehelper ({contact})"} if contact else {}
         response = client.head(url, headers=headers)
         response.raise_for_status()
         stamp = response.headers.get("Last-Modified")
@@ -131,7 +131,7 @@ def download_sde(
     owns_client = client is None
     client = client or httpx.Client(follow_redirects=True, timeout=None)
     try:
-        headers = {"User-Agent": f"evetrader ({contact})"} if contact else {}
+        headers = {"User-Agent": f"evehelper ({contact})"} if contact else {}
         with client.stream("GET", url, headers=headers) as response:
             response.raise_for_status()
             total = _content_length(response)

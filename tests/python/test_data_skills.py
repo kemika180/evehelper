@@ -1,6 +1,6 @@
 """The bundled skills reference loads and carries the expected static facts."""
 
-from evetrader.data.skills import load_skills
+from evehelper.data.skills import load_skills
 
 
 def test_load_skills_reads_the_bundled_file() -> None:

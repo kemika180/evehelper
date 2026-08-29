@@ -2,7 +2,7 @@
 
 import polars as pl
 
-from evetrader.market.listings import OwnOrder, classify_listings
+from evehelper.market.listings import OwnOrder, classify_listings
 
 _STATION = 60003760
 

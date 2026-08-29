@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from evetrader.data.sde import SdeDatabase, SdeError
+from evehelper.data.sde import SdeDatabase, SdeError
 
 
 def _make_sde(path: Path) -> None:

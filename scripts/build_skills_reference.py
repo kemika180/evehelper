@@ -1,4 +1,4 @@
-"""Regenerate the bundled skills reference (`evetrader/data/skills.json`).
+"""Regenerate the bundled skills reference (`evehelper/data/skills.json`).
 
 A one-time, dev-only build step — NOT part of the running app, which reads only the
 bundled file offline. Walks the public ESI universe endpoints (skill category ->
@@ -19,7 +19,7 @@ import httpx
 
 _BASE = "https://esi.evetech.net/latest"
 _PARAMS = {"datasource": "tranquility"}
-_USER_AGENT = "evetrader skills-reference build (jkgurchiek@gmail.com)"
+_USER_AGENT = "evehelper skills-reference build (jkgurchiek@gmail.com)"
 _SKILL_CATEGORY = 16
 _RANK = 275  # skillTimeConstant
 _PRIMARY = 180
@@ -31,7 +31,7 @@ _ATTRIBUTE_NAMES = {
     167: "Perception",
     168: "Willpower",
 }
-_OUT = Path(__file__).resolve().parent.parent / "python" / "evetrader" / "data" / "skills.json"
+_OUT = Path(__file__).resolve().parent.parent / "python" / "evehelper" / "data" / "skills.json"
 
 
 async def _get(client: httpx.AsyncClient, path: str) -> dict | list:

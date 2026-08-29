@@ -1,4 +1,4 @@
-"""The `evetrader` entry point: `evetrader login` then `evetrader`. Composition root.
+"""The `evehelper` entry point: `evehelper login` then `evehelper`. Composition root.
 
 Builds the I/O resources (shared across characters so the client cache is reused)
 and wires the pipeline, login, and character store into the TUI. Not unit-tested —
@@ -17,34 +17,41 @@ from pathlib import Path
 
 import httpx
 
-from evetrader.config import Config
-from evetrader.configload import default_config_path, default_data_dir, load_config
-from evetrader.data.access import LastAccessStore
-from evetrader.data.sde import SdeDatabase, SdeError
-from evetrader.data.sde_download import (
+from evehelper.config import Config
+from evehelper.configload import (
+    default_config_path,
+    default_data_dir,
+    load_config,
+    migrate_legacy_dirs,
+)
+from evehelper.data.access import LastAccessStore
+from evehelper.data.sde import SdeDatabase, SdeError
+from evehelper.data.sde_download import (
     ProgressFn,
     SdeState,
     check_sde_freshness,
     download_sde,
 )
-from evetrader.data.structures import StructureCache
-from evetrader.data.universe import NameCache
-from evetrader.esi.auth import (
+from evehelper.data.structures import StructureCache
+from evehelper.data.universe import NameCache
+from evehelper.data.wealth import WealthSample, WealthStore
+from evehelper.esi.auth import (
     Authenticator,
     CharacterIdentity,
     KeyringTokenStore,
     character_identity,
     login,
+    migrate_legacy_tokens,
 )
-from evetrader.esi.client import EsiClient
-from evetrader.pipeline import (
+from evehelper.esi.client import EsiClient
+from evehelper.pipeline import (
     CharacterReport,
     OpportunityReport,
     fetch_character,
     fetch_opportunities,
 )
-from evetrader.session import CharacterRecord, CharacterStore
-from evetrader.tui.app import EveTraderApp, RefreshFeed
+from evehelper.session import CharacterRecord, CharacterStore
+from evehelper.tui.app import EveHelperApp, RefreshFeed
 
 
 @dataclass
@@ -75,6 +82,12 @@ def _build_resources(config: Config) -> _Resources:
         name_cache=NameCache(default_data_dir() / "names.json", client),
         sde=_load_sde(),
     )
+
+
+def _filename_slug(name: str) -> str:
+    """A filesystem-safe slug of a character name for the exported TSV filename."""
+    slug = "".join(char if char.isalnum() else "_" for char in name).strip("_")
+    return slug or "character"
 
 
 def _characters_path() -> Path:
@@ -116,9 +129,12 @@ async def _migrate_legacy_character(config: Config, store: CharacterStore) -> No
 
 def _run_tui(config: Config) -> None:
     store = CharacterStore(_characters_path())
+    # Carry pre-rename SSO tokens over for characters already set up as "evetrader".
+    migrate_legacy_tokens(record.character_id for record in store.records())
     asyncio.run(_migrate_legacy_character(config, store))
     resources = _build_resources(config)
     last_access = LastAccessStore(default_data_dir() / "last_access.json")
+    wealth = WealthStore(default_data_dir() / "wealth_history.json")
 
     def make_feed(character_id: int) -> RefreshFeed:
         # Per-character: structure access (and its negative cache) is character-scoped.
@@ -145,7 +161,29 @@ def _run_tui(config: Config) -> None:
                 resources.client, config, report, resources.name_cache, resources.sde
             )
 
-        return RefreshFeed(character=character, opportunities=opportunities)
+        def record_wealth(sample: WealthSample) -> None:
+            wealth.record(character_id, sample)
+
+        def wealth_history() -> list[WealthSample]:
+            return wealth.history(character_id)
+
+        def export_wealth() -> Path:
+            # Land the TSV in the working directory so it's easy to find and open.
+            name = next(
+                (r.name for r in store.records() if r.character_id == character_id),
+                str(character_id),
+            )
+            dest = Path.cwd() / f"wealth_{_filename_slug(name)}.tsv"
+            wealth.export_tsv(character_id, dest)
+            return dest
+
+        return RefreshFeed(
+            character=character,
+            opportunities=opportunities,
+            record_wealth=record_wealth,
+            wealth_history=wealth_history,
+            export_wealth=export_wealth,
+        )
 
     async def login_fn() -> CharacterIdentity:
         return await login(config, resources.http, KeyringTokenStore())
@@ -171,7 +209,7 @@ def _run_tui(config: Config) -> None:
         return await asyncio.to_thread(check_sde_freshness, sde_path(), contact=config.contact)
 
     try:
-        EveTraderApp(
+        EveHelperApp(
             store,
             make_feed,
             login_fn,
@@ -187,10 +225,14 @@ def _run_tui(config: Config) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="evetrader")
+    parser = argparse.ArgumentParser(prog="evehelper")
     parser.add_argument("command", nargs="?", default="run", choices=["run", "login", "sde"])
     parser.add_argument("--config", type=Path, default=None)
     args = parser.parse_args()
+
+    # Rename fallout: move any pre-rename evetrader config/data into place before anything
+    # reads them, so an existing install keeps its characters and settings.
+    migrate_legacy_dirs()
 
     # A missing DEFAULT config is fine — the app runs on built-in defaults (shared client
     # id). But an explicitly requested --config that doesn't exist is almost certainly a

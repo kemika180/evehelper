@@ -24,8 +24,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from evetrader import __version__
-from evetrader.config import Config
+from evehelper import __version__
+from evehelper.config import Config
 
 _BASE_URL = "https://esi.evetech.net/latest"
 # Back off once the remaining error budget for the window drops to this.
@@ -81,7 +81,17 @@ def _load_cache(path: Path) -> dict[str, _CacheEntry]:
     try:
         with path.open("rb") as handle:
             version, entries = pickle.load(handle)
-    except (OSError, pickle.UnpicklingError, EOFError, ValueError, TypeError, AttributeError):
+    except (
+        OSError,
+        pickle.UnpicklingError,
+        EOFError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        # A cache written before the evetrader→evehelper rename pickled classes under the
+        # old module path; unpickling now fails to import it. Treat as a cold start.
+        ImportError,
+    ):
         return {}
     if version != _CACHE_VERSION or not isinstance(entries, dict):
         return {}
@@ -141,7 +151,7 @@ class EsiClient:
 
     @property
     def _user_agent(self) -> str:
-        return f"evetrader/{__version__} ({self._config.contact})"
+        return f"evehelper/{__version__} ({self._config.contact})"
 
     async def get(
         self, path: str, *, params: Params | None = None, token: str | None = None

@@ -31,6 +31,6 @@ class SkillReference(BaseModel):
 @cache
 def load_skills() -> dict[int, SkillReference]:
     """Skill id -> reference, loaded once from the bundled file."""
-    raw = files("evetrader.data").joinpath("skills.json").read_text(encoding="utf-8")
+    raw = files("evehelper.data").joinpath("skills.json").read_text(encoding="utf-8")
     stored: dict[str, dict[str, object]] = json.loads(raw)
     return {int(key): SkillReference.model_validate(value) for key, value in stored.items()}

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from evetrader.configload import load_config
+from evehelper.configload import load_config
 
 
 def test_load_config_from_toml(tmp_path: Path) -> None:

@@ -17,7 +17,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from evetrader.market.production import Recipe, RecipeMaterial
+from evehelper.market.production import Recipe, RecipeMaterial
 
 # industryActivity activityIDs (the SDE's stable activity codes).
 _MANUFACTURING = 1
@@ -55,7 +55,7 @@ class SdeDatabase:
 
     def __init__(self, path: Path) -> None:
         if not path.exists():
-            raise SdeError(f"SDE not found at {path}; run `evetrader sde` to download it")
+            raise SdeError(f"SDE not found at {path}; run `evehelper sde` to download it")
         # Open immutable/read-only so a stray write can't corrupt the shared dump.
         self._conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 

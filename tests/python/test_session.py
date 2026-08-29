@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from evetrader.session import CharacterRecord, CharacterStore
+from evehelper.session import CharacterRecord, CharacterStore
 
 
 def test_add_dedups_and_persists(tmp_path: Path) -> None:

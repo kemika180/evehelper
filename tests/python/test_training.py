@@ -1,6 +1,6 @@
 """The pure quick-train tips engine: SP/time formula plus horizon filtering and ranking."""
 
-from evetrader.market.training import (
+from evehelper.market.training import (
     TrainingCandidate,
     max_level_within,
     skill_points_for_level,

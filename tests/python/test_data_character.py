@@ -4,10 +4,10 @@ import asyncio
 
 import httpx
 
-from evetrader.config import Config
-from evetrader.data.character import build_character_state
-from evetrader.esi.client import EsiClient
-from evetrader.esi.models import CharacterOrder, CharacterSkills
+from evehelper.config import Config
+from evehelper.data.character import build_character_state
+from evehelper.esi.client import EsiClient
+from evehelper.esi.models import CharacterOrder, CharacterSkills
 
 _STATION = 60003760
 

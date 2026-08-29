@@ -13,8 +13,8 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
-from evetrader.config import Config
-from evetrader.esi.client import EsiClient, EsiError
+from evehelper.config import Config
+from evehelper.esi.client import EsiClient, EsiError, _load_cache
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -153,7 +153,7 @@ def test_sends_descriptive_user_agent_with_contact() -> None:
 
     _run(handler, body)
     ua = seen["ua"]
-    assert ua is not None and ua.startswith("evetrader/") and "contact@example.com" in ua
+    assert ua is not None and ua.startswith("evehelper/") and "contact@example.com" in ua
 
 
 def test_bearer_token_is_attached_when_provided() -> None:
@@ -266,3 +266,16 @@ def test_missing_or_corrupt_cache_starts_cold(tmp_path: Path) -> None:
             client.save_cache()  # overwrites the corrupt file cleanly
 
     asyncio.run(go())
+
+
+def test_cache_from_a_renamed_module_starts_cold(tmp_path: Path) -> None:
+    """A cache written before the evetrader→evehelper rename pickled classes under the old
+    module path; loading it must degrade to a cold start, not crash on the missing import."""
+    stale = tmp_path / "esi_cache.pickle"
+    # A valid pickle that references a module no longer importable — what the old cache
+    # becomes after the rename (ModuleNotFoundError on unpickle). Rewrite the "builtins"
+    # module token of a pickled class to an equal-length name that can't be imported.
+    payload = pickle.dumps((1, {"/x/": OSError})).replace(b"builtins", b"nomodule")
+    stale.write_bytes(payload)
+
+    assert _load_cache(stale) == {}

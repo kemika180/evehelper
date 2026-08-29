@@ -3,7 +3,7 @@
 import json
 
 import polars as pl
-from evetrader.data.market import orders_frame_from_pages
+from evehelper.data.market import orders_frame_from_pages
 
 
 def test_orders_frame_from_pages_parses_raw_json() -> None:

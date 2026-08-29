@@ -7,7 +7,7 @@ trained before the skill that needs it, higher-priority goals scheduled earlier,
 ties broken by shortest training time. It estimates training time from your
 character attributes and recommends an optimal attribute remap.
 
-Independent of the main `evetrader` app: it imports nothing from that package and
+Independent of the main `evehelper` app: it imports nothing from that package and
 makes no network calls. Its only runtime inputs are two small bundled JSON files.
 
 ## Run
@@ -61,7 +61,7 @@ points over 5 attributes, each capped at +10) to minimise the plan's total time.
 ## Data
 
 Two files ship with the tool, generated from the local EVE SDE dump the main project
-downloads (`~/.local/share/evetrader/sde.sqlite`). Regenerate them when the SDE updates:
+downloads (`~/.local/share/evehelper/sde.sqlite`). Regenerate them when the SDE updates:
 
 ```sh
 python tools/skillplan/build_data.py

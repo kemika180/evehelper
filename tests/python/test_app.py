@@ -5,17 +5,19 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import mkdtemp
 
 import pytest
 from rich.text import Text
 from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Input, OptionList, Static, TabbedContent, Tree
 
-from evetrader.advisor.state import CharacterState, TradeSkills
-from evetrader.data.assets import AssetLocation, AssetNode
-from evetrader.data.skills import SkillReference
-from evetrader.esi.auth import CharacterIdentity
-from evetrader.esi.models import (
+from evehelper.advisor.state import CharacterState, TradeSkills
+from evehelper.data.assets import AssetLocation, AssetNode
+from evehelper.data.skills import SkillReference
+from evehelper.data.wealth import WealthStore
+from evehelper.esi.auth import CharacterIdentity
+from evehelper.esi.models import (
     Blueprint,
     CharacterAttributes,
     IndustryJob,
@@ -23,8 +25,8 @@ from evetrader.esi.models import (
     SkillQueueEntry,
     WalletTransaction,
 )
-from evetrader.market.listings import ListingStatus
-from evetrader.market.production import (
+from evehelper.market.listings import ListingStatus
+from evehelper.market.production import (
     BlueprintNeeded,
     BuildInput,
     BuildStep,
@@ -35,15 +37,15 @@ from evetrader.market.production import (
     SelfSourcePlan,
     SourceNode,
 )
-from evetrader.market.training import TrainingTip
-from evetrader.data.sde_download import ProgressFn, SdeState
-from evetrader.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
-from evetrader.session import CharacterRecord, CharacterStore
-from evetrader.tui.app import (
+from evehelper.market.training import TrainingTip
+from evehelper.data.sde_download import ProgressFn, SdeState
+from evehelper.pipeline import BuildOpportunity, CharacterReport, OpportunityReport
+from evehelper.session import CharacterRecord, CharacterStore
+from evehelper.tui.app import (
     BlueprintInfoScreen,
     CharacterPickerScreen,
     DownloadSdeFn,
-    EveTraderApp,
+    EveHelperApp,
     IndustryJobScreen,
     MaterialsScreen,
     RefreshFeed,
@@ -400,8 +402,10 @@ def _build_app(
     opportunity: OpportunityReport | None = None,
     download_sde_fn: DownloadSdeFn | None = None,
     sde_check_fn: SdeCheckFn | None = None,
-) -> EveTraderApp:
+    wealth: WealthStore | None = None,
+) -> EveHelperApp:
     report = opportunity if opportunity is not None else _opportunity_report()
+    wealth_store = wealth if wealth is not None else WealthStore(Path(mkdtemp()) / "wealth.json")
 
     def make_feed(character_id: int) -> RefreshFeed:
         async def character() -> CharacterReport:
@@ -410,7 +414,18 @@ def _build_app(
         async def opportunities(state: CharacterState) -> OpportunityReport:
             return report
 
-        return RefreshFeed(character=character, opportunities=opportunities)
+        def export_wealth() -> Path:
+            dest = Path(mkdtemp()) / f"wealth_{character_id}.tsv"
+            wealth_store.export_tsv(character_id, dest)
+            return dest
+
+        return RefreshFeed(
+            character=character,
+            opportunities=opportunities,
+            record_wealth=lambda sample: wealth_store.record(character_id, sample),
+            wealth_history=lambda: wealth_store.history(character_id),
+            export_wealth=export_wealth,
+        )
 
     async def login_fn() -> CharacterIdentity:
         return CharacterIdentity(999, "New Char")
@@ -418,7 +433,7 @@ def _build_app(
     def remove_token_fn(character_id: int) -> None:
         pass
 
-    return EveTraderApp(
+    return EveHelperApp(
         store,
         make_feed,
         login_fn,
@@ -555,9 +570,9 @@ def test_shift_hl_and_shift_arrows_cycle_tabs_from_a_focused_table(tmp_path: Pat
             assert tabbed.active == "overview"
             assert app.focused is not None and app.focused.id == "digest"
 
-            await pilot.press("L")  # Shift+l -> next tab
+            await pilot.press("L")  # Shift+l -> next tab (Wealth follows Overview)
             await pilot.pause()
-            assert tabbed.active == "trading"
+            assert tabbed.active == "wealth"
 
             await pilot.press("H")  # Shift+h -> previous tab
             await pilot.pause()
@@ -608,6 +623,82 @@ def test_selecting_a_skill_row_opens_the_skill_info_popup(tmp_path: Path) -> Non
             await pilot.click("#skillbody")  # clicking the popup dismisses it
             await pilot.pause()
             assert isinstance(app.screen, TradingScreen)
+
+    asyncio.run(_drive())
+
+
+def test_skill_queue_refresh_keeps_the_selected_row(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+    report = replace(
+        _character_report(),
+        skill_queue=[
+            _queue_entry(
+                16622, 0, datetime(2019, 12, 1, tzinfo=UTC), datetime(2026, 8, 1, tzinfo=UTC)
+            ),
+            _queue_entry(
+                3443, 1, datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 9, 1, tzinfo=UTC)
+            ),
+        ],
+    )
+
+    async def _drive() -> None:
+        app = _build_app(store)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(4):
+                await pilot.pause()
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "queue"
+            await pilot.pause()
+            table = trading.query_one("#skillqueue", DataTable)
+            trading._render_skill_queue(report)  # a two-entry queue to select within
+            table.move_cursor(row=1)  # the second, queued skill
+            cursor = table.cursor_coordinate
+
+            # A timer refresh rebuilds the table (times tick); the cursor must not
+            # snap back to the top.
+            trading._render_skill_queue(report)
+            assert table.cursor_coordinate == cursor
+            await pilot.press("q")
+
+    asyncio.run(_drive())
+
+
+def test_refresh_records_wealth_and_exports_tsv(tmp_path: Path) -> None:
+    store = CharacterStore(tmp_path / "characters.json")
+    store.add(CharacterRecord(1, "Alice"))
+    wealth = WealthStore(tmp_path / "wealth.json")
+
+    async def _drive() -> None:
+        app = _build_app(store, wealth=wealth)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, CharacterPickerScreen)
+            picker.select_character(1)
+            for _ in range(5):  # let both refresh phases complete
+                await pilot.pause()
+
+            # The market scan (phase 2) recorded one sample: wallet 5M, no assets valued.
+            history = wealth.history(1)
+            assert len(history) == 1
+            assert history[0].total == 5_000_000.0
+
+            trading = app.screen
+            assert isinstance(trading, TradingScreen)
+            trading.query_one(TabbedContent).active = "wealth"
+            await pilot.pause()
+            await pilot.press("e")  # export to TSV
+            await pilot.pause()
+            status = trading.query_one("#status", Static).render()
+            assert "exported to" in str(status)
+            await pilot.press("q")
 
     asyncio.run(_drive())
 
@@ -878,9 +969,15 @@ def _app_with_assets(
     async def login_fn() -> CharacterIdentity:
         return CharacterIdentity(999, "New Char")
 
-    return EveTraderApp(
+    return EveHelperApp(
         store,
-        lambda cid: RefreshFeed(character=character, opportunities=opportunities),
+        lambda cid: RefreshFeed(
+            character=character,
+            opportunities=opportunities,
+            record_wealth=lambda sample: None,
+            wealth_history=list,
+            export_wealth=lambda: Path("wealth.tsv"),
+        ),
         login_fn,
         lambda cid: None,
         interval_seconds=30,
@@ -1084,9 +1181,15 @@ def test_deeply_nested_assets_render_without_crashing(tmp_path: Path) -> None:
         async def login_fn() -> CharacterIdentity:
             return CharacterIdentity(999, "New Char")
 
-        app = EveTraderApp(
+        app = EveHelperApp(
             store,
-            lambda cid: RefreshFeed(character=character, opportunities=opportunities),
+            lambda cid: RefreshFeed(
+            character=character,
+            opportunities=opportunities,
+            record_wealth=lambda sample: None,
+            wealth_history=list,
+            export_wealth=lambda: Path("wealth.tsv"),
+        ),
             login_fn,
             lambda cid: None,
             interval_seconds=30,
@@ -1241,7 +1344,7 @@ def test_manufacturing_tab_explains_a_missing_sde(tmp_path: Path) -> None:
             await pilot.pause()
             assert trading.query_one("#manufacturing", DataTable).row_count == 0
             hint = str(trading.query_one("#manufacturing-hint", Static).render())
-            assert "evetrader sde" in hint  # tells the user how to enable it
+            assert "evehelper sde" in hint  # tells the user how to enable it
             # No download callable wired -> no in-UI download button.
             assert not trading.query("#download-sde")
             await pilot.press("q")

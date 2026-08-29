@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 from email.utils import format_datetime
 
 import httpx
-from evetrader.config import Config
-from evetrader.esi.client import EsiClient
-from evetrader.esi.endpoints import (
+from evehelper.config import Config
+from evehelper.esi.client import EsiClient
+from evehelper.esi.endpoints import (
     fetch_affiliation,
     fetch_assets,
     fetch_attributes,

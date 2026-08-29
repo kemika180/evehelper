@@ -49,7 +49,7 @@ _PREREQ_PAIRS: tuple[tuple[int, int], ...] = (
     (1290, 1288),
 )
 
-_DEFAULT_SDE = Path.home() / ".local/share/evetrader/sde.sqlite"
+_DEFAULT_SDE = Path.home() / ".local/share/evehelper/sde.sqlite"
 _SKILLS_OUT = Path(__file__).with_name("skills.json")
 _MASTERIES_OUT = Path(__file__).with_name("masteries.json")
 _AIR_OUT = Path(__file__).with_name("air_plans.json")

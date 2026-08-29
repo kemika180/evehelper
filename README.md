@@ -1,11 +1,11 @@
-# evetrader
+# evehelper
 
 A terminal (TUI) companion for EVE Online: a **read-only dashboard** for one or more
 of your characters — net worth, assets, skills, industry jobs, and your live market
 orders — plus a crafting **build-vs-buy** advisor. It reads everything from ESI (the
 official EVE API) and the static data export, and shows you where you stand. It
 **never** writes to the game or automates anything (EVE forbids that) — you act
-in-game; evetrader only informs.
+in-game; evehelper only informs.
 
 Pure Python.
 
@@ -16,6 +16,10 @@ Multi-character — a picker on launch, then a per-character view with these tab
 - **Overview** — net worth (your assets valued at Jita reference prices), wallet, skill
   points, free order/industry slots, and an activity digest: trades since your last
   visit, industry jobs ready to deliver, and skills that finished training.
+- **Wealth** — your estimated wealth (wallet + assets at Jita reference prices) plotted
+  over time, so you can see the trend across sessions. A sample is recorded each time the
+  market scan values your holdings (throttled to at most one an hour); press **`e`** to
+  export the full history as a TSV file in the current directory.
 - **Trading** — your own open buy/sell orders, each flagged best-price or undercut. (It
   does *not* scan the market to suggest new trades — it tracks the orders you've placed.)
 - **Crafting** — for a blueprint you own, a build-vs-buy analysis: the full self-source
@@ -30,7 +34,7 @@ Multi-character — a picker on launch, then a per-character view with these tab
 ## How it works
 
 ```
-ESI + SDE (read-only)               evetrader (TUI)             you
+ESI + SDE (read-only)               evehelper (TUI)             you
 ─────────────────────               ───────────────            ───
 wallet · assets · orders        ┌─ dashboard: net worth,   ┌─ decide what to
 skills · industry · location ─► │  assets, skills, jobs,    │  train / build / list,
@@ -44,12 +48,12 @@ pure, deterministic, unit-testable core (enforced by import-linter).
 ## Setup
 
 Requires [`uv`](https://docs.astral.sh/uv/). That's the only prerequisite — there's
-**nothing to register**. evetrader ships with a shared ESI application, so it runs with
+**nothing to register**. evehelper ships with a shared ESI application, so it runs with
 no config file at all:
 
 ```
 uv sync
-uv run evetrader
+uv run evehelper
 ```
 
 On first launch, press **`a`** to add your character: your browser opens EVE's official
@@ -57,7 +61,7 @@ SSO, you log in with your own EVE account and authorize the read-only scopes, an
 token is stored in your OS keyring (never in the repo). Then select the character to open
 its dashboard.
 
-Configuration is optional. To customise, create `~/.config/evetrader/config.toml` — every
+Configuration is optional. To customise, create `~/.config/evehelper/config.toml` — every
 field has a default, so include only what you want to change:
 
 ```toml
@@ -68,7 +72,7 @@ theme = "nord"                  # any built-in Textual theme (default "kemika-pu
 ```
 
 The **Crafting** tab needs the EVE SDE (static data — blueprint recipes; ~250 MB). You
-don't have to do anything: evetrader offers to download it on launch (with a progress
+don't have to do anything: evehelper offers to download it on launch (with a progress
 bar) whenever it's missing or a newer version has been published — just accept the
 prompt. It's pulled from the [Fuzzwork](https://www.fuzzwork.co.uk/dump/) SQLite mirror
 into your local data dir (gitignored, never committed). The rest of the app works
